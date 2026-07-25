@@ -402,3 +402,288 @@ code {
   color: var(--text);
   font-size: 12px;
 }
+
+/* ---- market page --------------------------------------------------- */
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.table a:hover,
+.crumb:hover {
+  color: var(--accent);
+}
+
+.brand {
+  display: inline-block;
+}
+
+.market-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 20px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.crumb {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.market-title {
+  font-size: 17px;
+  font-weight: 500;
+  margin: 6px 0 6px;
+  color: var(--text);
+  max-width: 720px;
+}
+
+.market-sub {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--text-dim);
+}
+
+.market-quote {
+  text-align: right;
+}
+
+.quote-last {
+  font-size: 30px;
+  color: var(--accent);
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.quote-legs {
+  font-size: 12px;
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.up {
+  color: var(--accent);
+}
+
+.down {
+  color: var(--bad);
+}
+
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.seg {
+  display: flex;
+  gap: 1px;
+  margin-bottom: 12px;
+}
+
+.seg-btn {
+  background: var(--bg);
+  border: 1px solid var(--border-bright);
+  color: var(--text-faint);
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+
+.seg-btn.active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.chart {
+  width: 100%;
+}
+
+.split {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.rules {
+  color: var(--text-dim);
+  margin: 0;
+  line-height: 1.6;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+/* ---- order book ladder --------------------------------------------- */
+
+.ladder-summary {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.ladder {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.ladder-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 3px;
+}
+
+.ladder-empty {
+  color: var(--text-faint);
+  padding: 6px 0;
+  font-size: 11px;
+}
+
+.ladder-row {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 4px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ladder-depth {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  opacity: 0.16;
+}
+
+.ladder-row.bid .ladder-depth {
+  background: var(--accent);
+}
+
+.ladder-row.ask .ladder-depth {
+  background: var(--bad);
+}
+
+.ladder-row.bid .ladder-price {
+  color: var(--accent);
+}
+
+.ladder-row.ask .ladder-price {
+  color: var(--bad);
+}
+
+.ladder-price,
+.ladder-size {
+  position: relative;
+}
+
+.ladder-size {
+  color: var(--text-dim);
+}
+
+/* ---- tape ----------------------------------------------------------- */
+
+.tape {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.tape-head,
+.tape-row {
+  display: grid;
+  grid-template-columns: 1fr 60px 60px 44px;
+  gap: 8px;
+  padding: 2px 4px;
+}
+
+.tape-head {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg-panel);
+}
+
+.tape-row.up .tape-side,
+.tape-row.up .num {
+  color: var(--accent);
+}
+
+.tape-row.down .tape-side,
+.tape-row.down .num {
+  color: var(--bad);
+}
+
+.tape-row.big {
+  background: var(--bg-raised);
+  font-weight: 600;
+}
+
+.tape-time,
+.tape-side {
+  color: var(--text-faint);
+}
+
+/* ---- liquidity score ------------------------------------------------ */
+
+.score {
+  position: relative;
+  display: inline-block;
+  min-width: 62px;
+  height: 13px;
+}
+
+.score-bar {
+  position: absolute;
+  left: 0;
+  top: 2px;
+  height: 9px;
+  background: var(--accent);
+  opacity: 0.35;
+}
+
+.score-num {
+  position: relative;
+  padding-left: 3px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.table tr.self td {
+  background: var(--bg-raised);
+  color: var(--text);
+}
+
+@keyframes flash {
+  from {
+    background: #00d68f18;
+  }
+  to {
+    background: transparent;
+  }
+}
+
+.table tr.flash td {
+  animation: flash 0.6s ease-out;
+}

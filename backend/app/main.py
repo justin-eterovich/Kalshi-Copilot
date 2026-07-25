@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from app.api import ws
 from app.api.routes import health, markets
 from app.config import get_config
 from app.core.fees import load_fee_schedule
@@ -17,6 +18,8 @@ from app.core.logging import configure_logging, get_logger
 from app.core.redis import close_redis
 from app.db.base import dispose_engine
 from app.db.bootstrap import init_db
+from app.ingest.backfill import Backfiller
+from app.kalshi.client import build_rest_client
 from app.settings import get_settings
 
 log = get_logger(__name__)
@@ -35,8 +38,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     config = get_config()
     _log_safety_posture(settings, config)
 
+    # REST client for read-through backfill. Public market data needs no
+    # credentials, so charts, depth and tape work before a key is configured.
+    client = build_rest_client()
+    app.state.kalshi = client
+    app.state.backfiller = Backfiller(client)
+    log.info("backfill ready (authenticated=%s)", client.authenticated)
+
     yield
 
+    await client.aclose()
     await close_redis()
     await dispose_engine()
     log.info("api stopped")
@@ -86,6 +97,7 @@ app = FastAPI(
 
 app.include_router(health.router, prefix="/api", tags=["system"])
 app.include_router(markets.router, prefix="/api", tags=["catalog"])
+app.include_router(ws.router, tags=["realtime"])
 
 
 # ---------------------------------------------------------------------------

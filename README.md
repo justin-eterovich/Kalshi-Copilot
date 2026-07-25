@@ -21,7 +21,7 @@ model-driven fair value.
 |-----------|-------|-------|
 | **M0** | Scaffold, compose stack, fees module | ✅ done |
 | **M1** | Ingest + storage | ✅ done |
-| M2 | Dashboard core (screener, market page, charts) | pending |
+| **M2** | Dashboard core (screener, market page, charts) | ✅ done |
 | M3 | HITL approval + execution rail | pending |
 | M4 | Detectors wave 1 (set-arb, resolution sniper, BTC stale-quote) | pending |
 | M5 | Risk layer + PWA notifications | pending |
@@ -251,6 +251,39 @@ downstream EV number, so the system refuses to guess.
 ```bash
 cd backend && python -m pytest tests/test_fees.py -v
 ```
+
+---
+
+## Where market data comes from
+
+Two paths feed the same tables, and which one you get depends on credentials:
+
+| Path | Needs a key? | Gives you |
+|------|--------------|-----------|
+| REST catalog sync | no | series, events, markets, quotes |
+| REST read-through | no | candles, orderbook, tape — fetched on demand when you open a market |
+| WebSocket stream | **yes** | the same data live, plus book deltas and full tape |
+
+The Kalshi WebSocket requires authentication **even for public market-data
+channels**, but the REST market-data endpoints are open. So the dashboard is
+fully usable before any API key exists — opening a market page pulls its
+candles, depth and tape straight from Kalshi and caches them. Adding
+credentials upgrades that from on-demand polling to a live stream; nothing in
+the UI changes shape.
+
+The market page shows where each panel's data came from (`live` vs `cached`).
+
+### Real-time UI
+
+The browser connects to `GET /ws`, which relays Redis pub/sub. One Redis
+subscription is shared across every open tab. Clients send
+`{"action":"watch","tickers":[...]}` to filter the tick firehose down to what
+is on screen — the scanner streams every market and a market page wants one.
+
+Proposals and signals ignore that filter by design: an approval request must
+reach you regardless of which page you happen to have open. A client that
+cannot keep up has its messages dropped rather than being allowed to slow the
+shared reader down for everyone else.
 
 ---
 

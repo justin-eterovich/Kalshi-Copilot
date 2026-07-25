@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
-import CatalogBrowser from "./CatalogBrowser";
+import { Link, Route, Routes, useLocation } from "react-router-dom";
+import MarketPage from "./MarketPage";
+import Screener from "./Screener";
 import SystemPanel from "./SystemPanel";
 import { api, type Health, type SystemStatus } from "./api";
-
-type Tab = "catalog" | "system";
 
 function Pill({
   ok,
@@ -19,9 +19,9 @@ function Pill({
 }
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("catalog");
   const [system, setSystem] = useState<SystemStatus | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
+  const location = useLocation();
 
   useEffect(() => {
     const load = async () => {
@@ -39,27 +39,22 @@ export default function App() {
   }, []);
 
   const live = system?.live_trading_armed ?? false;
+  const onSystem = location.pathname.startsWith("/system");
 
   return (
     <div className="app">
       <header className="topbar">
-        <span className="brand">
+        <Link to="/" className="brand">
           kalshi<span className="dot">·</span>copilot
-        </span>
+        </Link>
 
         <nav className="tabs">
-          <button
-            className={tab === "catalog" ? "tab active" : "tab"}
-            onClick={() => setTab("catalog")}
-          >
-            catalog
-          </button>
-          <button
-            className={tab === "system" ? "tab active" : "tab"}
-            onClick={() => setTab("system")}
-          >
+          <Link to="/" className={onSystem ? "tab" : "tab active"}>
+            markets
+          </Link>
+          <Link to="/system" className={onSystem ? "tab active" : "tab"}>
             system
-          </button>
+          </Link>
         </nav>
 
         <span className="spacer" />
@@ -98,11 +93,14 @@ export default function App() {
           )}
         </div>
 
-        {tab === "catalog" ? (
-          <CatalogBrowser />
-        ) : (
-          <SystemPanel system={system} health={health} />
-        )}
+        <Routes>
+          <Route path="/" element={<Screener />} />
+          <Route path="/market/:ticker" element={<MarketPage />} />
+          <Route
+            path="/system"
+            element={<SystemPanel system={system} health={health} />}
+          />
+        </Routes>
       </main>
 
       <footer>
