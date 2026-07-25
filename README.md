@@ -20,7 +20,7 @@ model-driven fair value.
 | Milestone | Scope | State |
 |-----------|-------|-------|
 | **M0** | Scaffold, compose stack, fees module | ✅ done |
-| M1 | Ingest + storage | pending |
+| **M1** | Ingest + storage | ✅ done |
 | M2 | Dashboard core (screener, market page, charts) | pending |
 | M3 | HITL approval + execution rail | pending |
 | M4 | Detectors wave 1 (set-arb, resolution sniper, BTC stale-quote) | pending |
@@ -187,9 +187,20 @@ backend/app/
     base.py          engine, session factory
     models.py        schema
     bootstrap.py     create_all + hypertable setup
-  kalshi/            REST + WS clients (M1)
+  core/money.py      fixed-point parsing (dollars / fractional contracts)
+  kalshi/
+    auth.py          RSA-PSS request signing
+    ratelimit.py     adaptive token buckets (AIMD)
+    rest.py          REST client, cursor pagination, 429 backoff
+    ws.py            websocket, reconnect, per-sid sequence tracking
+    orderbook.py     local book reconstruction, gap detection
+    client.py        factories wiring settings -> clients
+  ingest/
+    main.py          service entrypoint (catalog + stream + flush loops)
+    catalog.py       series/events/markets sync, category backfill
+    normalize.py     API payloads -> ORM rows
+    streams.py       tape, candles, book snapshots
   api/routes/        HTTP endpoints
-  ingest/main.py     ingest service entrypoint
   worker/main.py     worker service entrypoint
 backend/tests/       pytest suite
 frontend/            React + Vite + TS dashboard
@@ -213,6 +224,9 @@ The taker formula:
 fee = round_up_to_cent( M × 0.07 × C × P × (1 − P) )
 ```
 
+`P` is a price in **dollars** and `C` may be **fractional**, because that is
+what the API actually speaks — see "Units" below.
+
 Two details the implementation gets right and most don't:
 
 - **Rounding is on the order aggregate, not per contract.** One contract at 50¢
@@ -223,6 +237,12 @@ Two details the implementation gets right and most don't:
 
 Maker fees are a fraction of the taker rate, and some categories charge none.
 
+**Category comes from the event, not the market.** The `/markets` payload
+carries no category at all; it lives on the parent event. Ingest joins it
+across on every sync, because `fees.py` selects the multiplier *by category* —
+without that join every Crypto market would quietly price at the standard rate
+and the guard below would never fire.
+
 **Unverified categories fail closed.** If `data/fee_schedule.yaml` has a `null`
 multiplier for a category, `fees.py` raises `UnverifiedFeeCategory` and those
 markets are excluded from proposals. An understated fee silently inflates every
@@ -231,6 +251,31 @@ downstream EV number, so the system refuses to guess.
 ```bash
 cd backend && python -m pytest tests/test_fees.py -v
 ```
+
+---
+
+## Units — read this before touching money
+
+The API does **not** speak integer cents. Getting this wrong is the single
+easiest way to produce a confident, wrong edge number.
+
+| Concept | Wire format | Internal type |
+|---------|-------------|---------------|
+| Price | `FixedPointDollars`, e.g. `"0.5600"`, up to **6 decimals** | `Decimal` dollars, `Numeric(12,6)` |
+| Contract count | `FixedPointCount`, e.g. `"10.00"`, **fractional to 0.01** | `Decimal`, `Numeric(16,2)` |
+| Fee / realised P&L | — | integer **cents**, which they exactly are |
+
+Consequences that are easy to miss:
+
+- Tick size varies by market (`price_level_structure`), so sub-cent prices are
+  real. Rounding a quote to the nearest cent on ingest loses information the
+  detectors need.
+- Contracts can be fractional, so fee and sizing math must not assume integers.
+- Prices cross the API boundary as **strings**, and stay strings in JSON
+  responses to the frontend. Parsing a price into a JS `number` re-introduces
+  exactly the precision loss the backend avoided.
+- `taker_fee_cents("0.5600", ...)` is right; `taker_fee_cents(56, ...)` raises
+  rather than silently pricing a market at $56.
 
 ---
 
@@ -263,8 +308,18 @@ and are documented as alternatives. Override in `.env` if you need them.
 
 Basic tier is 200 read tokens/sec and 100 write tokens/sec, with most requests
 costing 10 tokens — so roughly 20 reads/sec and 10 writes/sec. Basic write
-buckets hold only one second of burst headroom. The client-side token bucket
-(M1) is sized from `KALSHI_RATE_TIER` and keeps read and write budgets separate.
+buckets hold only one second of burst headroom. Read and write budgets are
+tracked separately, so a heavy catalog sync can never throttle order placement.
+
+Those numbers describe *authenticated* accounts, some endpoints cost more than
+the default 10 tokens, and a 429 carries no `Retry-After` and no
+`X-RateLimit-*` headers — so the real ceiling cannot be known up front. The
+limiter therefore adapts: it halves its rate on a 429 and creeps back up while
+requests succeed (AIMD). Against the live demo API this converges in ~25
+rejections instead of one per request.
+
+You will see one warning as it finds the ceiling, e.g.
+`limiter now at read=27/200 tok/s`. That is the mechanism working, not a fault.
 
 Live values are available from `GET /account/limits` and
 `GET /account/endpoint_costs`.
@@ -288,8 +343,8 @@ BIND_ADDR=192.168.1.50
 ## Development
 
 ```bash
-# tests
-docker compose run --rm api python -m pytest tests/ -v
+# tests (no host toolchain needed)
+docker compose run --rm --no-deps api python -m pytest tests/ -v
 
 # lint + typecheck
 docker compose run --rm api ruff check app/
@@ -322,6 +377,7 @@ python -m pytest tests/ -v
 | Detector flags | Each detector independently enabled; all off by default. |
 | Fee fail-closed | Unknown fee multiplier ⇒ market excluded, never guessed. |
 | Idempotent orders | Client-supplied order IDs; a network retry cannot double-place. |
+| Stale orderbook | A websocket sequence gap marks the local book stale; it raises rather than answering from guessed state. |
 | Audit log | Append-only record of every signal, proposal, decision, order, fill, and fee. |
 | Secret redaction | Private keys and signature headers stripped from logs by the formatter. |
 

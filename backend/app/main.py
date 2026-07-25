@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api.routes import health
+from app.api.routes import health, markets
 from app.config import get_config
 from app.core.fees import load_fee_schedule
 from app.core.logging import configure_logging, get_logger
@@ -85,6 +85,7 @@ app = FastAPI(
 )
 
 app.include_router(health.router, prefix="/api", tags=["system"])
+app.include_router(markets.router, prefix="/api", tags=["catalog"])
 
 
 # ---------------------------------------------------------------------------

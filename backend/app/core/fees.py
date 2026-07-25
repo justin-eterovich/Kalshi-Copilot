@@ -19,8 +19,11 @@ wrong:
    rounds up three times.  :func:`taker_fee_cents` prices a single fill;
    callers modelling partial fills should sum per-fill costs.
 
-All money is handled as :class:`~decimal.Decimal` and returned as whole
-cents (``int``) so nothing drifts through float arithmetic.
+Units follow the API: **prices are Decimal dollars** (the wire format is a
+fixed-point string with up to 6 decimals, so sub-cent prices are real), and
+**contract counts are Decimal** because Kalshi supports fractional contracts
+down to 0.01. Fees themselves are always a whole number of cents, so they are
+returned as ``int`` cents. Nothing goes through float.
 """
 
 from __future__ import annotations
@@ -32,6 +35,8 @@ from pathlib import Path
 from typing import Any, Final
 
 import yaml
+
+from app.core.money import parse_count, parse_dollars
 
 __all__ = [
     "FeeSchedule",
@@ -165,52 +170,60 @@ def load_fee_schedule(path: str | Path | None = None) -> FeeSchedule:
 
 # ---------------------------------------------------------------------------
 # Fee calculations
+#
+# Prices are Decimal DOLLARS (0 < P < 1). Counts are Decimal contracts and may
+# be fractional. Fees come back as whole cents.
 # ---------------------------------------------------------------------------
 
 
-def _validate(price_cents: int | Decimal, contracts: int) -> tuple[Decimal, int]:
-    price = Decimal(str(price_cents))
-    if not (0 < price < 100):
+def _validate(
+    price_dollars: Decimal | str | int, contracts: Decimal | str | int
+) -> tuple[Decimal, Decimal]:
+    price = parse_dollars(price_dollars, "price_dollars")
+    if not (Decimal(0) < price < Decimal(1)):
         raise ValueError(
-            f"price_cents must be strictly between 0 and 100, got {price_cents}"
+            f"price_dollars must be strictly between 0 and 1, got {price_dollars!r}. "
+            f"(Kalshi quotes are dollar strings like '0.5600', not cents.)"
         )
-    if contracts < 0:
-        raise ValueError(f"contracts must be non-negative, got {contracts}")
-    return price, int(contracts)
+
+    qty = parse_count(contracts, "contracts")
+    if qty < 0:
+        raise ValueError(f"contracts must be non-negative, got {contracts!r}")
+
+    return price, qty
 
 
 def taker_fee_cents(
-    price_cents: int | Decimal,
-    contracts: int,
+    price_dollars: Decimal | str | int,
+    contracts: Decimal | str | int,
     category: str | None = None,
     schedule: FeeSchedule | None = None,
 ) -> int:
     """Taker fee, in whole cents, for a single fill.
 
     Args:
-        price_cents: Execution price, 1-99.
-        contracts: Number of contracts in this fill.
+        price_dollars: Execution price in dollars, exclusive of 0 and 1.
+        contracts: Contracts in this fill; may be fractional.
         category: Market category, used to pick the fee multiplier.
         schedule: Override schedule (tests); defaults to the loaded one.
     """
-    price, qty = _validate(price_cents, contracts)
+    price, qty = _validate(price_dollars, contracts)
     if qty == 0:
         return 0
     sched = schedule or load_fee_schedule()
 
-    p = price / Decimal(100)
-    gross = sched.taker_rate(category) * Decimal(qty) * p * (Decimal(1) - p)
+    gross = sched.taker_rate(category) * qty * price * (Decimal(1) - price)
     return _round_up_cents(gross)
 
 
 def maker_fee_cents(
-    price_cents: int | Decimal,
-    contracts: int,
+    price_dollars: Decimal | str | int,
+    contracts: Decimal | str | int,
     category: str | None = None,
     schedule: FeeSchedule | None = None,
 ) -> int:
     """Maker (resting order) fee in whole cents. Zero for maker-free categories."""
-    price, qty = _validate(price_cents, contracts)
+    price, qty = _validate(price_dollars, contracts)
     if qty == 0:
         return 0
     sched = schedule or load_fee_schedule()
@@ -219,17 +232,16 @@ def maker_fee_cents(
     if rate == 0:
         return 0
 
-    p = price / Decimal(100)
-    gross = rate * Decimal(qty) * p * (Decimal(1) - p)
+    gross = rate * qty * price * (Decimal(1) - price)
     return _round_up_cents(gross)
 
 
 def round_trip_cost_cents(
-    entry_price_cents: int | Decimal,
-    contracts: int,
+    entry_price_dollars: Decimal | str | int,
+    contracts: Decimal | str | int,
     category: str | None = None,
     *,
-    exit_price_cents: int | Decimal | None = None,
+    exit_price_dollars: Decimal | str | int | None = None,
     entry_is_taker: bool = True,
     exit_is_taker: bool = True,
     schedule: FeeSchedule | None = None,
@@ -237,55 +249,59 @@ def round_trip_cost_cents(
     """Total fees to open and close a position.
 
     A position held to settlement pays no exit fee — pass
-    ``exit_price_cents=None`` for that case, which is the norm for the
+    ``exit_price_dollars=None`` for that case, which is the norm for the
     resolution sniper and set-arb detectors.
     """
     entry_fn = taker_fee_cents if entry_is_taker else maker_fee_cents
-    total = entry_fn(entry_price_cents, contracts, category, schedule)
+    total = entry_fn(entry_price_dollars, contracts, category, schedule)
 
-    if exit_price_cents is not None:
+    if exit_price_dollars is not None:
         exit_fn = taker_fee_cents if exit_is_taker else maker_fee_cents
-        total += exit_fn(exit_price_cents, contracts, category, schedule)
+        total += exit_fn(exit_price_dollars, contracts, category, schedule)
 
     return total
 
 
 def net_edge_cents(
-    fair_price_cents: Decimal | float,
-    executable_price_cents: int | Decimal,
-    contracts: int,
+    fair_price_dollars: Decimal | str | int,
+    executable_price_dollars: Decimal | str | int,
+    contracts: Decimal | str | int,
     category: str | None = None,
     *,
-    slippage_cents: Decimal | float = 0,
+    slippage_cents: Decimal | str | int = 0,
     is_taker: bool = True,
     schedule: FeeSchedule | None = None,
 ) -> Decimal:
-    """Per-contract edge in cents, net of fees and slippage.
+    """Per-contract edge in **cents**, net of fees and slippage.
 
-    This is *the* number the system is allowed to show.  Positive means the
+    This is *the* number the system is allowed to show. Positive means the
     trade is expected to make money after costs; a gross edge without this
     correction is meaningless.
 
+    Prices go in as dollars because that is what the API speaks; the result
+    comes back in cents because that is what a trader reads.
+
     Args:
-        fair_price_cents: Model's fair value for the contract, 0-100.
-        executable_price_cents: Price we would actually pay.
+        fair_price_dollars: Model's fair value, in dollars.
+        executable_price_dollars: Price we would actually pay, in dollars.
         contracts: Size, which matters because fees round up per fill.
-        slippage_cents: Extra adverse fill assumed, per contract.
+        slippage_cents: Extra adverse fill assumed, per contract, in cents.
 
     Returns:
         Net edge per contract in cents. May be negative.
     """
-    if contracts <= 0:
+    qty = parse_count(contracts, "contracts")
+    if qty <= 0:
         return Decimal(0)
 
-    fair = Decimal(str(fair_price_cents))
-    price = Decimal(str(executable_price_cents))
-    slip = Decimal(str(slippage_cents))
+    fair = parse_dollars(fair_price_dollars, "fair_price_dollars")
+    price = parse_dollars(executable_price_dollars, "executable_price_dollars")
+    slip = parse_dollars(slippage_cents, "slippage_cents")
 
     fee_fn = taker_fee_cents if is_taker else maker_fee_cents
-    fee_total = Decimal(fee_fn(price, contracts, category, schedule))
+    fee_total_cents = Decimal(fee_fn(price, qty, category, schedule))
 
-    gross_per_contract = fair - price
-    fee_per_contract = fee_total / Decimal(contracts)
+    gross_per_contract_cents = (fair - price) * Decimal(100)
+    fee_per_contract_cents = fee_total_cents / qty
 
-    return gross_per_contract - fee_per_contract - slip
+    return gross_per_contract_cents - fee_per_contract_cents - slip

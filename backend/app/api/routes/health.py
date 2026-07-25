@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
 
 from app.config import get_config
@@ -86,8 +86,8 @@ async def system() -> dict[str, Any]:
 
 @router.get("/fees/quote")
 async def fee_quote(
-    price_cents: int,
-    contracts: int,
+    price_dollars: str,
+    contracts: str,
     category: str = "default",
     is_taker: bool = True,
 ) -> dict[str, Any]:
@@ -95,24 +95,41 @@ async def fee_quote(
 
     Exists so the frontend can never compute a fee itself and drift from the
     engine's numbers.
+
+    Args:
+        price_dollars: Price as the API quotes it, e.g. ``0.5600``. Not cents.
+        contracts: Contract count; fractional values down to 0.01 are valid.
     """
+    from decimal import Decimal
+
     from app.core.fees import maker_fee_cents, taker_fee_cents
 
     schedule = load_fee_schedule(get_settings().fee_schedule_path)
     fn = taker_fee_cents if is_taker else maker_fee_cents
 
     try:
-        fee = fn(price_cents, contracts, category, schedule)
+        fee = fn(price_dollars, contracts, category, schedule)
     except UnverifiedFeeCategory as exc:
-        return {
-            "error": "unverified_fee_category",
-            "category": exc.category,
-            "detail": str(exc),
-        }
+        # Fail closed: the market is excluded rather than priced with a guess.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "unverified_fee_category",
+                "category": exc.category,
+                "message": str(exc),
+            },
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    qty = Decimal(contracts)
     return {
         "fee_cents": fee,
-        "fee_per_contract_cents": round(fee / contracts, 4) if contracts else 0,
+        "fee_per_contract_cents": (
+            str(round(Decimal(fee) / qty, 4)) if qty > 0 else "0"
+        ),
+        "price_dollars": price_dollars,
+        "contracts": contracts,
         "category": category,
         "is_taker": is_taker,
     }
