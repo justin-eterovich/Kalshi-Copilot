@@ -1,0 +1,53 @@
+# ============================================================================
+# Kalshi fee schedule — data behind backend/app/core/fees.py
+#
+# SOURCE OF TRUTH:  https://kalshi.com/docs/kalshi-fee-schedule.pdf
+#
+# Refresh with:
+#     python scripts/refresh_fee_schedule.py
+#
+# That script downloads the current PDF, extracts the formula + per-category
+# multipliers, and shows you a diff against this file.  Run it from your
+# homelab: kalshi.com sits behind bot protection that blocks datacenter IPs.
+# ============================================================================
+
+meta:
+  # Bump when you re-verify against the PDF.
+  source_url: https://kalshi.com/docs/kalshi-fee-schedule.pdf
+  # Date the numbers below were last confirmed against the official PDF.
+  # null  => never verified on this machine; unknown categories fail closed.
+  verified_on: null
+  # Fee-schedule revision string printed on the PDF, once known.
+  schedule_revision: null
+
+formula:
+  # Taker fee for an order of C contracts at price P (dollars, 0 < P < 1):
+  #
+  #     fee = round_up_to_cent( multiplier * base_rate * C * P * (1 - P) )
+  #
+  # Note the rounding applies to the ORDER AGGREGATE, not per contract:
+  #   1 contract  @ $0.50 -> ceil($0.0175) = $0.02
+  #   100 contracts @ $0.50 -> $1.75 exactly
+  # Each fill is charged separately, so partial fills round up independently.
+  base_taker_rate: 0.07
+
+  # Maker (resting, liquidity-adding) fees are a fraction of the taker rate.
+  # Many markets charge no maker fee at all; those are listed in
+  # `maker_free_categories` below.
+  maker_rate_fraction: 0.25
+
+# Per-category multiplier applied on top of base_taker_rate.
+#   1.0   => the standard 0.07 rate
+#   null  => UNVERIFIED. fees.py raises UnverifiedFeeCategory and the market is
+#            excluded from proposals, so we can never understate a fee and
+#            overstate an edge.  Run the refresh script to resolve.
+categories:
+  default: 1.0
+
+  # Kalshi's schedule applies a higher multiplier to some premium categories.
+  # These are left deliberately unverified rather than guessed — an invented
+  # multiplier here would silently inflate every edge number in the system.
+  crypto: null
+
+# Categories documented as charging no maker fee.
+maker_free_categories: []

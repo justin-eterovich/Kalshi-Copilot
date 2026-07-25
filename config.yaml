@@ -1,0 +1,182 @@
+# ============================================================================
+# kalshi-copilot — runtime configuration
+#
+# Bind-mounted read-only into every container.  Most values are editable from
+# the settings UI (which writes through to config_kv in Postgres and takes
+# precedence over this file); this file is the boot-time default.
+#
+# NOTHING here can enable automatic trading.  Every order requires explicit
+# per-trade human approval.  There is no auto-trade flag, by design.
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Trading mode
+# ---------------------------------------------------------------------------
+trading:
+  # paper | live
+  #   paper : proposals execute against the demo environment / fill simulator
+  #   live  : real orders — ALSO requires KALSHI_ENV=prod, LIVE_TRADING=true
+  #           in .env, and per-trade confirmation in the UI.
+  mode: paper
+
+  # Proposals expire if not approved within this window (seconds).
+  default_proposal_ttl_sec: 120
+
+  # Order placed on approval.
+  order:
+    # gtc | ioc
+    time_in_force: gtc
+    # Cancel an unfilled (or partially filled) order after this many seconds.
+    auto_cancel_after_sec: 90
+    # Never pay worse than the proposed price.
+    allow_price_improvement_only: true
+
+# ---------------------------------------------------------------------------
+# Risk & sizing  (M7)
+# ---------------------------------------------------------------------------
+risk:
+  bankroll_usd: 1000.0
+  kelly_fraction: 0.25          # quarter-Kelly
+  max_pct_per_market: 0.05      # 5% of bankroll in any single market
+  max_total_exposure_pct: 0.40  # 40% of bankroll deployed at once
+  daily_loss_limit_pct: 0.05    # halt proposals after -5% on the day
+  cooldown_after_consecutive_losses: 3
+  cooldown_minutes: 60
+  # Global kill switch: halts all proposals and cancels resting orders.
+  kill_switch: false
+
+# ---------------------------------------------------------------------------
+# Fees & slippage
+# Fee math lives in backend/app/core/fees.py and reads data/fee_schedule.yaml.
+# Every edge/EV figure in the system is net of these.
+# ---------------------------------------------------------------------------
+costs:
+  # Extra cents of adverse fill assumed on top of book-walk slippage.
+  slippage_buffer_cents: 0.5
+  # Assume we cross the spread (taker) unless a detector says otherwise.
+  assume_taker: true
+
+# ---------------------------------------------------------------------------
+# Market-data ingest  (M1)
+# ---------------------------------------------------------------------------
+ingest:
+  # Full depth: orderbook deltas + public tape + ticker.
+  watchlist: []
+  # Wider universe gets ticker-level coverage only.
+  scanner:
+    enabled: true
+    max_markets: 500
+    # Restrict scanner to these series prefixes; empty = all.
+    series_filter: []
+  catalog_refresh_sec: 300
+  orderbook_snapshot_throttle_ms: 1000
+  candle_interval_sec: 60
+
+# ---------------------------------------------------------------------------
+# Detectors  (M3-M6)
+# ALL DISABLED BY DEFAULT.  Enable one at a time and let the report card
+# earn your trust before it earns your money.
+# ---------------------------------------------------------------------------
+detectors:
+  set_arbitrage:
+    enabled: false
+    min_net_edge_cents: 1.0
+    require_full_depth: true       # only signal if every leg fills at quote
+
+  stale_quote:
+    enabled: false
+    min_net_edge_cents: 2.0
+    reference_max_age_sec: 5
+
+  resolution_sniper:
+    enabled: false
+    yes_threshold_cents: 97
+    no_threshold_cents: 3
+    min_source_confidence: 0.95
+
+  undervalued_screener:
+    enabled: false
+    # research feed, not an auto-signal
+    max_volume_percentile: 0.25
+    min_spread_cents: 2
+    max_hours_to_close: 168
+
+  whale_flow:
+    enabled: false
+    size_zscore_threshold: 3.0
+    sweep_window_sec: 2.0
+    min_levels_cleared: 2
+    base_confidence: 0.35          # flow is an input, never an instruction
+
+  leaderboard_watcher:
+    # Experimental / fragile. Official surfaces only — no scraping.
+    enabled: false
+
+  longshot_calibration:
+    enabled: false
+    # Data collection only until this many settled observations exist.
+    min_samples_before_signalling: 500
+    low_band_cents: [1, 10]
+    high_band_cents: [90, 99]
+
+# ---------------------------------------------------------------------------
+# Bitcoin engine  (M4/M6)
+# ---------------------------------------------------------------------------
+bitcoin:
+  enabled: false
+  spot_source: coinbase          # coinbase | binance | kraken
+  ewma_lambda: 0.94
+  vol_lookback_minutes: 1440
+  min_net_edge_cents: 2.0
+  # Optional upgrade: price brackets off Deribit's implied distribution.
+  use_deribit_implied: false
+
+# ---------------------------------------------------------------------------
+# Weather engine  (M7)
+# ---------------------------------------------------------------------------
+weather:
+  enabled: false
+  user_agent: "kalshi-copilot (self-hosted; contact: set-me@example.com)"
+  # Station mapping is parsed from each series' rules — never assumed.
+  refresh_forecast_sec: 900
+  refresh_observations_sec: 300
+  min_net_edge_cents: 2.0
+  min_calibration_samples: 30
+
+# ---------------------------------------------------------------------------
+# News & catalyst engine  (M8)
+# ---------------------------------------------------------------------------
+news:
+  enabled: false
+  calendar:
+    enabled: false
+    sources: [bls, bea, fed]
+  headlines:
+    enabled: false
+    rss_feeds: []
+    # Two-tier: cheap triage model on everything, strong model on the hits.
+    # Model IDs are resolved at build time against docs.claude.com.
+    triage_model: null
+    scoring_model: null
+    daily_budget_usd: 2.00
+    escalation_rate_cap: 0.10    # escalate at most 10% of novel headlines
+
+# ---------------------------------------------------------------------------
+# Notifications — first-party only.
+# The dashboard is the sole surface: Web Push (PWA), audio ping, favicon badge.
+# No Telegram, no ntfy, no third-party push services.
+# ---------------------------------------------------------------------------
+notifications:
+  web_push_enabled: true
+  audio_enabled: true
+  favicon_badge: true
+  # Kill everything above with one flag.
+  enabled: true
+
+# ---------------------------------------------------------------------------
+# Backtester / paper accounting  (M9)
+# ---------------------------------------------------------------------------
+backtest:
+  # Simulated fills assume we cross the spread and pay taker fees.
+  pessimistic_fills: true
+  report_card_min_trades: 20

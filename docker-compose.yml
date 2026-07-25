@@ -1,0 +1,151 @@
+# kalshi-copilot — full stack.
+#
+#   docker compose up -d --build
+#
+# Services:
+#   db      Postgres 16 + TimescaleDB (hypertables for candles/tape)
+#   redis   pub/sub fan-out to the UI, rate-limit buckets, dedupe sets
+#   api     FastAPI; also serves the built React dashboard
+#   ingest  Kalshi + external market-data ingestion
+#   worker  detectors, scanners, risk/sizing
+#
+# Only `api` publishes a host port, and it binds to ${BIND_ADDR} (LAN).
+# db and redis stay on the internal compose network — they are deliberately
+# NOT reachable from the host.
+
+name: kalshi-copilot
+
+x-backend-env: &backend-env
+  KALSHI_ENV: ${KALSHI_ENV:-demo}
+  LIVE_TRADING: ${LIVE_TRADING:-false}
+  KALSHI_DEMO_KEY_ID: ${KALSHI_DEMO_KEY_ID:-}
+  KALSHI_DEMO_PRIVATE_KEY_PATH: ${KALSHI_DEMO_PRIVATE_KEY_PATH:-/run/secrets/kalshi_demo_key.pem}
+  KALSHI_PROD_KEY_ID: ${KALSHI_PROD_KEY_ID:-}
+  KALSHI_PROD_PRIVATE_KEY_PATH: ${KALSHI_PROD_PRIVATE_KEY_PATH:-/run/secrets/kalshi_prod_key.pem}
+  KALSHI_PROD_REST_URL: ${KALSHI_PROD_REST_URL:-https://external-api.kalshi.com/trade-api/v2}
+  KALSHI_PROD_WS_URL: ${KALSHI_PROD_WS_URL:-wss://external-api-ws.kalshi.com/trade-api/ws/v2}
+  KALSHI_DEMO_REST_URL: ${KALSHI_DEMO_REST_URL:-https://external-api.demo.kalshi.co/trade-api/v2}
+  KALSHI_DEMO_WS_URL: ${KALSHI_DEMO_WS_URL:-wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2}
+  KALSHI_RATE_TIER: ${KALSHI_RATE_TIER:-basic}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://copilot:change-me-before-first-run@db:5432/kalshi_copilot}
+  REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+  CONFIG_PATH: /app/config.yaml
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  LOG_FORMAT: ${LOG_FORMAT:-console}
+
+x-backend-volumes: &backend-volumes
+  # config is bind-mounted so settings edits do not require a rebuild
+  - ./config.yaml:/app/config.yaml:ro
+  - ./data:/app/data:ro
+  # private keys: read-only, never written, never logged
+  - ./secrets:/run/secrets:ro
+
+services:
+  db:
+    image: timescale/timescaledb:2.17.2-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-copilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-kalshi_copilot}
+      # deterministic timestamps everywhere
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-copilot} -d ${POSTGRES_DB:-kalshi_copilot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", ""]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      SERVICE_ROLE: api
+    volumes: *backend-volumes
+    ports:
+      # LAN-only by design. Do not expose this to the internet.
+      - "${BIND_ADDR:-0.0.0.0}:${API_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck", "--http"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 25s
+
+  ingest:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.ingest.main"]
+    environment:
+      <<: *backend-env
+      SERVICE_ROLE: ingest
+    volumes: *backend-volumes
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck", "--heartbeat", "ingest"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker.main"]
+    environment:
+      <<: *backend-env
+      SERVICE_ROLE: worker
+    volumes: *backend-volumes
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.healthcheck", "--heartbeat", "worker"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+
+volumes:
+  pgdata:
+  redisdata:
