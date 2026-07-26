@@ -3,8 +3,8 @@ import type { Health, SystemStatus } from "./api";
 const MILESTONES: [string, string, boolean][] = [
   ["M0", "Scaffold, compose stack, fees module", true],
   ["M1", "Ingest + storage", true],
-  ["M2", "Dashboard core", false],
-  ["M3", "HITL approval + execution rail", false],
+  ["M2", "Dashboard core", true],
+  ["M3", "HITL approval + execution rail", true],
   ["M4", "Detectors wave 1", false],
   ["M5", "Risk layer + PWA notifications", false],
   ["M6", "BTC engine + detectors wave 2", false],

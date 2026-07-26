@@ -7,7 +7,14 @@ Units mirror the Kalshi API exactly:
   market, so sub-cent prices are real and must not be rounded on ingest.
 - **Contract counts are ``Numeric(16, 2)``** because fractional contracts are
   supported down to 0.01.
-- **Fees and realised P&L are integer cents**, which they exactly are.
+- **Fees are integer cents**, which they exactly are: the exchange charges a
+  whole number of cents per fill.
+- **Realised P&L is Decimal cents**, which it exactly is not. P&L is a price
+  difference times a count, and with sub-cent tick sizes and fractional
+  contracts both factors can be fractional — closing 0.50 contracts for a
+  1c move earns half a cent. Rounding each realisation to whole cents would
+  quietly accumulate error in the one number the report card is judged on,
+  so it is carried exactly and rounded only for display.
 
 Nothing money-related is a float. Money that drifts is money you cannot audit.
 
@@ -49,6 +56,9 @@ from app.db.base import Base
 PriceType = Numeric(12, 6)
 #: Contract count, 0.01 granularity.
 QtyType = Numeric(16, 2)
+#: Realised/unrealised P&L in cents. Fractional because a price difference
+#: times a fractional count is fractional — see the module docstring.
+PnlCentsType = Numeric(20, 6)
 
 
 class Side(enum.StrEnum):
@@ -319,9 +329,15 @@ class ProposedTrade(Base):
     ticker: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     side: Mapped[Side] = mapped_column(Enum(Side, name="side"), nullable=False)
     action: Mapped[str] = mapped_column(String(8), nullable=False, default="buy")
+    #: Price on the traded side, in dollars — what you pay per contract on a
+    #: buy. "Buy NO at 30c" stores 0.30 here; the YES price the exchange
+    #: wants is derived at the wire boundary. See app.trading.direction.
     limit_price: Mapped[Decimal] = mapped_column(PriceType, nullable=False)
     contracts: Mapped[Decimal] = mapped_column(QtyType, nullable=False)
 
+    #: Fair value on the traded side, when the source had one. Present for
+    #: detector signals; optional on a manual ticket.
+    fair_price: Mapped[Decimal | None] = mapped_column(PriceType)
     net_edge_cents: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
     est_fee_cents: Mapped[int | None] = mapped_column(Integer)
     pct_of_bankroll: Mapped[float | None] = mapped_column(Float)
@@ -365,7 +381,13 @@ class Order(Base):
         nullable=False,
         default=OrderStatus.PENDING,
     )
+    #: True unless this order reached the live exchange with real money.
     is_paper: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    #: Which rail carried it: simulated | demo_exchange | live_exchange.
+    #: `is_paper` collapses two of those into one bit; the audit trail wants
+    #: to know which, because a demo fill and a simulated fill are different
+    #: kinds of evidence.
+    route: Mapped[str] = mapped_column(String(16), default="simulated")
     error: Mapped[str | None] = mapped_column(Text)
 
     created_at: Mapped[datetime] = _ts()
@@ -385,6 +407,10 @@ class Fill(Base):
     exchange_fill_id: Mapped[str | None] = mapped_column(String(64))
     ticker: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     side: Mapped[Side] = mapped_column(Enum(Side, name="side"), nullable=False)
+    #: buy | sell. Needed because ``side`` alone cannot tell "bought 10 YES"
+    #: from "sold 10 YES", and those are opposite positions.
+    action: Mapped[str] = mapped_column(String(8), nullable=False, default="buy")
+    #: Price on ``side``, in dollars — 0.30 for a NO fill at 30c.
     price: Mapped[Decimal] = mapped_column(PriceType, nullable=False)
     contracts: Mapped[Decimal] = mapped_column(QtyType, nullable=False)
     #: Fees round up per fill, so this is recorded per fill, not per order.
@@ -394,15 +420,31 @@ class Fill(Base):
 
 
 class Position(Base):
+    """One row per (market, book). Signed, in YES-equivalent contracts.
+
+    ``net_contracts`` is positive for a long YES position and negative for a
+    long NO one, because on this exchange buying NO genuinely cancels a YES
+    position rather than sitting beside it — a single signed number is the
+    only representation where exposure nets correctly.
+
+    ``avg_price`` is therefore the average **YES price** of the open position
+    whichever side it is on: 5 NO contracts bought at 30c are carried as
+    ``net_contracts = -5, avg_price = 0.70``. Display converts back.
+    """
+
     __tablename__ = "positions"
     __table_args__ = (UniqueConstraint("ticker", "is_paper", name="uq_position"),)
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     ticker: Mapped[str] = mapped_column(String(128), nullable=False)
+    #: False only for orders that reached the live exchange with real money.
+    #: Demo-exchange orders are paper: the rail is real, the money is not.
     is_paper: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     net_contracts: Mapped[Decimal] = mapped_column(QtyType, default=Decimal(0))
     avg_price: Mapped[Decimal] = mapped_column(PriceType, default=Decimal(0))
-    realized_pnl_cents: Mapped[int] = mapped_column(BigInteger, default=0)
+    realized_pnl_cents: Mapped[Decimal] = mapped_column(
+        PnlCentsType, default=Decimal(0)
+    )
     fees_paid_cents: Mapped[int] = mapped_column(BigInteger, default=0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -416,8 +458,12 @@ class PnlDaily(Base):
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     day: Mapped[date] = mapped_column(Date, nullable=False)
     is_paper: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    realized_pnl_cents: Mapped[int] = mapped_column(BigInteger, default=0)
-    unrealized_pnl_cents: Mapped[int] = mapped_column(BigInteger, default=0)
+    realized_pnl_cents: Mapped[Decimal] = mapped_column(
+        PnlCentsType, default=Decimal(0)
+    )
+    unrealized_pnl_cents: Mapped[Decimal] = mapped_column(
+        PnlCentsType, default=Decimal(0)
+    )
     fees_paid_cents: Mapped[int] = mapped_column(BigInteger, default=0)
     trades: Mapped[int] = mapped_column(Integer, default=0)
 

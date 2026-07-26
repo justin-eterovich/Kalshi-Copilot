@@ -41,6 +41,7 @@ from app.core.money import parse_count, parse_dollars
 __all__ = [
     "FeeSchedule",
     "UnverifiedFeeCategory",
+    "UncategorisedMarket",
     "load_fee_schedule",
     "taker_fee_cents",
     "maker_fee_cents",
@@ -49,7 +50,21 @@ __all__ = [
 ]
 
 CENT: Final = Decimal("0.01")
+#: Where the schedule lives inside the container image. Used only when
+#: settings are unavailable; :func:`load_fee_schedule` prefers the configured
+#: path so a stack running outside Docker reads the same file.
 DEFAULT_SCHEDULE_PATH: Final = Path("/app/data/fee_schedule.yaml")
+
+
+def _default_schedule_path() -> Path:
+    # Imported lazily: this module is the pure engine and must not take a
+    # settings dependency at import time.
+    try:
+        from app.settings import get_settings
+
+        return Path(get_settings().fee_schedule_path)
+    except Exception:  # noqa: BLE001 - settings are optional for the engine
+        return DEFAULT_SCHEDULE_PATH
 
 
 class UnverifiedFeeCategory(RuntimeError):
@@ -69,6 +84,40 @@ class UnverifiedFeeCategory(RuntimeError):
             f"Markets in this category are excluded from proposals until then."
         )
         self.category = category
+
+
+class UncategorisedMarket(UnverifiedFeeCategory):
+    """Raised when a market has no category at all, so no multiplier applies.
+
+    A missing category is **not** the same as an unrecognised one, and
+    conflating them is how an unverified market gets priced anyway.
+    :meth:`FeeSchedule.multiplier` falls back to ``default`` for a category it
+    does not recognise, which is right for a category that genuinely exists
+    and is simply not premium-rated.  A ``None`` category means something
+    else: *we have not looked yet*.
+
+    Categories live on the Event, not the Market, and ingest joins them across
+    after the (long) event sync. Until that join lands — on a fresh database,
+    for a newly listed ticker, or whenever an event failed to sync — a Crypto
+    market looks exactly like an uncategorised one, and the default multiplier
+    would price it happily. That was observed live: a Bitcoin market quoted at
+    the standard rate with HTTP 200 while ``crypto`` was still unverified.
+
+    Subclasses :class:`UnverifiedFeeCategory` so every existing fail-closed
+    handler catches it without modification.
+    """
+
+    def __init__(self, ticker: str | None = None) -> None:
+        where = f" ({ticker})" if ticker else ""
+        RuntimeError.__init__(
+            self,
+            f"This market{where} has no category, so its fee multiplier is "
+            f"unknown and its cost cannot be trusted. Categories come from the "
+            f"parent Event; wait for the catalog sync to finish, or check that "
+            f"the event synced at all. Excluded from proposals until then.",
+        )
+        self.category = "uncategorised"
+        self.ticker = ticker
 
 
 def _round_up_cents(dollars: Decimal) -> int:
@@ -157,8 +206,14 @@ class FeeSchedule:
 
 @lru_cache(maxsize=4)
 def load_fee_schedule(path: str | Path | None = None) -> FeeSchedule:
-    """Load and cache the fee schedule from disk."""
-    resolved = Path(path) if path is not None else DEFAULT_SCHEDULE_PATH
+    """Load and cache the fee schedule from disk.
+
+    With no argument the path comes from settings, so callers that do not
+    thread a schedule through — the paper fill simulator, ticket pricing —
+    still read the same file the rest of the stack does. The constant below
+    is only a fallback for when settings cannot be constructed at all.
+    """
+    resolved = Path(path) if path is not None else _default_schedule_path()
     if not resolved.exists():
         raise FileNotFoundError(
             f"Fee schedule not found at {resolved}. It is required: every edge "

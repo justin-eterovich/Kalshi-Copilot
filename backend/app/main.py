@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api import ws
-from app.api.routes import health, markets
+from app.api.routes import health, markets, trading
 from app.config import get_config
 from app.core.fees import load_fee_schedule
 from app.core.logging import configure_logging, get_logger
@@ -21,6 +21,7 @@ from app.db.bootstrap import init_db
 from app.ingest.backfill import Backfiller
 from app.kalshi.client import build_rest_client
 from app.settings import get_settings
+from app.trading.interlocks import InterlockError, resolve_route
 
 log = get_logger(__name__)
 
@@ -67,6 +68,30 @@ def _log_safety_posture(settings, config) -> None:
             settings.live_trading,
         )
 
+    # Say plainly where an approved order would actually go. "Paper" covers
+    # two very different rails — a local simulator and real orders on the
+    # demo exchange — and the logs should never leave that ambiguous.
+    try:
+        route = resolve_route(settings, config)
+        log.info(
+            "execution route: %s (%s)",
+            route.value,
+            {
+                "simulated": "filled locally against the live book, no API call",
+                "demo_exchange": "real orders on Kalshi demo, play money",
+                "live_exchange": "REAL ORDERS WITH REAL MONEY",
+            }[route.value],
+        )
+    except InterlockError as exc:
+        log.error(
+            "no usable execution route (%s): %s. Approvals will be refused.",
+            exc.code,
+            exc,
+        )
+
+    if config.risk.kill_switch:
+        log.warning("KILL SWITCH ENGAGED — no proposals, no new orders")
+
     if not settings.credentials_present():
         log.warning(
             "no usable credentials for env=%s (key id set: %s, key file: %s) — "
@@ -97,6 +122,7 @@ app = FastAPI(
 
 app.include_router(health.router, prefix="/api", tags=["system"])
 app.include_router(markets.router, prefix="/api", tags=["catalog"])
+app.include_router(trading.router, prefix="/api", tags=["trading"])
 app.include_router(ws.router, tags=["realtime"])
 
 

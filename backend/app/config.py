@@ -25,8 +25,16 @@ class OrderConfig(_Base):
 
 
 class TradingConfig(_Base):
+    # There is no third value here and there must never be one. A test
+    # asserts that; see tests/test_config.py.
     mode: Literal["paper", "live"] = "paper"
     default_proposal_ttl_sec: int = Field(120, ge=5)
+    #: In paper mode, place real orders on the *demo* exchange when demo
+    #: credentials exist, instead of filling against the local simulator.
+    #: Demo is play money, so this exercises the real order rail for free.
+    #: Set false to keep everything local. It cannot route to production —
+    #: paper mode never does, whatever this says.
+    paper_uses_demo_exchange: bool = True
     order: OrderConfig = OrderConfig()
 
 

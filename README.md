@@ -22,7 +22,7 @@ model-driven fair value.
 | **M0** | Scaffold, compose stack, fees module | ✅ done |
 | **M1** | Ingest + storage | ✅ done |
 | **M2** | Dashboard core (screener, market page, charts) | ✅ done |
-| M3 | HITL approval + execution rail | pending |
+| **M3** | HITL approval + execution rail | ✅ done |
 | M4 | Detectors wave 1 (set-arb, resolution sniper, BTC stale-quote) | pending |
 | M5 | Risk layer + PWA notifications | pending |
 | M6 | BTC engine + detectors wave 2 | pending |
@@ -137,13 +137,66 @@ proposals** rather than priced with a guess. See "Fees" below.
 
 ---
 
+## Trading
+
+Every order starts as a **proposal** — a request for a human decision. Nothing
+reaches an exchange until you approve that specific proposal.
+
+1. Open a market and fill in the **trade ticket**. The cost, fee, breakeven
+   and worst case update as you type, computed by the backend so the fee
+   engine stays the single source of those numbers.
+2. Press **propose**. The trade goes into the queue on `/trades` and the nav
+   badge (and the browser tab title) shows the pending count.
+3. Approve it. That is a two-step interaction; on the live route it also
+   requires typing the market ticker.
+
+Proposals **expire** after `trading.default_proposal_ttl_sec` (120s). A
+proposal carries a price that was executable when it was written — approving
+a stale quote means trading against a book that has moved, so expiry makes it
+un-actionable rather than merely inadvisable.
+
+### Where an approved order actually goes
+
+| `trading.mode` | `KALSHI_ENV` | `LIVE_TRADING` | credentials | route |
+|---|---|---|---|---|
+| `paper` | demo | — | yes | **demo exchange** — real orders, play money |
+| `paper` | demo | — | no | **simulated** — local fill sim, no API call |
+| `paper` | prod | — | — | **simulated** — never touches prod |
+| `live` | prod | true | yes | **live exchange** — real money |
+| `live` | anything else | | | **refused** |
+
+The header shows which one is active. Two rows deserve emphasis:
+
+- **Paper mode never touches a production exchange**, even with prod
+  credentials present. Changing `KALSHI_ENV` for a data reason must not
+  quietly arm real money.
+- **`mode: live` without both environment interlocks refuses** rather than
+  degrading to paper. A config that says live must not trade fictionally
+  while the dashboard says otherwise.
+
+Set `trading.paper_uses_demo_exchange: false` to force the local simulator
+even when demo credentials exist.
+
+### Paper fills are deliberately pessimistic
+
+The simulator crosses the spread, walks the book, and charges a **separate
+taker fee per price level** — because fees round up per fill, and an order
+sweeping three levels rounds up three times. It never fills through your
+limit, and a market with no book fills nothing rather than inventing a price.
+
+A simulator that flatters itself produces a report card saying a detector
+works when it does not, and that report card is what decides whether real
+money gets deployed.
+
+---
+
 ## Going live
 
 Live trading is deliberately awkward to enable. All three must be true:
 
 1. `KALSHI_ENV=prod` in `.env`
 2. `LIVE_TRADING=true` in `.env`
-3. Confirmation in the UI modal, **per trade**
+3. Confirmation in the UI, **per trade** — typing the market ticker
 
 ```bash
 # only when you actually mean it
@@ -215,8 +268,18 @@ backend/app/
     catalog.py       series/events/markets sync, category backfill
     normalize.py     API payloads -> ORM rows
     streams.py       tape, candles, book snapshots
+  trading/
+    direction.py     ⭐ (side, action) <-> Kalshi's single bid/ask book
+    interlocks.py    execution routing + every safety check
+    pricing.py       fee-aware ticket costing
+    proposals.py     proposal lifecycle: create, expire, decide
+    executor.py      ⭐ the only module that can cause an order to exist
+    paper.py         pessimistic fill simulator
+    positions.py     signed position + realised P&L accounting
   api/routes/        HTTP endpoints
-  worker/main.py     worker service entrypoint
+  worker/
+    main.py          worker service entrypoint
+    maintenance.py   proposal expiry, order auto-cancel, reconciliation
 backend/tests/       pytest suite
 frontend/            React + Vite + TS dashboard
 data/                fee_schedule.yaml
@@ -311,7 +374,14 @@ easiest way to produce a confident, wrong edge number.
 |---------|-------------|---------------|
 | Price | `FixedPointDollars`, e.g. `"0.5600"`, up to **6 decimals** | `Decimal` dollars, `Numeric(12,6)` |
 | Contract count | `FixedPointCount`, e.g. `"10.00"`, **fractional to 0.01** | `Decimal`, `Numeric(16,2)` |
-| Fee / realised P&L | — | integer **cents**, which they exactly are |
+| Fee | `"0.0175"` dollars | integer **cents**, which it exactly is |
+| Realised P&L | — | `Decimal` cents, `Numeric(20,6)` |
+
+Fees are whole cents because the exchange charges whole cents. Realised P&L
+is **not**: it is a price difference times a count, and with sub-cent ticks
+and fractional contracts both can be fractional — closing 0.50 contracts on a
+1c move earns half a cent. Rounding each realisation would accumulate drift
+in the one number the report card is judged on.
 
 Consequences that are easy to miss:
 
@@ -324,6 +394,29 @@ Consequences that are easy to miss:
   exactly the precision loss the backend avoided.
 - `taker_fee_cents("0.5600", ...)` is right; `taker_fee_cents(56, ...)` raises
   rather than silently pricing a market at $56.
+
+### Order direction
+
+Kalshi's order API quotes **one book, from the YES side**: `bid` = buy YES,
+`ask` = sell YES, and the wire price is *always* the YES price.
+
+| side/action | book side | wire price |
+|-------------|-----------|------------|
+| buy YES | `bid` | `p` |
+| sell YES | `ask` | `p` |
+| **buy NO** | **`ask`** | **`1 − p`** |
+| sell NO | `bid` | `1 − p` |
+
+"Buy NO at 30¢" reaches the exchange as an **ask at 0.70**. Nothing
+downstream catches an inversion: the fee formula `P(1−P)` is symmetric, so a
+flipped direction produces the same fee, the same notional, and a plausible
+confirmation. `backend/app/trading/direction.py` owns this mapping and it is
+never inlined elsewhere. The approval card shows the literal wire form so you
+can check it before committing.
+
+Positions use the opposite convention — one **signed** number per market in
+YES-equivalents (positive YES, negative NO), matching the API's own signed
+`position_fp`. The UI converts back to "10 NO at 30¢" for display.
 
 ---
 
@@ -419,8 +512,12 @@ python -m pytest tests/ -v
 
 | Control | Behaviour |
 |---------|-----------|
-| Per-trade approval | Every order, always. Detector signals and manual tickets use the same queue. |
-| Environment interlock | Live needs `KALSHI_ENV=prod` **and** `LIVE_TRADING=true` **and** UI confirmation. |
+| Per-trade approval | Every order, always. Detector signals and manual tickets use the same queue. There is no bulk approve. |
+| Environment interlock | Live needs `KALSHI_ENV=prod` **and** `LIVE_TRADING=true` **and** the ticker typed back, per trade. |
+| Paper never hits prod | Paper mode routes to the simulator on a prod environment rather than trading it. |
+| Live never degrades | `mode: live` without the env interlocks refuses, rather than silently trading on paper. |
+| Proposal TTL | A proposal expires (120s default) and cannot then be approved. Checked at approval, not just by the sweep. |
+| No write retries | A timed-out order POST may have been accepted, so it raises instead of retrying. Recovery is reconciliation by client order ID. |
 | Kill switch | Halts all proposals and cancels resting orders. |
 | Detector flags | Each detector independently enabled; all off by default. |
 | Fee fail-closed | Unknown fee multiplier ⇒ market excluded, never guessed. |

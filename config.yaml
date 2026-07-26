@@ -22,6 +22,16 @@ trading:
   # Proposals expire if not approved within this window (seconds).
   default_proposal_ttl_sec: 120
 
+  # In paper mode, send approved orders to the *demo* exchange when demo
+  # credentials exist. Demo is play money, so this exercises the real order
+  # rail — signing, rate limits, partial fills — at no risk. Set false to fill
+  # against the local simulator instead.
+  #
+  # This can never route to production. Paper mode refuses to touch a prod
+  # exchange even if KALSHI_ENV=prod, so changing the environment for a data
+  # reason cannot quietly arm real money.
+  paper_uses_demo_exchange: true
+
   # Order placed on approval.
   order:
     # gtc | ioc

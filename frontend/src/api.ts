@@ -132,20 +132,196 @@ export interface CatalogStats {
   }[];
 }
 
+// ---------------------------------------------------------------------------
+// Trading (M3)
+//
+// Every price here is a dollar string. The backend refuses a cents-style "56"
+// rather than reading it as $56, so the forms send exactly what was typed and
+// let the engine validate it.
+// ---------------------------------------------------------------------------
+
+export interface TradingState {
+  environment: string;
+  trading_mode: string;
+  live_trading_armed: boolean;
+  kill_switch: boolean;
+  credentials_present: boolean;
+  /** simulated | demo_exchange | live_exchange, or null when refused. */
+  execution_route: string | null;
+  route_blocked_by: string | null;
+  real_money: boolean;
+  requires_typed_confirmation: boolean;
+  proposal_ttl_sec: number;
+  time_in_force: string;
+  auto_cancel_after_sec: number;
+  pending_proposals: number;
+  working_orders: number;
+  balance?: {
+    cents: number | null;
+    dollars: string | null;
+    portfolio_value_cents: number | null;
+  };
+  balance_error?: string;
+}
+
+export interface TicketQuote {
+  ticker: string;
+  side: string;
+  action: string;
+  limit_price: string;
+  contracts: string;
+  category: string | null;
+  is_taker: boolean;
+  /** Exactly what will be sent to Kalshi, so it can be shown before approval. */
+  wire: { book_side: string; yes_price: string; count: string };
+  notional_cents: string;
+  est_fee_cents: number;
+  total_cost_cents: string;
+  breakeven_cents: string;
+  max_loss_cents: string;
+  max_win_cents: string;
+  /** Present only when a fair value was supplied. Always net of costs. */
+  net_edge_cents: string | null;
+  fair_price: string | null;
+}
+
+export interface Proposal {
+  id: number;
+  signal_id: number | null;
+  source: string;
+  ticker: string;
+  side: string;
+  action: string;
+  limit_price: string;
+  contracts: string;
+  fair_price: string | null;
+  net_edge_cents: string | null;
+  est_fee_cents: number | null;
+  pct_of_bankroll: number | null;
+  rationale: string | null;
+  status: string;
+  expires_at: string | null;
+  expires_in_sec: number | null;
+  decided_at: string | null;
+  decision_reason: string | null;
+  created_at: string | null;
+}
+
+export interface OrderRow {
+  id: number;
+  proposal_id: number | null;
+  client_order_id: string;
+  exchange_order_id: string | null;
+  ticker: string;
+  side: string;
+  action: string;
+  limit_price: string;
+  contracts: string;
+  filled_contracts: string;
+  time_in_force: string;
+  status: string;
+  is_paper: boolean;
+  route: string;
+  error: string | null;
+  created_at: string | null;
+}
+
+export interface FillRow {
+  id: number;
+  order_id: number | null;
+  exchange_fill_id: string | null;
+  ticker: string;
+  side: string;
+  action: string;
+  price: string;
+  contracts: string;
+  fee_cents: number;
+  is_taker: boolean;
+  ts: string | null;
+}
+
+export interface PositionRow {
+  ticker: string;
+  is_paper: boolean;
+  net_contracts: string;
+  side: string;
+  contracts: string;
+  avg_price: string;
+  avg_yes_price: string;
+  realized_pnl_cents: string;
+  unrealized_pnl_cents: string | null;
+  fees_paid_cents: number;
+  updated_at: string | null;
+}
+
+export interface AuditEntry {
+  id: number;
+  ts: string | null;
+  kind: string;
+  ticker: string | null;
+  actor: string;
+  payload: Record<string, unknown> | null;
+}
+
+export interface TicketInput {
+  ticker: string;
+  side: "yes" | "no";
+  action: "buy" | "sell";
+  limit_price: string;
+  contracts: string;
+  fair_price?: string | null;
+  rationale?: string | null;
+  ttl_sec?: number | null;
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
     public status: number,
+    /** Stable machine-readable reason from the backend, when it sent one. */
+    public code?: string,
+    public detail?: string,
   ) {
     super(message);
   }
 }
 
+async function parseError(response: Response, path: string): Promise<ApiError> {
+  let code: string | undefined;
+  let detail: string | undefined;
+  try {
+    const body = await response.json();
+    const d = body?.detail;
+    if (typeof d === "string") {
+      detail = d;
+    } else if (d && typeof d === "object") {
+      code = d.error;
+      detail = d.message;
+    }
+  } catch {
+    /* a non-JSON error body is still an error */
+  }
+  return new ApiError(
+    detail || `${path} -> HTTP ${response.status}`,
+    response.status,
+    code,
+    detail,
+  );
+}
+
 async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(path);
-  if (!response.ok) {
-    throw new ApiError(`${path} -> HTTP ${response.status}`, response.status);
-  }
+  if (!response.ok) throw await parseError(response, path);
+  return (await response.json()) as T;
+}
+
+async function postJson<T>(path: string, body?: unknown): Promise<T> {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  });
+  if (!response.ok) throw await parseError(response, path);
   return (await response.json()) as T;
 }
 
@@ -186,6 +362,58 @@ export const api = {
     getJson<OrderbookResponse>(
       `/api/markets/${encodeURIComponent(ticker)}/orderbook`,
     ),
+
+  // -- trading ------------------------------------------------------------
+
+  tradingState: () => getJson<TradingState>("/api/trading/state"),
+
+  /** Price a ticket without creating anything. */
+  quoteTicket: (ticket: TicketInput) =>
+    postJson<{ quote: TicketQuote; market: Record<string, string | null> }>(
+      "/api/proposals/quote",
+      ticket,
+    ),
+
+  /** Create a pending proposal. Sends nothing to any exchange. */
+  propose: (ticket: TicketInput) =>
+    postJson<{ proposal: Proposal; quote: TicketQuote }>(
+      "/api/proposals",
+      ticket,
+    ),
+
+  proposals: (status?: string) =>
+    getJson<{ proposals: Proposal[] }>(
+      `/api/proposals?${qs({ status, limit: 100 })}`,
+    ),
+
+  /**
+   * Approve one proposal and place its order. `confirm` is always explicit,
+   * and the live route additionally requires the ticker typed back.
+   */
+  approve: (id: number, confirmationPhrase?: string) =>
+    postJson<{ proposal: Proposal; order: OrderRow; fills: FillRow[] }>(
+      `/api/proposals/${id}/approve`,
+      { confirm: true, confirmation_phrase: confirmationPhrase ?? null },
+    ),
+
+  reject: (id: number, reason?: string) =>
+    postJson<{ proposal: Proposal }>(`/api/proposals/${id}/reject`, {
+      reason: reason ?? null,
+    }),
+
+  orders: (ticker?: string) =>
+    getJson<{ orders: OrderRow[] }>(`/api/orders?${qs({ ticker, limit: 50 })}`),
+
+  cancelOrder: (id: number) =>
+    postJson<{ order: OrderRow }>(`/api/orders/${id}/cancel`),
+
+  fills: (ticker?: string) =>
+    getJson<{ fills: FillRow[] }>(`/api/fills?${qs({ ticker, limit: 100 })}`),
+
+  positions: () => getJson<{ positions: PositionRow[] }>("/api/positions"),
+
+  audit: (kind?: string) =>
+    getJson<{ entries: AuditEntry[] }>(`/api/audit?${qs({ kind, limit: 100 })}`),
 };
 
 // ---------------------------------------------------------------------------
@@ -233,6 +461,40 @@ export function asTimeToClose(hours: number | null): string {
   if (hours < 1) return `${Math.round(hours * 60)}m`;
   if (hours < 48) return `${hours.toFixed(1)}h`;
   return `${Math.round(hours / 24)}d`;
+}
+
+/** Render a cents-string as money: "5175.00" -> "$51.75". */
+export function asDollars(cents: string | null | undefined): string {
+  if (cents === null || cents === undefined || cents === "") return "—";
+  const value = Number(cents) / 100;
+  if (!Number.isFinite(value)) return "—";
+  const sign = value < 0 ? "-" : "";
+  return `${sign}$${Math.abs(value).toFixed(2)}`;
+}
+
+/** A cents figure with an explicit sign, for P&L and edges. */
+export function asSignedCents(
+  cents: string | null | undefined,
+  dp = 2,
+): string {
+  if (cents === null || cents === undefined || cents === "") return "—";
+  const value = Number(cents);
+  if (!Number.isFinite(value)) return "—";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(dp)}¢`;
+}
+
+/** Human label for an execution route. */
+export function routeLabel(route: string | null): string {
+  switch (route) {
+    case "simulated":
+      return "simulated";
+    case "demo_exchange":
+      return "demo exchange";
+    case "live_exchange":
+      return "LIVE — real money";
+    default:
+      return "unavailable";
+  }
 }
 
 export function asClock(iso: string): string {

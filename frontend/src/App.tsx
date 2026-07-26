@@ -3,7 +3,14 @@ import { Link, Route, Routes, useLocation } from "react-router-dom";
 import MarketPage from "./MarketPage";
 import Screener from "./Screener";
 import SystemPanel from "./SystemPanel";
-import { api, type Health, type SystemStatus } from "./api";
+import Trades from "./Trades";
+import {
+  api,
+  routeLabel,
+  type Health,
+  type SystemStatus,
+  type TradingState,
+} from "./api";
 
 function Pill({
   ok,
@@ -21,6 +28,7 @@ function Pill({
 export default function App() {
   const [system, setSystem] = useState<SystemStatus | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
+  const [trading, setTrading] = useState<TradingState | null>(null);
   const location = useLocation();
 
   useEffect(() => {
@@ -32,6 +40,11 @@ export default function App() {
       } catch {
         /* the active panel surfaces the error */
       }
+      try {
+        setTrading(await api.tradingState());
+      } catch {
+        /* trading state is additive; the header degrades without it */
+      }
     };
     load();
     const id = setInterval(load, 5000);
@@ -39,7 +52,17 @@ export default function App() {
   }, []);
 
   const live = system?.live_trading_armed ?? false;
-  const onSystem = location.pathname.startsWith("/system");
+  const pending = trading?.pending_proposals ?? 0;
+  const path = location.pathname;
+  const onSystem = path.startsWith("/system");
+  const onTrades = path.startsWith("/trades");
+  const onMarkets = !onSystem && !onTrades;
+
+  // The approval queue has to be visible from anywhere: a proposal expires in
+  // seconds, and a badge you only see on one page is a badge you miss.
+  useEffect(() => {
+    document.title = pending > 0 ? `(${pending}) kalshi-copilot` : "kalshi-copilot";
+  }, [pending]);
 
   return (
     <div className="app">
@@ -49,8 +72,12 @@ export default function App() {
         </Link>
 
         <nav className="tabs">
-          <Link to="/" className={onSystem ? "tab" : "tab active"}>
+          <Link to="/" className={onMarkets ? "tab active" : "tab"}>
             markets
+          </Link>
+          <Link to="/trades" className={onTrades ? "tab active" : "tab"}>
+            trades
+            {pending > 0 && <span className="badge">{pending}</span>}
           </Link>
           <Link to="/system" className={onSystem ? "tab active" : "tab"}>
             system
@@ -59,6 +86,11 @@ export default function App() {
 
         <span className="spacer" />
 
+        {trading && (
+          <Pill ok={!trading.real_money} warn={trading.real_money}>
+            {routeLabel(trading.execution_route)}
+          </Pill>
+        )}
         {system && (
           <>
             <Pill ok={!live} warn={live}>
@@ -96,6 +128,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={<Screener />} />
           <Route path="/market/:ticker" element={<MarketPage />} />
+          <Route path="/trades" element={<Trades />} />
           <Route
             path="/system"
             element={<SystemPanel system={system} health={health} />}

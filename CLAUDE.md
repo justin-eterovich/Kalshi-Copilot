@@ -13,9 +13,16 @@ anything; several of the rules below were learned the expensive way.
    test asserts that. If a task seems to require automatic execution, stop and
    ask.
 2. **Live trading needs three interlocks**: `KALSHI_ENV=prod` **and**
-   `LIVE_TRADING=true` **and** per-trade confirmation in the UI.
+   `LIVE_TRADING=true` **and** per-trade confirmation in the UI (typing the
+   market ticker, on the live route).
 3. **Demo-first.** Default environment is Kalshi demo. Demo and prod use
    separate credentials; a demo key will not authenticate against prod.
+   **Paper mode never touches a production exchange**, even with prod
+   credentials present — it falls back to the local simulator. Changing
+   `KALSHI_ENV` for a data reason must not quietly arm real money.
+   Conversely `mode: live` without both env interlocks **refuses** rather
+   than degrading to paper: a config that says live must not trade
+   fictionally while the dashboard says otherwise.
 4. **Docs win.** `docs.kalshi.com` is authoritative over anything written here
    or in the original spec. The machine-readable specs are the best source:
    `https://docs.kalshi.com/openapi.yaml` and `.../asyncapi.yaml`.
@@ -38,7 +45,15 @@ entire milestone's schema when it was discovered late; do not reintroduce it.
 |---------|-------------|----------|
 | Price | `"0.5600"` — dollars, up to **6 decimals** | `Decimal` dollars, `Numeric(12,6)` |
 | Count | `"10.00"` — **fractional to 0.01** | `Decimal`, `Numeric(16,2)` |
-| Fee / realised P&L | — | integer **cents** (they exactly are) |
+| Fee | `"0.0175"` dollars on the wire | integer **cents** (it exactly is) |
+| Realised P&L | — | `Decimal` cents, `Numeric(20,6)` |
+
+Fees are whole cents because the exchange charges whole cents. **Realised P&L
+is not** — it is a price difference times a count, and both factors can be
+fractional (closing 0.50 contracts on a 1c move earns half a cent). M3
+corrected this: rounding each realisation would accumulate drift in the one
+number the report card is judged on, so it is carried exactly and rounded
+only for display.
 
 - Tick size varies per market (`price_level_structure`), so sub-cent prices
   are real. Never round a quote on ingest.
@@ -51,8 +66,53 @@ entire milestone's schema when it was discovered late; do not reintroduce it.
 
 ---
 
+## Order direction — read before touching the execution rail
+
+**Kalshi's order API quotes one book, from the YES side.** `bid` = buy YES,
+`ask` = sell YES, and `price` on the wire is **always the YES price**,
+whichever direction you are going.
+
+| side/action | book side | wire price |
+|-------------|-----------|------------|
+| buy YES | `bid` | `p` |
+| sell YES | `ask` | `p` |
+| **buy NO** | **`ask`** | **`1 - p`** |
+| sell NO | `bid` | `1 - p` |
+
+"Buy NO at 30c" goes to the exchange as an **ask at 0.70**. Both halves have
+to be right or the position is inverted — and **nothing catches an inversion
+downstream**: the fee formula `P(1-P)` is symmetric, so a flipped direction
+produces the same fee, the same notional, and a plausible confirmation. The
+only guards are `app/trading/direction.py` and the tests around it. Never
+inline this mapping anywhere else.
+
+Internally we keep `side` (yes/no) + `action` (buy/sell) because that is how
+a trader reads a ticket, and `limit_price` is the price on the **traded
+side** — `0.30` for "buy NO at 30c". Conversion happens only at the wire.
+
+Positions are the opposite convention: one **signed** number per market in
+YES-equivalents (positive YES, negative NO), with `avg_price` as a YES price.
+That is the only form in which exposure nets correctly, and it matches the
+API's own signed `position_fp`.
+
+---
+
 ## Non-obvious API facts (verified against live demo)
 
+- **Order creation is `POST /portfolio/events/orders` (V2), not
+  `/portfolio/orders`.** The legacy path is deprecated (no earlier than
+  2026-05-06) and speaks integer cents — the exact unit mistake this codebase
+  exists to avoid. V2 speaks fixed-point dollars. Confusingly, `GET
+  /portfolio/orders` is still the read path; only creation moved.
+- **`self_trade_prevention_type` is required** on order creation, and `GTT`
+  is not a valid `time_in_force` — an expiring order is `good_till_canceled`
+  plus an `expiration_time`.
+- **`OrderStatus` from the API has only `resting|canceled|executed`.**
+  "Partially filled" is something we derive from fill count, not read.
+- **Writes are never retried.** A `POST` that times out may still have
+  reached the matching engine, so `rest.py` raises on write timeouts and 5xx
+  rather than retrying. 429 is safe to retry (rejected, not executed).
+  Recovery is reconciliation by client order ID, never a second POST.
 - **The WebSocket requires auth even for public market-data channels.** REST
   public market data does not. This is why the market page reads through to
   REST: it works with no key at all.
@@ -119,6 +179,16 @@ backend/app/
     normalize.py     API payloads -> ORM rows
     streams.py       tape, candles, book snapshots
     backfill.py      REST read-through for the market page
+  trading/
+    direction.py     ⭐ (side, action) <-> bid/ask. Never inline this.
+    interlocks.py    execution routing + every safety check
+    pricing.py       fee-aware ticket costing (calls fees.py, owns no fee math)
+    proposals.py     proposal lifecycle: create, expire, decide
+    executor.py      ⭐ the ONLY module that can cause an order to exist
+    paper.py         pessimistic fill simulator
+    positions.py     signed position + realised P&L accounting
+  worker/
+    maintenance.py   proposal expiry, order auto-cancel, reconciliation
   api/routes/        HTTP endpoints
   api/ws.py          browser relay (shared Redis subscription)
 frontend/src/        React + Vite + TS
@@ -159,8 +229,8 @@ a liquidity score of −450 on a 0–100 scale, fractional sizes rendering as
 | M0 scaffold, compose, fees | done |
 | M1 ingest + storage | done |
 | M2 dashboard core | done |
-| M3 HITL approval/execution rail | **next** |
-| M4 detectors wave 1 | pending |
+| M3 HITL approval/execution rail | done |
+| M4 detectors wave 1 | **next** |
 | M5 risk layer + PWA notifications | pending |
 | M6 BTC engine + detectors wave 2 | pending |
 | M7 weather engine | pending |
@@ -171,9 +241,17 @@ Branch: `claude/kalshi-copilot-build-bgyv2d`
 
 ### Open items for the operator
 
+- **M3 ran against a live stack** (portable Postgres + Redis, real ingest
+  against the Kalshi demo REST API, 125k markets). That found four bugs the
+  test suite had passed — see `docs/m3-demo-notes.md`. Two gaps remain: **no
+  demo order has ever been placed** (no credentials on the build machine, so
+  only the `simulated` route was exercised) and **no UI screenshots** (no
+  browser). Do both on the test VM before trusting M3.
 - `data/fee_schedule.yaml` has `crypto: null` → ~5,900 Crypto markets are
   excluded from proposals until verified against the official PDF. Blocks the
-  BTC detector in M4.
+  BTC detector in M4. It also means **Crypto markets cannot be proposed at
+  all** — the trade ticket refuses them with a visible banner, which is a
+  good way to see the fail-closed path working.
 - Notifications are **first-party only** (PWA Web Push, audio, favicon
   badge). The original spec mentioned ntfy/Telegram once in a milestone list;
   that contradicts two more detailed sections and was resolved as a drafting

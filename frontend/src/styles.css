@@ -687,3 +687,214 @@ a {
 .table tr.flash td {
   animation: flash 0.6s ease-out;
 }
+
+/* ---- trading rail (M3) ---------------------------------------------- */
+
+/* Book / tape / ticket sit side by side on a wide screen and stack on a
+   narrow one. The ticket is the widest of the three because it carries the
+   cost breakdown. */
+.split-3 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 12px;
+}
+
+/* Pending-approval count in the nav. A proposal expires in seconds, so this
+   has to be legible from across the room. */
+.badge {
+  display: inline-block;
+  min-width: 16px;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--warn);
+  color: #000;
+  font-size: 11px;
+  text-align: center;
+}
+
+/* ---- trade ticket ---- */
+
+.ticket .field {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.ticket .field > span {
+  display: block;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: 3px;
+}
+
+.ticket .field .input {
+  width: 100%;
+  min-width: 0;
+}
+
+.ticket-seg {
+  margin-bottom: 8px;
+}
+
+.ticket .btn.primary,
+.approval .btn.primary {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.ticket .btn.primary {
+  width: 100%;
+  padding: 7px 12px;
+  margin-top: 4px;
+}
+
+.quote-box {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  padding: 8px 10px;
+  margin: 10px 0;
+}
+
+.ticket-foot {
+  margin: 8px 0 0;
+  font-size: 11px;
+}
+
+.note {
+  color: var(--accent);
+  margin: 8px 0 0;
+}
+
+.error {
+  color: var(--bad);
+  margin: 6px 0;
+}
+
+/* ---- approval queue ---- */
+
+.approvals {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 10px;
+}
+
+.approval {
+  border: 1px solid var(--border-bright);
+  background: var(--bg);
+  padding: 10px 12px;
+}
+
+/* A decided proposal is history, not an action. Recede it. */
+.approval.decided {
+  opacity: 0.55;
+  border-color: var(--border);
+}
+
+.approval-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.approval-ticker {
+  font-size: 14px;
+}
+
+.approval-sub {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.chip.up {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.chip.down {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+
+/* The clock changes colour as it runs out. The proposal is priced against a
+   book that is still moving; the operator should feel that. */
+.countdown {
+  font-size: 20px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.countdown.soon {
+  color: var(--warn);
+}
+
+.countdown.urgent {
+  color: var(--bad);
+}
+
+.approval-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  margin: 10px 0;
+}
+
+.approval-grid .stat-value {
+  font-size: 14px;
+}
+
+.approval-grid .stat-value.up {
+  color: var(--accent);
+}
+
+.approval-grid .stat-value.down {
+  color: var(--bad);
+}
+
+.approval-why {
+  color: var(--text-dim);
+  margin: 0 0 8px;
+}
+
+.approval-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* Confirmation is a second, deliberate step — never a single click. */
+.confirm {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.confirm .input {
+  width: 100%;
+  min-width: 0;
+  margin-bottom: 8px;
+}
+
+.confirm-paper {
+  color: var(--text-dim);
+  margin: 0 0 8px;
+}
+
+.confirm-live {
+  color: var(--bad);
+  margin: 0 0 8px;
+}
+
+.audit-detail {
+  color: var(--text-faint);
+  font-size: 11px;
+  max-width: 520px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

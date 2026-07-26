@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import OrderBookLadder from "./OrderBookLadder";
 import PriceChart from "./PriceChart";
 import TapeView from "./TapeView";
+import TradeTicket from "./TradeTicket";
 import {
   api,
   asCount,
@@ -13,6 +14,7 @@ import {
   type MarketRow,
   type OrderbookResponse,
   type Trade,
+  type TradingState,
 } from "./api";
 import { useLiveFeed } from "./useLiveFeed";
 
@@ -42,6 +44,7 @@ export default function MarketPage() {
   const [period, setPeriod] = useState(PERIODS[0]);
   const [error, setError] = useState<string | null>(null);
   const [chartNote, setChartNote] = useState<string | null>(null);
+  const [trading, setTrading] = useState<TradingState | null>(null);
 
   const watch = useMemo(() => (ticker ? [ticker] : []), [ticker]);
 
@@ -99,6 +102,14 @@ export default function MarketPage() {
     const id = setInterval(loadDepthAndTape, 5000);
     return () => clearInterval(id);
   }, [loadDepthAndTape]);
+
+  const loadTradingState = useCallback(() => {
+    api.tradingState().then(setTrading).catch(() => setTrading(null));
+  }, []);
+
+  useEffect(() => {
+    loadTradingState();
+  }, [loadTradingState]);
 
   if (error) {
     return (
@@ -161,7 +172,7 @@ export default function MarketPage() {
         {chartNote && <p className="muted" style={{ marginTop: 8 }}>{chartNote}</p>}
       </section>
 
-      <div className="split">
+      <div className="split-3">
         <section className="panel">
           <h2>Order book</h2>
           <OrderBookLadder book={book} />
@@ -171,6 +182,12 @@ export default function MarketPage() {
           <h2>Tape</h2>
           <TapeView trades={trades} />
         </section>
+
+        <TradeTicket
+          market={market}
+          state={trading}
+          onProposed={loadTradingState}
+        />
       </div>
 
       <div className="split" style={{ marginTop: 12 }}>

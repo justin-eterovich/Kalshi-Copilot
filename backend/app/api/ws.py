@@ -22,13 +22,20 @@ from typing import Any
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.core.logging import get_logger
-from app.core.redis import CH_PROPOSALS, CH_SIGNALS, CH_SYSTEM, CH_TICKS, get_redis
+from app.core.redis import (
+    CH_ORDERS,
+    CH_PROPOSALS,
+    CH_SIGNALS,
+    CH_SYSTEM,
+    CH_TICKS,
+    get_redis,
+)
 
 log = get_logger(__name__)
 
 router = APIRouter()
 
-CHANNELS = (CH_TICKS, CH_SIGNALS, CH_PROPOSALS, CH_SYSTEM)
+CHANNELS = (CH_TICKS, CH_SIGNALS, CH_PROPOSALS, CH_ORDERS, CH_SYSTEM)
 #: Per-client queue depth before we consider the client too slow to keep.
 CLIENT_QUEUE_MAX = 256
 
@@ -44,7 +51,9 @@ class Client:
         self.dropped = 0
 
     def wants(self, channel: str, payload: dict[str, Any]) -> bool:
-        # Signals, proposals and system events are never per-market noise.
+        # Signals, proposals, orders and system events bypass the filter: an
+        # approval request or a fill must reach the operator regardless of
+        # which page happens to be open.
         if channel != CH_TICKS or not self.tickers:
             return True
         return payload.get("ticker") in self.tickers

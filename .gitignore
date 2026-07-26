@@ -23,6 +23,7 @@ htmlcov/
 node_modules/
 frontend/dist/
 .vite/
+*.tsbuildinfo
 
 # ---- data & runtime ----
 pgdata/
