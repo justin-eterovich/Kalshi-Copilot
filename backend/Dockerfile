@@ -39,6 +39,7 @@ RUN pip install --upgrade pip && pip install '.[dev]'
 
 COPY backend/app ./app
 COPY backend/tests ./tests
+COPY scripts ./scripts
 COPY --from=frontend /build/dist ./frontend
 
 # Signature timestamps are validated server-side, so run as a normal user but

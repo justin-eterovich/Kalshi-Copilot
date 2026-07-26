@@ -106,16 +106,31 @@ right. The shipped `data/fee_schedule.yaml` encodes the general formula but
 leaves premium-category multipliers **unverified**:
 
 ```bash
-python scripts/refresh_fee_schedule.py
+docker compose run --rm tools python scripts/refresh_fee_schedule.py
 ```
 
-Run it from the homelab, not a cloud host — kalshi.com serves a bot-protection
-challenge to datacenter IPs. Follow the printed instructions, then:
+`tools` is a one-shot maintenance container — it never starts with
+`docker compose up`, and it is the only service with write access to `data/`.
+No Python on the host required.
+
+Run it from the homelab, not a cloud host: kalshi.com serves a bot-protection
+challenge to datacenter IPs. If the fetch is blocked, open the URL in a
+browser, save the PDF into the repo, and point the script at it:
 
 ```bash
-python scripts/refresh_fee_schedule.py --mark-verified
+docker compose run --rm tools python scripts/refresh_fee_schedule.py \
+    --file data/kalshi-fee-schedule.pdf
+```
+
+Fill the reported multipliers into `data/fee_schedule.yaml`, then:
+
+```bash
+docker compose run --rm tools python scripts/refresh_fee_schedule.py --mark-verified
 docker compose restart api worker
 ```
+
+`--mark-verified` refuses while any multiplier is still `null`, so you cannot
+accidentally clear the warning while markets remain unpriceable.
 
 Until then, any category with an unknown multiplier is **excluded from
 proposals** rather than priced with a guess. See "Fees" below.

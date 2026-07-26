@@ -159,8 +159,45 @@ def analyse(text: str) -> None:
     print("-" * 70)
 
 
+def unresolved_categories() -> list[str]:
+    """Categories whose multiplier is still unknown.
+
+    Parses the YAML rather than slicing the text. An earlier string-based
+    check split on ``"categories:"``, which also matches inside
+    ``maker_free_categories:`` — so it inspected the wrong block entirely and
+    happily marked a schedule verified while ``crypto`` was still null. A
+    safety guard that silently inspects the wrong thing is worse than none.
+    """
+    try:
+        import yaml
+    except ImportError:
+        print(
+            "! pyyaml not installed; cannot safely verify. "
+            "Run this inside the container: "
+            "docker compose run --rm tools python scripts/refresh_fee_schedule.py",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    data = yaml.safe_load(SCHEDULE_PATH.read_text(encoding="utf-8")) or {}
+    categories = data.get("categories") or {}
+    return sorted(name for name, value in categories.items() if value is None)
+
+
 def mark_verified(revision: str | None) -> None:
-    """Stamp today's date into meta.verified_on."""
+    """Stamp today's date into meta.verified_on, if nothing is unresolved."""
+    unresolved = unresolved_categories()
+    if unresolved:
+        print(
+            f"! refusing to mark verified: {len(unresolved)} category "
+            f"multiplier(s) still null: {', '.join(unresolved)}\n"
+            f"  Fill them in first — fail-closed exists for a reason. Marking "
+            f"this verified would hide the fact that those markets still "
+            f"cannot be priced.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     text = SCHEDULE_PATH.read_text(encoding="utf-8")
     today = dt.date.today().isoformat()
 
@@ -179,14 +216,6 @@ def mark_verified(revision: str | None) -> None:
             count=1,
             flags=re.M,
         )
-
-    if "null" in text.split("categories:")[-1].split("maker_free_categories")[0]:
-        print(
-            "! refusing to mark verified: `categories:` still contains a null "
-            "multiplier.\n  Fill it in first — fail-closed exists for a reason.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
     SCHEDULE_PATH.write_text(text, encoding="utf-8")
     print(f"-> marked verified on {today}")

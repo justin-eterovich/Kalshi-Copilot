@@ -26,6 +26,9 @@ dev = [
     "ruff>=0.7",
     "mypy>=1.13",
     "types-PyYAML>=6.0",
+    # Used by scripts/refresh_fee_schedule.py so the fee schedule can be
+    # verified inside the container — no host Python toolchain needed.
+    "pypdf>=5.1",
 ]
 
 [build-system]

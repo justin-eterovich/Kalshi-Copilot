@@ -146,6 +146,36 @@ services:
       retries: 4
       start_period: 20s
 
+  # One-shot maintenance container. Never starts with `docker compose up`
+  # (it sits behind a profile); run it explicitly:
+  #
+  #   docker compose run --rm tools python scripts/refresh_fee_schedule.py
+  #
+  # Identical to `api` except that ./data is mounted READ-WRITE, because
+  # verifying the fee schedule writes back to data/fee_schedule.yaml. Keeping
+  # that write off the long-running services means nothing in normal operation
+  # can mutate the fee table underneath a running detector.
+  tools:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    profiles: ["tools"]
+    # Runs as root solely so it can write data/fee_schedule.yaml, which is
+    # owned by whoever cloned the repo. The write is in place, so the file
+    # keeps its original ownership. The long-running services stay
+    # unprivileged.
+    user: "0:0"
+    environment:
+      <<: *backend-env
+      SERVICE_ROLE: tools
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data:rw
+      - ./secrets:/run/secrets:ro
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   pgdata:
   redisdata:
