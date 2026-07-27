@@ -151,6 +151,12 @@ API's own signed `position_fp`.
   continuous understates every bucket by ~2x (measured: 0.2611 vs 0.1324). And
   "greater than 96" means `T >= 97`, differing by the whole mass at 96. See
   `app/weather/distribution.py`.
+- **A daily LOW is assigned by the forecast period's END date; a daily HIGH
+  by its START.** An NWS night period runs 18:00 local to 06:00 next morning
+  and its minimum falls in the *following* calendar day — "Monday Night" is
+  Tuesday's low. Keying lows by start files every one a day early. See
+  `daily_low` in `app/weather/nws_parse.py`; forecast-error calibration is
+  keyed by `(station, measure)` for the same reason.
 - **Two weather families, two settlement sources.** Daily high/low settles on
   the **NWS** Climatological Report (Daily); the hourly family (`KXTEMPNYCH`)
   settles on **The Weather Company**, for which we have no feed — so NWS data

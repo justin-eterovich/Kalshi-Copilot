@@ -210,6 +210,57 @@ CREATE TABLE weather_forecasts (...);     -- UNIQUE (station_id, target_date, me
 
 ---
 
+## Follow-up: low-temperature markets
+
+Lows are now wired end to end. The interesting part was the day-assignment
+rule, which is **not** the mirror of the one for highs.
+
+An NWS night period runs 18:00 local to 06:00 the next morning and reports
+that night's minimum. The coldest hour is just before sunrise, so the
+temperature *"Monday Night"* reports falls in **Tuesday's** calendar day and
+the Climatological Report attributes it to Tuesday. Observed at KMDW:
+
+```
+Overnight       Mon 04:00 -> Mon 06:00   78F   -> Monday's low
+Monday Night    Mon 18:00 -> Tue 06:00   71F   -> Tuesday's low
+Tuesday Night   Tue 18:00 -> Wed 06:00   67F   -> Wednesday's low
+```
+
+So `daily_low` assigns by the period's **end** date where `daily_high`
+assigns by its **start**. Keying lows by start would file every one of them a
+day early, on every station, in every bucket — and on a book of two-degree
+tiles a whole-day shift is not a rounding error.
+
+"Ends on the day" rather than the simpler "starts the day before" because a
+forecast issued during the night carries a truncated `"Overnight"` period that
+both starts *and* ends on the same day; the start-minus-one rule would
+silently drop it.
+
+It is also the more robust rule. A night ends at 06:00 local, which is
+mid-morning UTC for every US station, so the assignment survives a wrong
+offset — whereas 18:00 local is already past midnight UTC on the Pacific
+coast, and a start-based rule would need the offset to be right. Both facts
+are pinned by tests.
+
+**Calibration is now keyed by `(station, measure)`.** A station's overnight
+lows are not forecast with the same skill as its afternoon highs, and one
+sigma covering both would be wrong for each in opposite directions.
+
+Also worth stating: `_observed_extreme` bounds the day in UTC, and that
+approximation is **worse for lows than for highs**. A local day's hottest
+hours sit well inside any reasonable window; its minimum happens just before
+dawn, right against the boundary, so a US station's UTC window can straddle
+two nights and pick the colder. Still fine for calibration, where a consistent
+bias is measured rather than assumed away — but the low side carries the
+larger error and the docstring says so.
+
+Verified live: **192 of 192 low markets now resolve a forecast** (previously
+zero). KMDW stored 78/71/67 for Jul 27/28/29, exactly the values read off the
+raw periods. A real KXLOWTCHI book priced from a synthetic 45-day calibration
+put its mass on `{70,71}` at 0.3915 against a debiased forecast of 70.52°F,
+with the tiling summing to 1.0150 — the excess again being the clamp lifting
+two negligible tiles off zero.
+
 ## Open items
 
 - **The engine cannot price for ~30 days after being enabled.** That is the
@@ -223,8 +274,5 @@ CREATE TABLE weather_forecasts (...);     -- UNIQUE (station_id, target_date, me
   *high* the hottest hours sit well inside any reasonable window, so the
   approximation is mild — but it is one, and a local-day window needs the
   station's timezone (which `/stations/{id}` does return).
-- **Low-temperature markets are half-wired.** Stations are mapped for them and
-  the rules parser reads `DAILY_LOW`, but ingest only stores `measure="high"`
-  forecasts, so `KXLOWT*` markets currently find no forecast and are skipped.
 - **The hourly family is unpriced by design** — 5 series, settled by The
   Weather Company, which we have no feed for.

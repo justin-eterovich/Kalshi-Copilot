@@ -88,6 +88,7 @@ __all__ = [
     "parse_observation",
     "parse_forecast_periods",
     "daily_high",
+    "daily_low",
     "running_high_f",
 ]
 
@@ -438,6 +439,78 @@ def daily_high(
             return None
         temps.append(period.temperature_f)
     return max(temps)
+
+
+def daily_low(
+    periods: Iterable[ForecastPeriod],
+    *,
+    day: date,
+    tz_offset_hours: float = 0.0,
+) -> float | None:
+    """Forecast low for one local calendar day, in Fahrenheit.
+
+    **This assigns periods by their END date, not their start — the opposite
+    of** :func:`daily_high` **— and the asymmetry is the whole point.**
+
+    An NWS night period runs 18:00 local to 06:00 the *next* morning and
+    reports that night's minimum. The coldest hour is just before sunrise, so
+    the temperature "Monday Night" reports falls in **Tuesday's** calendar day,
+    and the Climatological Report attributes it to Tuesday. Assigning it by
+    start date — which is what :func:`daily_high` correctly does for daytime
+    periods — would file every low under the day before, on every station, in
+    every bucket. The book is priced in two-degree tiles; a whole day's shift
+    is not a rounding error.
+
+    Observed live at KMDW (offset -5.0)::
+
+        Overnight       Mon 04:00 -> Mon 06:00   78F   -> Monday's low
+        Monday Night    Mon 18:00 -> Tue 06:00   71F   -> Tuesday's low
+        Tuesday Night   Tue 18:00 -> Wed 06:00   67F   -> Wednesday's low
+
+    The first row is why the rule is "ends on ``day``" rather than "starts on
+    ``day - 1``": a forecast issued during the night carries a truncated
+    ``"Overnight"`` period that both starts and ends on the same day, and the
+    start-minus-one rule would silently drop it.
+
+    Refusals mirror :func:`daily_high` — no period ends on ``day``, an unknown
+    ``is_daytime``, a night period with no ``end`` to place it by, or a
+    contributing period with no usable temperature.
+
+    **Known limitation.** A daily minimum usually occurs before dawn, but not
+    always: a cold front arriving in the evening can put a calendar day's
+    minimum at 23:59, which this attributes to the following day. That is a
+    real error on frontal days and it is the same simplification the NWS's own
+    period structure makes.
+    """
+    shift = timedelta(hours=tz_offset_hours)
+
+    ends_on_day: list[ForecastPeriod] = []
+    for period in periods:
+        if period.end is None:
+            # Cannot be placed. Skipped rather than fatal, because a single
+            # malformed period should not hide every other night.
+            continue
+        if (period.end + shift).date() == day:
+            ends_on_day.append(period)
+
+    if not ends_on_day:
+        return None
+
+    if any(p.is_daytime is None for p in ends_on_day):
+        return None
+
+    night = [p for p in ends_on_day if not p.is_daytime]
+    if not night:
+        return None
+
+    temps: list[float] = []
+    for period in night:
+        if period.temperature_f is None:
+            # One unreadable night poisons the minimum, and an overstated low
+            # is entirely believable. Fail closed.
+            return None
+        temps.append(period.temperature_f)
+    return min(temps)
 
 
 def running_high_f(observations: Sequence[Observation]) -> float | None:

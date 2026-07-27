@@ -37,6 +37,7 @@ from app.db.models import WeatherForecast, WeatherObservation
 from app.weather.client import NwsClient, NwsError
 from app.weather.nws_parse import (
     daily_high,
+    daily_low,
     parse_forecast_periods,
     parse_observation,
 )
@@ -111,7 +112,7 @@ async def sync_forecast(
     days_ahead: int = 7,
     now: datetime | None = None,
 ) -> int:
-    """Record forecast highs for the next ``days_ahead`` local days.
+    """Record forecast highs and lows for the next ``days_ahead`` local days.
 
     One row per (station, day, issuance). Issuances are never overwritten —
     that history *is* the calibration dataset, and a table that keeps only the
@@ -148,9 +149,6 @@ async def sync_forecast(
 
     for delta in range(days_ahead):
         target = local_today + timedelta(days=delta)
-        high = daily_high(periods, day=target, tz_offset_hours=offset)
-        if high is None:
-            continue
 
         # Lead time from now to the end of the target local day, which is when
         # the outcome is finally determined.
@@ -159,20 +157,32 @@ async def sync_forecast(
         ) + timedelta(days=1, hours=-offset)
         lead_hours = (target_end - now).total_seconds() / 3600.0
 
-        stmt = (
-            pg_insert(WeatherForecast)
-            .values(
-                station_id=station_id,
-                target_date=target,
-                measure="high",
-                issued_at=now,
-                temperature_f=Decimal(str(high)),
-                lead_hours=lead_hours,
+        # Both statistics, because both are traded — KXHIGHT* and KXLOWT* are
+        # separate series on the same station. They are stored as separate
+        # rows rather than two columns so the calibration can measure them
+        # apart: a station's overnight lows are not forecast with the same
+        # skill as its afternoon highs, and one sigma covering both is wrong
+        # for each of them in opposite directions.
+        for measure, value in (
+            ("high", daily_high(periods, day=target, tz_offset_hours=offset)),
+            ("low", daily_low(periods, day=target, tz_offset_hours=offset)),
+        ):
+            if value is None:
+                continue
+            stmt = (
+                pg_insert(WeatherForecast)
+                .values(
+                    station_id=station_id,
+                    target_date=target,
+                    measure=measure,
+                    issued_at=now,
+                    temperature_f=Decimal(str(value)),
+                    lead_hours=lead_hours,
+                )
+                .on_conflict_do_nothing(constraint="uq_weather_forecast")
             )
-            .on_conflict_do_nothing(constraint="uq_weather_forecast")
-        )
-        result = await session.execute(stmt)
-        written += bool(result.rowcount)
+            result = await session.execute(stmt)
+            written += bool(result.rowcount)
 
     return written
 
@@ -182,10 +192,10 @@ async def backfill_actuals(
 ) -> int:
     """Fill in ``actual_f`` for forecasts whose day has finished.
 
-    The actual is the maximum observation recorded on that local day — a
-    proxy for the Climatological Report, and labelled as one everywhere it is
-    used. It is good enough to measure forecast error against, which is all
-    this column is for.
+    The actual is the maximum (or, for a low forecast, the minimum)
+    observation recorded on that day — a proxy for the Climatological Report,
+    and labelled as one everywhere it is used. It is good enough to measure
+    forecast error against, which is all this column is for.
     """
     now = now or datetime.now(UTC)
     since = (now - timedelta(days=lookback_days)).date()
@@ -208,7 +218,9 @@ async def backfill_actuals(
 
     filled = 0
     for row in pending:
-        actual = await _observed_high(session, row.station_id, row.target_date)
+        actual = await _observed_extreme(
+            session, row.station_id, row.target_date, measure=row.measure
+        )
         if actual is None:
             continue
         row.actual_f = actual
@@ -217,17 +229,24 @@ async def backfill_actuals(
     return filled
 
 
-async def _observed_high(
-    session: AsyncSession, station_id: str, day: date
+async def _observed_extreme(
+    session: AsyncSession, station_id: str, day: date, *, measure: str
 ) -> Decimal | None:
-    """Highest observation recorded on ``day`` UTC for a station.
+    """Highest or lowest observation recorded on ``day`` UTC for a station.
 
     Deliberately UTC-bounded rather than local: the observations table stores
     aware UTC timestamps, and a station's local day is a window this function
-    does not have the offset to compute. The mismatch shifts the boundary by a
-    few hours, which matters least for a daily *high* — the hottest hours of a
-    local day sit well inside any reasonable window — but it is a real
-    approximation and callers should read the number as such.
+    does not have the offset to compute.
+
+    **That approximation is worse for lows than for highs**, and knowingly so.
+    A local day's hottest hours sit well inside any reasonable window, so a
+    few hours of boundary slip rarely changes the maximum. A local day's
+    *minimum* happens just before dawn — right against the boundary — so for a
+    US station, whose local midnight falls 5-8 hours after UTC midnight, the
+    UTC window can straddle two different nights and pick the colder. The
+    number is still useful for calibration, where a consistent bias is
+    measured rather than assumed away, but it is not a settlement value and
+    the low side carries the larger error.
     """
     start = datetime.combine(day, datetime.min.time(), tzinfo=UTC)
     rows = (
@@ -242,7 +261,9 @@ async def _observed_high(
     ).scalars().all()
 
     values = [v for v in rows if v is not None]
-    return max(values) if values else None
+    if not values:
+        return None
+    return max(values) if measure == "high" else min(values)
 
 
 async def sweep_weather(

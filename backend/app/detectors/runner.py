@@ -935,7 +935,7 @@ class WeatherDetector:
         from app.core.fees import net_edge_cents
         from app.weather.calibration import debias, lead_bucket, sigma_for
         from app.weather.distribution import fair_price as weather_fair_price
-        from app.weather.rules import parse_rules
+        from app.weather.rules import Measure, parse_rules
         from app.weather.stations import station_for_series
 
         cfg = config.weather
@@ -965,7 +965,7 @@ class WeatherDetector:
         headroom = state.headroom_cents if state else None
 
         # Forecast-error history per station, computed once per scan.
-        stats_cache: dict[str, Any] = {}
+        stats_cache: dict[tuple[str, str], Any] = {}
         findings: list[Finding] = []
 
         for market in markets:
@@ -981,14 +981,32 @@ class WeatherDetector:
             if ref is None or not ref.settles_from_nws:
                 continue
 
+            # A high market is priced from the high forecast and a low
+            # market from the low one. `parse_rules` is what says which, and
+            # it refuses anything it cannot classify, so there is no branch
+            # here that guesses from the ticker.
+            if ref.measure not in (Measure.DAILY_HIGH, Measure.DAILY_LOW):
+                # Hourly, or something new. Not priced from a daily forecast.
+                continue
+            measure = "high" if ref.measure is Measure.DAILY_HIGH else "low"
+
             station = claim.station_id
-            if station not in stats_cache:
-                stats_cache[station] = await self._error_stats(session, station)
-            stats = stats_cache[station]
+            # Keyed by measure as well as station: a station's overnight lows
+            # are not forecast with the same skill as its afternoon highs, and
+            # sharing one sigma between them would be wrong for both, in
+            # opposite directions.
+            cache_key = (station, measure)
+            if cache_key not in stats_cache:
+                stats_cache[cache_key] = await self._error_stats(
+                    session, station, measure
+                )
+            stats = stats_cache[cache_key]
             if not stats:
                 continue
 
-            forecast = await self._latest_forecast(session, station, market, now)
+            forecast = await self._latest_forecast(
+                session, station, market, now, measure
+            )
             if forecast is None:
                 continue
             point_f, lead_hours = forecast
@@ -1070,7 +1088,7 @@ class WeatherDetector:
                     else 0.35,
                     size_hint=size,
                     rationale=(
-                        f"{claim.station_id} ({claim.described_as}) forecast "
+                        f"{claim.station_id} ({claim.described_as}) {measure} forecast "
                         f"{point_f:.1f}F, debiased {adjusted:.1f}F, sigma "
                         f"{sigma:.2f}F at {lead_hours:.0f}h lead; model "
                         f"{model} vs {side.value} at {price}. "
@@ -1082,6 +1100,7 @@ class WeatherDetector:
                         "station_described_as": claim.described_as,
                         "station_explicit_in_rules": claim.explicit_in_rules,
                         "settlement_source": ref.source.value,
+                        "measure": measure,
                         "forecast_f": f"{point_f:.2f}",
                         "debiased_f": f"{adjusted:.2f}",
                         "sigma_f": f"{sigma:.3f}",
@@ -1098,8 +1117,10 @@ class WeatherDetector:
 
         return findings
 
-    async def _error_stats(self, session: AsyncSession, station: str) -> list[Any]:
-        """Measured forecast error for a station, by lead-time bucket."""
+    async def _error_stats(
+        self, session: AsyncSession, station: str, measure: str
+    ) -> list[Any]:
+        """Measured forecast error for one station and one statistic."""
         from app.db.models import WeatherForecast
         from app.weather.calibration import ForecastError, calibrate
 
@@ -1111,6 +1132,7 @@ class WeatherDetector:
                     WeatherForecast.actual_f,
                 ).where(
                     WeatherForecast.station_id == station,
+                    WeatherForecast.measure == measure,
                     WeatherForecast.actual_f.isnot(None),
                     WeatherForecast.lead_hours.isnot(None),
                 )
@@ -1134,6 +1156,7 @@ class WeatherDetector:
         station: str,
         market: Market,
         now: Any,
+        measure: str,
     ) -> tuple[float, float] | None:
         """Most recent forecast for the local day this market names.
 
@@ -1154,7 +1177,7 @@ class WeatherDetector:
                 .where(
                     WeatherForecast.station_id == station,
                     WeatherForecast.target_date == close.date(),
-                    WeatherForecast.measure == "high",
+                    WeatherForecast.measure == measure,
                 )
                 .order_by(WeatherForecast.issued_at.desc())
                 .limit(1)
