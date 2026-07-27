@@ -215,6 +215,66 @@ authoritative midpoint is computed in Python with `Decimal` rounding and the
 SQL filter is not — a SQL band narrower than the Python one would silently
 drop boundary observations, and the loss would be invisible.
 
+### The one that explains the missing data
+
+Chasing "why does the backtester only have 79 markets and an 85-minute
+sampling gap?" led to a bug that had been degrading book ingestion since M1.
+
+`OrderBook.apply_delta` marked a book stale whenever the incoming `seq` was
+not exactly its previous `seq + 1`. **But `seq` counts the subscription, not
+the market.** One `orderbook_delta` subscription covers every ticker in it and
+numbers all of their messages from one counter, so a single market's deltas
+arrive with holes wherever another market was updated. Probed against the live
+demo stream with 65 markets subscribed:
+
+```
+KXNFLGAME-26SEP09NESEA-SEA   seqs = 86, 87, 88, 89, 90, 92, 95, 97
+KXNFLGAME-26AUG13INDNE-NE    seqs = 91, 94, 96, 99, 102, 104, 107, 110
+```
+
+Every one of those holes was read as a gap. The result: **21 of 65 books went
+stale within sixty seconds** — and never recovered, because nothing ever
+drained `resync_needed` (below). Meanwhile the *per-subscription* tracker in
+`kalshi/ws.py`, which compares the counter the number actually belongs to,
+logged **zero** gaps over the same period. That asymmetry is what proved it.
+
+It was silent because a stale book does not raise — `_maybe_record_book`
+simply returns early. So the symptom was not an error but thin data, showing
+up three milestones later as a backtester with nothing to replay.
+
+There is also no per-market sequence to switch to: the delta body carries only
+`market_ticker, market_id, price_dollars, delta_fp, side, ts, ts_ms`. Gap
+detection belongs entirely to the per-sid tracker, which already emits
+`__resync__`. The book now records `seq` for observability, refuses a
+*replayed* (lower) seq because applying a delta twice would double-count it,
+and judges nothing else.
+
+Six tests in `test_orderbook.py` were pinning the wrong semantics and were
+rewritten. That is worth noting: the tests were green throughout, because they
+encoded the same misunderstanding as the code.
+
+Measured before and after, on the same watchlist of 65 markets:
+
+| | stream counters | snapshots written per minute |
+|---|---|---|
+| before | `gaps=1799 stale=21` after 60s; `gaps=3965 stale=21` after 120s | **65, once** — one per market at the initial snapshot, then nothing, because every book went stale on its first delta |
+| after | `gaps=0 stale=0`, sustained across 11,950 book messages / six consecutive minutes | 855 snapshots over six minutes — **143/min** across the 25 markets actually trading |
+
+The "65 then nothing" pattern is the whole bug in one line: the ingest was
+recording each market exactly once per process restart, which is precisely
+the shape of the sparse data the coverage audit refused on.
+
+### Stale books never recovered
+
+`resync_needed` was only ever appended to. Nothing read it — despite the
+module docstring claiming the consumer "requests a fresh snapshot". A book
+that went stale stayed stale for the life of the process.
+
+Added `_book_heal_loop`: when ten or more books are waiting, force a
+reconnect, since Kalshi sends a fresh snapshot on subscribe and the reconnect
+path is already exercised on every disconnect. A per-subscription resubscribe
+command would have been a guess at a protocol not verified against the docs.
+
 ### The rest
 
 | finding | fix |
@@ -241,12 +301,17 @@ correctness.
   four refusals clear with time alone. `too_few_settled` needs markets in the
   watchlist to actually resolve, and this deployment has recorded **zero**
   settlements.
-- **Book snapshots are being written far less often than configured.**
-  `ingest.orderbook_snapshot_throttle_ms` is 1000, but the measured median gap
-  between snapshots of the same market is **84.8 minutes** — 23.7 snapshots
-  per market over 9.8 hours. Whatever is throttling is not that setting. This
-  is the binding constraint on ever having a usable backtest, and it is worth
-  investigating before anything else in M9 becomes useful.
+- **Existing book history predates the sequence fix and is unrepresentative.**
+  Everything in `orderbook_snaps` before 2026-07-27 16:24 UTC is roughly one
+  row per market per restart. Any backtest window spanning that boundary is
+  measuring two different ingest behaviours; the coverage audit will refuse on
+  the gaps regardless, but do not read the refusal as a statement about the
+  data collected since.
+- **The watchlist is stale and is now the binding constraint.** 65 markets,
+  heavy on NFL preseason and F1 constructors, and only ~21 of them trade in a
+  given minute. CLAUDE.md already flags regenerating it from the top
+  mutually-exclusive events by 24h volume; with book recording fixed, that is
+  the next thing standing between here and a backtest that can run.
 - **The report card says `insufficient_evidence` for everything**, correctly.
   `set_arbitrage` on the demo exchange shows 2 trades and −20.88c, which is
   entirely fees: both fills were sells that realised nothing, and a thesis

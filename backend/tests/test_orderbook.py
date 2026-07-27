@@ -107,37 +107,76 @@ def test_delta_applies_to_no_side(book: OrderBook) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sequence gaps — the property that protects real money
+# Sequence numbers — whose counter is this, anyway
 # ---------------------------------------------------------------------------
 
 
-def test_sequence_gap_marks_book_stale(book: OrderBook) -> None:
-    assert book.apply_delta(delta("0.4000", "50.00"), seq=13) is False
-    assert book.stale is True
-    assert "gap" in (book.stale_reason or "")
+def test_skipped_seq_is_not_a_gap_for_this_market(book: OrderBook) -> None:
+    """``seq`` counts the *subscription*, not the market.
+
+    One `orderbook_delta` subscription covers every ticker in it and numbers
+    all of their messages from one counter, so a market's own deltas arrive
+    with holes wherever another market was updated. Verified live: with 65
+    markets subscribed, one ticker's seqs ran 86, 87, 88, 89, 90, 92, 95, 97.
+
+    Treating those holes as gaps is what left 21 of 65 books permanently
+    stale — and silently, because a stale book stops being *recorded* rather
+    than raising, so the symptom was thin data with no error anywhere.
+    """
+    assert book.apply_delta(delta("0.4000", "50.00"), seq=13) is True
+    assert book.stale is False
+    assert book.seq == 13
+    assert book.yes[Decimal("0.4000")] == Decimal("150.00")
+
+
+def test_interleaved_markets_leave_both_books_healthy(book: OrderBook) -> None:
+    """The real shape of the stream: two markets, one counter."""
+    other = OrderBook(ticker="OTHER-MKT", stale=False, seq=10)
+    for seq in range(11, 31):
+        target = book if seq % 2 else other
+        assert target.apply_delta(delta("0.4000", "1.00"), seq=seq) is True
+    assert book.stale is False
+    assert other.stale is False
+
+
+def test_a_replayed_seq_is_refused(book: OrderBook) -> None:
+    """A lower seq on a single ordered socket is a replay, not a reorder.
+
+    Applying it again would double-count the delta, which is the one way a
+    book can end up wrong while still reporting itself healthy.
+    """
+    assert book.apply_delta(delta("0.4000", "1.00"), seq=15) is True
+    before = dict(book.yes)
+    assert book.apply_delta(delta("0.4000", "1.00"), seq=15) is False
+    assert book.apply_delta(delta("0.4000", "1.00"), seq=12) is False
+    assert book.yes == before
 
 
 def test_stale_book_refuses_every_read(book: OrderBook) -> None:
-    book.apply_delta(delta("0.4000", "50.00"), seq=99)
+    book.mark_stale("resync")
     for read in (book.yes_bids, book.no_bids, book.yes_asks, book.best_yes_bid):
         with pytest.raises(BookStaleError):
             read()
 
 
+def test_stale_book_rejects_further_deltas(book: OrderBook) -> None:
+    """A gap is detected per-subscription in ws.py, which marks every book
+    stale. From here the only thing that matters is that a stale book takes
+    nothing until it is resnapshotted."""
+    book.mark_stale("sequence gap on sid 3")
+    assert book.apply_delta(delta("0.4000", "1.00"), seq=14) is False
+
+
 def test_gap_does_not_apply_the_delta(book: OrderBook) -> None:
     """State must not be half-updated across a gap."""
     before = dict(book.yes)
+    book.mark_stale("sequence gap on sid 3")
     book.apply_delta(delta("0.4000", "50.00"), seq=13)
     assert book.yes == before
 
 
-def test_stale_book_rejects_further_deltas(book: OrderBook) -> None:
-    book.apply_delta(delta("0.4000", "1.00"), seq=13)  # gap
-    assert book.apply_delta(delta("0.4000", "1.00"), seq=14) is False
-
-
 def test_fresh_snapshot_recovers_from_gap(book: OrderBook) -> None:
-    book.apply_delta(delta("0.4000", "1.00"), seq=13)
+    book.mark_stale("sequence gap on sid 3")
     assert book.stale is True
 
     book.apply_snapshot(snapshot(yes=[["0.4500", "10.00"]]), seq=20)
@@ -147,17 +186,28 @@ def test_fresh_snapshot_recovers_from_gap(book: OrderBook) -> None:
 
 
 def test_gap_count_increments(book: OrderBook) -> None:
-    book.apply_delta(delta("0.4000", "1.00"), seq=13)
+    book.mark_stale("sequence gap on sid 3")
     book.apply_snapshot(snapshot(yes=[["0.4000", "1.00"]]), seq=20)
-    book.apply_delta(delta("0.4000", "1.00"), seq=25)
+    book.mark_stale("sequence gap on sid 3")
     assert book.gap_count == 2
 
 
 def test_in_order_deltas_never_gap(book: OrderBook) -> None:
-    for i, seq in enumerate(range(11, 21)):
+    for seq in range(11, 21):
         assert book.apply_delta(delta("0.4000", "1.00"), seq=seq) is True
     assert book.stale is False
     assert book.seq == 20
+
+
+def test_unknown_side_marks_the_book_stale(book: OrderBook) -> None:
+    """An `else: self.no` fallthrough wrote into the wrong book, advanced the
+    sequence and left `stale` False — corruption reporting itself healthy,
+    which the gap machinery cannot catch because no sequence was skipped."""
+    before = dict(book.no)
+    assert book.apply_delta(delta("0.4000", "1.00", side="sell"), seq=11) is False
+    assert book.stale is True
+    assert "unknown book side" in (book.stale_reason or "")
+    assert book.no == before
 
 
 # ---------------------------------------------------------------------------

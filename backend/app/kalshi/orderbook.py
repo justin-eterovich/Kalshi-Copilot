@@ -11,6 +11,28 @@ plausible and is wrong, which is exactly how an arbitrage detector talks you
 into a trade that does not exist. On any gap the book is marked stale, and it
 refuses to answer questions until a fresh snapshot arrives.
 
+**``seq`` counts the subscription, not the market**, and this module used to
+get that wrong. One ``orderbook_delta`` subscription covers every ticker in
+it and numbers all of their messages from one counter, so consecutive deltas
+for a single market are *not* consecutive in ``seq``. Verified against the
+live demo stream with 65 markets subscribed::
+
+    KXNFLGAME-26SEP09NESEA-SEA   seqs = 86, 87, 88, 89, 90, 92, 95, 97
+    KXNFLGAME-26AUG13INDNE-NE    seqs = 91, 94, 96, 99, 102, 104, 107, 110
+
+Comparing those per market to ``self.seq + 1`` reports a gap on almost every
+message once a second market is active. It did: 21 of 65 books went stale
+within sixty seconds and never recovered, while the *per-subscription*
+tracker in ``kalshi/ws.py`` — which is the one that is right — logged zero
+gaps over the same period. The effect was silent, because a stale book simply
+stops being recorded, so the symptom was thin data rather than an error.
+
+There is also no per-market sequence available to switch to: the delta body
+carries only ``market_ticker, market_id, price_dollars, delta_fp, side, ts,
+ts_ms``. Gap detection therefore belongs entirely to the per-sid tracker in
+``ws.py``, which raises a ``__resync__`` that invalidates every book. This
+class keeps ``seq`` for observability and does not judge it.
+
 Kalshi quotes both sides as *bids*: ``yes_dollars`` are bids to buy YES and
 ``no_dollars`` are bids to buy NO. A NO bid at price ``p`` is economically an
 offer to sell YES at ``1 - p``, which is how :meth:`OrderBook.yes_ask` is
@@ -66,17 +88,24 @@ class OrderBook:
     def apply_delta(self, msg: dict[str, Any], seq: int | None) -> bool:
         """Apply one ``orderbook_delta``.
 
-        Returns True if applied, False if a gap was detected. A False return
-        means the caller must resubscribe or request a fresh snapshot.
+        Returns True if applied, False if the book is not in a state to take
+        it. A False return means the caller needs a fresh snapshot.
+
+        ``seq`` is recorded but **not** checked against the previous one: it
+        counts the subscription, not this market, so consecutive deltas for
+        one ticker are not consecutive in ``seq``. See the module docstring —
+        checking it here is what left most of the watchlist permanently
+        stale. Gap detection lives in :mod:`app.kalshi.ws`, where the counter
+        it compares is the one the number actually belongs to.
         """
         if self.stale:
             return False
 
-        if seq is not None and self.seq is not None:
-            expected = self.seq + 1
-            if seq != expected:
-                self.mark_stale(f"sequence gap: expected {expected}, got {seq}")
-                return False
+        # Out-of-order delivery would be a real problem, but this is a single
+        # ordered websocket: a lower seq than the last one means a replay, not
+        # a reordering, and applying it twice would double-count the delta.
+        if seq is not None and self.seq is not None and seq <= self.seq:
+            return False
 
         price = parse_dollars(msg["price_dollars"], "price_dollars")
         delta = parse_count(msg["delta_fp"], "delta_fp")

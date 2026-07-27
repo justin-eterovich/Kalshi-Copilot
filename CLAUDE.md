@@ -186,6 +186,24 @@ API's own signed `position_fp`.
   described different assets. 1,762 markets were affected. Only the **series
   ticker** says what a market tracks — see `reference_symbol_for()` in
   `app/detectors/stale_quote.py`, which refuses rather than defaulting.
+- **A websocket `seq` counts the SUBSCRIPTION, not the market.** One
+  `orderbook_delta` subscription covers every ticker in it and numbers all
+  their messages from one counter, so a single market's deltas are *not*
+  consecutive — verified live with 65 markets: `86, 87, 88, 89, 90, 92, 95,
+  97` for one ticker. `OrderBook.apply_delta` compared that per market and
+  marked a book stale on nearly every message: **21 of 65 books stale within
+  sixty seconds**, permanently. The per-sid tracker in `ws.py` logged zero
+  gaps over the same period, which is how the two were told apart. It was
+  silent because a stale book is not *recorded* rather than raising, so the
+  symptom was thin data three milestones later. There is no per-market
+  sequence to use instead — the delta body has none — so gap detection lives
+  only in `ws.py`. `orderbook.py` records `seq`, refuses a replayed (lower)
+  one, and judges nothing else. Six tests encoded the same misunderstanding
+  and stayed green throughout.
+- **`resync_needed` must actually be drained.** For three milestones nothing
+  read it, so a book that went stale stayed stale for the process's life.
+  `_book_heal_loop` in `ingest/main.py` forces a reconnect once enough books
+  are waiting; a reconnect is a resubscribe is a fresh snapshot.
 - **The tape's `taker_side` is `yes`/`no`, never `buy`/`sell`.** Verified
   against 9,604 live rows. A flow detector written to the obvious vocabulary
   finds zero sweeps forever and looks like it is working.
@@ -424,11 +442,11 @@ Branch: `claude/kalshi-copilot-build-bgyv2d`
   data", because the operator needs to know whether to wait a week or change
   the config. `--ignore-coverage` runs it anyway and keeps the refusals
   attached; the result is not evidence.
-- **Book snapshots are written far less often than configured.**
-  `orderbook_snapshot_throttle_ms` is 1000, but the measured median gap
-  between snapshots of the same market is **84.8 minutes**. Whatever throttles
-  it is not that setting. This is the binding constraint on ever having a
-  usable backtest.
+- **Book snapshots were written far less often than configured**, and the
+  cause was the `seq` bug above: stale books are not recorded, so a fifth of
+  the watchlist wrote nothing. Measured median gap before the fix was **84.8
+  minutes** against a 1-second throttle. Re-measure before trusting any
+  backtest window that spans the fix.
 - **The report card's unit is a decision, not a fill.** A five-leg set
   arbitrage settles as five rows; counting them as five trades inflates `n`
   fivefold and shrinks the confidence interval by √5 on perfectly correlated
