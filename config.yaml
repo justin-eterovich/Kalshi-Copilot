@@ -233,6 +233,10 @@ detectors:
     max_volume_percentile: 0.25
     min_spread_cents: 2
     max_hours_to_close: 168
+    # The screener is a ranking, so its tail is noise by construction —
+    # without a cap it would bury every other detector's signals under
+    # hundreds of "this market is quiet" notes.
+    max_results: 20
 
   whale_flow:
     enabled: false
@@ -240,9 +244,19 @@ detectors:
     sweep_window_sec: 2.0
     min_levels_cleared: 2
     base_confidence: 0.35          # flow is an input, never an instruction
+    lookback_minutes: 30           # how much tape each scan reads
 
   leaderboard_watcher:
-    # Experimental / fragile. Official surfaces only — no scraping.
+    # NOT IMPLEMENTED, and not merely unfinished — there is nothing to build
+    # against. Kalshi's OpenAPI spec exposes no leaderboard, no public trader
+    # ranking, and no public profile surface of any kind; the only endpoints
+    # naming a counterparty are RFQ and block-trade negotiation, which are
+    # yours alone. Checked against docs.kalshi.com/openapi.yaml on 2026-07-27.
+    #
+    # The only way to build this is to scrape the web app, which this project
+    # does not do. Setting `enabled: true` logs a refusal explaining that and
+    # emits nothing — a silent no-op would look like a working detector that
+    # never finds anything, which is the worse failure.
     enabled: false
 
   longshot_calibration:

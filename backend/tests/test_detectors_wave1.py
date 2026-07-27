@@ -16,6 +16,7 @@ from app.detectors.stale_quote import (
     decisive_fair_price,
     parse_spot,
     reference_is_fresh,
+    reference_symbol_for,
     resolve_strike,
 )
 
@@ -277,3 +278,54 @@ class TestResolutionSniper:
             source_confirmed=True,
         )
         assert confirmed.actionable is True
+
+
+# ---------------------------------------------------------------------------
+# Reference symbol resolution
+#
+# These exist because of a bug that reached a live run: the detector selected
+# markets by `category == "Crypto"` and priced every one of them against
+# BTC-USD. An ETH contract with a $1,969 strike, compared to Bitcoin at
+# $65,154, resolved "decisively YES" and reported a 71-cent edge on a market
+# genuinely quoted at 26c. Nothing downstream could have caught it: every
+# number involved was valid, they just described different assets.
+# ---------------------------------------------------------------------------
+
+
+class TestReferenceSymbol:
+    def test_bitcoin_series_map_to_btc(self) -> None:
+        for ticker in (
+            "KXBTC-26JUL2706-B68650",
+            "KXBTCD-26JUL2706-T59699.99",
+            "KXBTC15M-26JUL270530-30",
+            "KXBTCY-26-T100000",
+        ):
+            assert reference_symbol_for(ticker) == "BTC-USD"
+
+    def test_ether_series_do_not_map_to_bitcoin(self) -> None:
+        """The exact case that produced the phantom 71-cent edge."""
+        assert reference_symbol_for("KXETHD-26JUL2706-T1969.99") == "ETH-USD"
+
+    def test_solana_and_xrp_are_their_own_underlyings(self) -> None:
+        assert reference_symbol_for("KXSOLE-26JUL2706-B76.375") == "SOL-USD"
+        assert reference_symbol_for("KXXRP-26JUL2706-T3.20") == "XRP-USD"
+
+    def test_an_unknown_series_is_refused(self) -> None:
+        """Not an invitation to fall back to BTC.
+
+        A market priced against the wrong asset does not look broken, it
+        looks like an enormous edge.
+        """
+        assert reference_symbol_for("KXNFLGAME-26SEP13CLEJAC-CLE") is None
+        assert reference_symbol_for("KXCPI-26JUL-T3.5") is None
+
+    def test_a_missing_ticker_is_refused(self) -> None:
+        assert reference_symbol_for(None) is None
+        assert reference_symbol_for("") is None
+
+    def test_matching_is_on_the_series_not_a_substring(self) -> None:
+        """A strike or date containing 'BTC' must not pull a market in."""
+        assert reference_symbol_for("KXNFLGAME-26BTC13-CLE") is None
+
+    def test_the_series_is_the_segment_before_the_first_hyphen(self) -> None:
+        assert reference_symbol_for("kxethd-26jul2706-t1969.99") == "ETH-USD"

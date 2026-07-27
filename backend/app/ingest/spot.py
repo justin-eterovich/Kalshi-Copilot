@@ -14,7 +14,7 @@ age rather than trusting the newest row.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Final
 
@@ -26,7 +26,18 @@ from app.db.models import ExternalPrice
 
 log = get_logger(__name__)
 
-__all__ = ["SPOT_SOURCES", "fetch_spot", "record_spot"]
+__all__ = [
+    "SPOT_SOURCES",
+    "fetch_spot",
+    "record_spot",
+    "fetch_minute_candles",
+    "backfill_minutes",
+]
+
+#: Coinbase's public candle endpoint, which caps a response at 300 buckets.
+#: Backfilling a day of minutes therefore takes several windowed requests.
+CANDLE_URL: Final = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+CANDLE_MAX_BUCKETS: Final = 300
 
 #: source -> (url, json path). Public, unauthenticated endpoints.
 SPOT_SOURCES: Final[dict[str, tuple[str, tuple[str, ...]]]] = {
@@ -78,3 +89,83 @@ def record_spot(source: str, price: Decimal, symbol: str = "BTC-USD") -> Externa
     return ExternalPrice(
         ts=datetime.now(UTC), source=source, symbol=symbol, price=price
     )
+
+
+async def fetch_minute_candles(
+    *, minutes: int, timeout: float = 15.0
+) -> list[tuple[datetime, Decimal]]:
+    """Fetch the last ``minutes`` one-minute closes, oldest first.
+
+    The volatility model needs a return series, and the live poller only
+    produces one going forward — on a cold start it has nothing, so a
+    freshly-deployed detector would sit silent for a day. It would sit silent
+    *correctly* (the estimator refuses below its sample floor rather than
+    guessing from six ticks), but a limit that is right and useless for
+    twenty-four hours is worth avoiding.
+
+    One minute is the sampling interval on purpose. The live poller runs every
+    three seconds, and an EWMA at lambda=0.94 has an effective memory of only
+    about 1/(1-lambda) ~ 17 observations — seventeen three-second ticks is
+    under a minute of history, which produces a volatility estimate that
+    swings wildly on microstructure noise rather than measuring anything.
+    Consumers bucket by minute for the same reason; see the vol reader.
+    """
+    if minutes <= 0:
+        return []
+
+    end = datetime.now(UTC)
+    out: dict[datetime, Decimal] = {}
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        remaining = minutes
+        while remaining > 0:
+            span = min(remaining, CANDLE_MAX_BUCKETS)
+            start = end - timedelta(minutes=span)
+            response = await client.get(
+                CANDLE_URL,
+                params={
+                    "granularity": 60,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                },
+            )
+            response.raise_for_status()
+            rows = response.json()
+            if not isinstance(rows, list) or not rows:
+                break
+
+            # [time, low, high, open, close, volume], newest first.
+            for row in rows:
+                ts = datetime.fromtimestamp(int(row[0]), tz=UTC)
+                close = parse_dollars(row[4], "coinbase candle close")
+                if close <= 0:
+                    # A zero close is corrupt, and a zero spot makes every
+                    # strike look decisively breached. Drop the bucket rather
+                    # than carry it into a return series.
+                    continue
+                out[ts] = close
+
+            end = start
+            remaining -= span
+
+    return sorted(out.items())
+
+
+def backfill_minutes(
+    candles: list[tuple[datetime, Decimal]],
+    *,
+    source: str = "coinbase_1m",
+    symbol: str = "BTC-USD",
+) -> list[ExternalPrice]:
+    """Turn fetched candles into rows.
+
+    Recorded under a distinct ``source`` so a backfilled close is never
+    mistaken for a live tick. They are not the same observation: a candle
+    close is the last trade in a minute that has already ended, whereas a
+    poll is a quote as of now, and the freshness checks that gate every
+    detector must never treat the former as the latter.
+    """
+    return [
+        ExternalPrice(ts=ts, source=source, symbol=symbol, price=price)
+        for ts, price in candles
+    ]

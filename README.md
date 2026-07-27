@@ -25,8 +25,8 @@ model-driven fair value.
 | **M3** | HITL approval + execution rail | ✅ done |
 | **M4** | Detectors wave 1 (set-arb, resolution sniper, BTC stale-quote) | ✅ done |
 | **M5** | Risk layer, settlements, Kelly sizing, in-tab alerts | ✅ done |
-| M6 | BTC engine + detectors wave 2 | **next** |
-| M7 | Weather engine | pending |
+| **M6** | BTC volatility engine + detectors wave 2 | ✅ done |
+| M7 | Weather engine | **next** |
 | M8 | News + catalyst engine | pending |
 | M9 | Backtester, report card, hardening | pending |
 
@@ -276,6 +276,82 @@ wires one in yet (that is M7/M8), so today it never produces a proposal.
 
 Its thresholds apply to the price you would actually **pay** — the ask when
 buying YES — not the mid. A market quoted 96/99 is not a 97¢ chance.
+
+### Undervalued screener
+
+A **reading list, not a signal.** An illiquid, wide-spread market is not
+mispriced — it is *untraded*, and the spread that makes it interesting to look
+at is the same spread you must cross to act. The result type therefore has no
+edge, fair-value or EV field at all, and a test asserts those names stay
+absent so nothing downstream can start reading one. Its score is an ordering
+for attention: not cents, not a probability, and a 70 is not twice a 35.
+
+### Whale flow
+
+Unusually large prints and multi-level sweeps on the public tape. **Flow is an
+input to judgement, never an instruction** — a large trade is not information
+about value, it is information that somebody with a different opinion, or a
+different need, transacted, and the counterparty may be the informed side.
+Confidence is hard-capped by `base_confidence`; no amount of size raises it.
+
+A sweep requires clearing several *distinct* price levels. One large print at
+one price is size, not aggression, and the two are reported differently.
+
+### Longshot calibration
+
+Measures whether this market set actually overprices unlikely outcomes, from
+settled observations, using **Wilson score intervals** — the extremes (1–10¢,
+90–99¢) are exactly where the normal approximation breaks and can produce
+bounds outside [0,1], i.e. confident nonsense precisely where the strategy
+wants to act.
+
+It refuses to say anything until a bucket has `min_samples_before_signalling`
+(500) settled observations, and records **one row per market, ever** — a
+market sitting at 5¢ for a week would otherwise contribute thousands of rows
+that are all the same fact. Collection runs even while the detector is
+disabled, because otherwise enabling it would be useless for months.
+
+Two things it does not claim: calibration is not profitability (a 5¢ contract
+must win more than 5% of the time to cover the fee), and it measures the
+watchlist rather than Kalshi.
+
+### Leaderboard watcher — not built
+
+Kalshi publishes **no leaderboard, trader ranking, or public profile
+endpoint**. The only API surfaces naming a counterparty are RFQ and block-trade
+negotiation, which are yours alone. Building this would require scraping the
+web app, which this project does not do. Enabling it logs a refusal rather
+than doing nothing quietly.
+
+---
+
+## The Bitcoin volatility engine
+
+Set `bitcoin.enabled: true` to start the spot poller; without it the
+stale-quote detector has no reference and emits nothing.
+
+Fair value comes from a **driftless lognormal** on an EWMA volatility
+estimate, scaled to the market's remaining horizon by square-root-of-time.
+Zero drift is deliberate: over a minutes-to-hours horizon any drift estimate
+is far smaller than the noise around it, and it would be a free parameter that
+lets the model argue itself into a directional view.
+
+**Sampling is the part that matters.** The poller writes every 3 seconds, but
+an EWMA at `ewma_lambda: 0.94` has an effective memory of ~17 observations —
+on raw ticks that is fifty seconds of quote noise. Everything buckets to one
+observation per minute. On first run, 24h of one-minute closes are backfilled
+from Coinbase so the estimator is not blind for a day; they are stored under a
+separate source so a candle close is never mistaken for a live tick.
+
+Known limitation, stated rather than hidden: square-root-of-time assumes
+i.i.d. returns, and Bitcoin's volatility clusters.
+
+**`category` is not an underlying.** "Crypto" contains BTC, ETH, SOL and XRP;
+only the series ticker says which. The detector holds one fresh reference per
+underlying and refuses any market whose feed is missing — it does not fall
+back to a default symbol. It did once, and reported a 72¢ edge on an Ethereum
+contract by comparing its $1,969 strike to Bitcoin at $65,154. Only BTC has a
+feed today, so ETH/SOL/XRP markets are seen and refused.
 
 ---
 

@@ -22,16 +22,20 @@ from app.core.redis import beat, close_redis, get_redis
 from app.db.base import dispose_engine, get_session_factory
 from app.detectors.base import propose_finding, record
 from app.detectors.runner import (
+    LeaderboardWatcherDetector,
+    LongshotCalibrationDetector,
     ResolutionSniperDetector,
     SetArbitrageDetector,
     StaleQuoteDetector,
+    UndervaluedScreenerDetector,
+    WhaleFlowDetector,
 )
 from app.kalshi.client import build_rest_client
 from app.settings import get_settings
 from app.trading.executor import Executor
 from app.trading.interlocks import InterlockError, resolve_route
 from app.trading.proposals import ProposalError
-from app.worker import maintenance
+from app.worker import calibration, maintenance
 
 log = get_logger(__name__)
 
@@ -51,6 +55,11 @@ DETECTOR_SCAN_SEC = 20
 #: still has to exist, because the risk layer's loss limit is only as current
 #: as the P&L it reads.
 SETTLEMENT_SWEEP_SEC = 120
+#: Calibration records one observation per market, ever, and then waits for it
+#: to settle. Nothing is gained by looking often — the interesting event is a
+#: market appearing in a band for the first time, which is a listing, not a
+#: tick.
+CALIBRATION_SWEEP_SEC = 300
 
 
 async def _heartbeat_loop(stop: asyncio.Event) -> None:
@@ -106,6 +115,24 @@ async def _settlement_loop(executor: Executor, stop: asyncio.Event) -> None:
             log.exception("settlement sweep failed: %s", exc)
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=SETTLEMENT_SWEEP_SEC)
+
+
+async def _calibration_loop(stop: asyncio.Event) -> None:
+    """Collect price-vs-outcome observations for the longshot screen.
+
+    Runs whether or not the detector is enabled: the screen refuses to say
+    anything below 500 settled samples, and a detector that only starts
+    collecting when switched on would be useless for months afterwards.
+    Gathering the data is not the same as acting on it.
+    """
+    sessions = get_session_factory()
+    while not stop.is_set():
+        try:
+            await calibration.sweep_calibration(sessions, get_config())
+        except Exception as exc:  # noqa: BLE001
+            log.exception("calibration sweep failed: %s", exc)
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=CALIBRATION_SWEEP_SEC)
 
 
 async def _detector_loop(detectors: list[Any], stop: asyncio.Event) -> None:
@@ -189,6 +216,10 @@ async def run() -> None:
         SetArbitrageDetector(client),
         StaleQuoteDetector(client),
         ResolutionSniperDetector(),
+        UndervaluedScreenerDetector(),
+        WhaleFlowDetector(),
+        LongshotCalibrationDetector(),
+        LeaderboardWatcherDetector(),
     ]
     log.info("order maintenance ready (authenticated=%s)", client.authenticated)
     log.info(
@@ -208,6 +239,7 @@ async def run() -> None:
         asyncio.create_task(_order_sweep_loop(executor, stop), name="order-sweep"),
         asyncio.create_task(_detector_loop(detectors, stop), name="detectors"),
         asyncio.create_task(_settlement_loop(executor, stop), name="settlements"),
+        asyncio.create_task(_calibration_loop(stop), name="calibration"),
     ]
 
     try:

@@ -32,7 +32,32 @@ from decimal import Decimal
 
 from app.core.money import parse_dollars
 
-__all__ = ["StrikeVerdict", "resolve_strike", "decisive_fair_price"]
+__all__ = [
+    "StrikeVerdict",
+    "resolve_strike",
+    "decisive_fair_price",
+    "reference_symbol_for",
+]
+
+#: Series-ticker prefix -> the reference symbol that actually prices it.
+#:
+#: This map exists because of a bug that reached a live run: the detector
+#: selected on ``category == "Crypto"`` and compared every one of those
+#: markets against ``BTC-USD``. An ETH market with a $1,969 strike, held up
+#: against Bitcoin at $65,154, resolves "decisively YES" and produced a
+#: 71-cent edge on a contract genuinely quoted at 26c. Every part of that
+#: number was arithmetically correct and it was comparing two different
+#: assets.
+#:
+#: Category is not an underlying. "Crypto" contains at least BTC, ETH, SOL
+#: and XRP, and the only thing that says which one a market is about is its
+#: series ticker.
+REFERENCE_PREFIXES: dict[str, str] = {
+    "KXBTC": "BTC-USD",
+    "KXETH": "ETH-USD",
+    "KXSOL": "SOL-USD",
+    "KXXRP": "XRP-USD",
+}
 
 ONE = Decimal(1)
 HUNDRED = Decimal(100)
@@ -130,6 +155,30 @@ def reference_is_fresh(
     if observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=UTC)
     return (now - observed_at).total_seconds() <= max_age_sec
+
+
+def reference_symbol_for(ticker: str | None) -> str | None:
+    """Which spot feed prices this market, or ``None`` if we cannot tell.
+
+    ``None`` is a refusal and must be treated as one. Falling back to a
+    default symbol is precisely the bug this function was written to prevent:
+    a market priced against the wrong asset does not look broken, it looks
+    like an enormous edge, because the strike and the spot are both perfectly
+    valid numbers that have nothing to do with each other.
+
+    Matching is on the **series** — the segment before the first hyphen —
+    rather than on a substring of the whole ticker, so a strike or date that
+    happens to contain "BTC" cannot pull a market into the wrong feed.
+    """
+    if not ticker:
+        return None
+    series = ticker.split("-", 1)[0].strip().upper()
+    if not series:
+        return None
+    for prefix, symbol in REFERENCE_PREFIXES.items():
+        if series.startswith(prefix):
+            return symbol
+    return None
 
 
 def parse_spot(value: object) -> Decimal:

@@ -638,10 +638,21 @@ class DetectorStat(Base):
 
 
 class CalibrationLog(Base):
-    """Price-vs-settlement observations for the longshot calibration screen."""
+    """Price-vs-settlement observations for the longshot calibration screen.
+
+    **One row per market, ever.** The unique constraint is the whole
+    statistical basis of the table: a market that sits at 5c for a week would
+    otherwise contribute thousands of observations that are all the same
+    observation, and the sample count the calibration screen refuses below
+    (500 by default) would be satisfied by a few dozen markets pretending to
+    be a thousand. Resampling adds rows, not information.
+    """
 
     __tablename__ = "calibration_log"
-    __table_args__ = (Index("ix_calib_bucket", "price_bucket_cents"),)
+    __table_args__ = (
+        UniqueConstraint("ticker", name="uq_calibration_ticker"),
+        Index("ix_calib_bucket", "price_bucket_cents"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     ticker: Mapped[str] = mapped_column(String(128), nullable=False)

@@ -47,6 +47,10 @@ __all__ = [
     "SetArbitrageDetector",
     "StaleQuoteDetector",
     "ResolutionSniperDetector",
+    "UndervaluedScreenerDetector",
+    "WhaleFlowDetector",
+    "LongshotCalibrationDetector",
+    "LeaderboardWatcherDetector",
 ]
 
 #: Set sizes to price, largest first. A bigger set walks deeper into the book
@@ -271,11 +275,15 @@ class StaleQuoteDetector:
 
         from sqlalchemy import desc
 
+        from app.btc.history import horizon_sigma
+        from app.btc.vol import fair_price as vol_fair_price
         from app.core.fees import net_edge_cents
         from app.db.models import ExternalPrice
         from app.detectors.stale_quote import (
+            REFERENCE_PREFIXES,
             decisive_fair_price,
             reference_is_fresh,
+            reference_symbol_for,
             resolve_strike,
         )
 
@@ -284,21 +292,34 @@ class StaleQuoteDetector:
         min_margin = Decimal(str(getattr(cfg, "decisive_margin_pct", 1.0)))
         max_minutes = float(getattr(cfg, "max_minutes_to_close", 30))
         min_edge = Decimal(str(getattr(cfg, "min_net_edge_cents", 2.0)))
+        # M6: price from an actual volatility estimate rather than the
+        # fixed-margin placeholder M4 shipped. The placeholder survives only
+        # as a *veto* below — see the comment at the pricing site.
+        use_vol = bool(config.bitcoin.enabled)
 
-        latest = (
-            await session.execute(
-                select(ExternalPrice)
-                .where(ExternalPrice.symbol == "BTC-USD")
-                .order_by(desc(ExternalPrice.ts))
-                .limit(1)
-            )
-        ).scalars().first()
+        # One fresh reference per underlying. There is deliberately no global
+        # "spot" any more: the previous version selected every market in the
+        # Crypto *category* and priced all of them against BTC, which on a
+        # live run turned an ETH contract quoted at 26c into a 71-cent edge
+        # because $1,969 is a long way below $65,154. Category is not an
+        # underlying; only the series says which asset a market tracks.
+        references: dict[str, Decimal] = {}
+        for symbol in set(REFERENCE_PREFIXES.values()):
+            row = (
+                await session.execute(
+                    select(ExternalPrice)
+                    .where(ExternalPrice.symbol == symbol)
+                    .order_by(desc(ExternalPrice.ts))
+                    .limit(1)
+                )
+            ).scalars().first()
+            if row is not None and reference_is_fresh(row.ts, max_age_sec=max_age):
+                references[symbol] = row.price
 
-        if latest is None or not reference_is_fresh(latest.ts, max_age_sec=max_age):
-            log.debug("stale_quote: no fresh BTC reference; emitting nothing")
+        if not references:
+            log.debug("stale_quote: no fresh reference price; emitting nothing")
             return []
 
-        spot = latest.price
         horizon = datetime.now(UTC) + timedelta(minutes=max_minutes)
         markets = (
             await session.execute(
@@ -326,6 +347,14 @@ class StaleQuoteDetector:
         headroom = state.headroom_cents if state else None
 
         for market in markets:
+            # Refuse anything whose underlying we cannot name, and anything
+            # whose feed is missing or stale, rather than reaching for
+            # whatever price happens to be nearest.
+            symbol = reference_symbol_for(market.ticker)
+            spot = references.get(symbol) if symbol else None
+            if spot is None:
+                continue
+
             verdict = resolve_strike(
                 strike_type=market.strike_type,
                 floor_strike=market.floor_strike,
@@ -334,8 +363,48 @@ class StaleQuoteDetector:
             )
             if verdict is None:
                 continue
-            fair = decisive_fair_price(verdict, min_margin_pct=min_margin)
+
+            mins_left = (
+                market.close_time - datetime.now(UTC)
+            ).total_seconds() / 60
+
+            # The margin check stays, but its job has changed. It is no longer
+            # the model — it is a veto in front of one. A strike that spot has
+            # barely cleared is exactly where a lognormal is least trustworthy
+            # (it prices the last basis point of edge with total confidence
+            # and no memory of the last jump), so the crude test still gets to
+            # say "not this one" before the precise one gets to say a number.
+            if decisive_fair_price(verdict, min_margin_pct=min_margin) is None:
+                continue
+
+            fair = None
+            sigma_note: dict[str, Any] = {}
+            if use_vol:
+                estimate = await horizon_sigma(
+                    session, config, minutes_to_close=mins_left, symbol=symbol
+                )
+                if estimate is not None:
+                    fair = vol_fair_price(
+                        strike_type=market.strike_type,
+                        floor_strike=market.floor_strike,
+                        cap_strike=market.cap_strike,
+                        spot=spot,
+                        sigma=estimate.sigma,
+                    )
+                    sigma_note = {
+                        "sigma_horizon": f"{estimate.sigma:.6f}",
+                        "sigma_per_minute": f"{estimate.per_minute_sigma:.8f}",
+                        "vol_samples": estimate.samples,
+                        "vol_as_of": estimate.as_of.isoformat(),
+                    }
+
             if fair is None:
+                # No usable volatility estimate, so no price. Falling back to
+                # the fixed-margin heuristic here would be the worst of both:
+                # the operator would see a detector that says "vol model" and
+                # a number that came from a constant, with nothing on the card
+                # distinguishing the two. Refusing is the honest answer, and
+                # `bitcoin.enabled: false` is what silences this entirely.
                 continue
 
             # Buy the side the spot says is right, at what it actually costs.
@@ -348,10 +417,6 @@ class StaleQuoteDetector:
                 fair = Decimal(1) - fair
             if price is None or not (Decimal(0) < price < Decimal(1)):
                 continue
-
-            mins_left = (
-                market.close_time - datetime.now(UTC)
-            ).total_seconds() / 60
 
             # Two passes, because fees round per fill and so the edge depends
             # slightly on the size. Probe at a nominal size to learn the
@@ -396,23 +461,26 @@ class StaleQuoteDetector:
                     side=side,
                     fair_price=fair,
                     net_edge_cents=edge,
-                    # Bounded well below certainty: this is a fixed-margin
-                    # heuristic, not a probability from a vol model. That
-                    # arrives in M6.
+                    # Still bounded well below certainty, for a different
+                    # reason than in M4. The price now comes from a real
+                    # estimator, but a driftless lognormal fitted to
+                    # square-root-scaled minute returns is a model of a market
+                    # that jumps and clusters — right on average and capable
+                    # of being badly wrong exactly when it matters.
                     confidence=min(0.75, 0.4 + float(verdict.margin_pct) / 20.0),
                     size_hint=size,
                     rationale=(
                         f"spot {spot} is {verdict.margin_pct:.2f}% past the "
                         f"{market.strike_type} strike with "
-                        f"{mins_left:.0f}m left; {side.value} quoted at {price}. "
+                        f"{mins_left:.0f}m left; vol model fair {fair} vs "
+                        f"{side.value} quoted at {price}. "
                         f"{size} contracts at "
                         f"{recommendation.scaled_fraction:.1%} of bankroll "
                         f"(capped by {recommendation.binding_constraint})"
                     ),
                     evidence={
                         "spot": str(spot),
-                        "spot_source": latest.source,
-                        "spot_ts": latest.ts.isoformat() if latest.ts else None,
+                        "reference_symbol": symbol,
                         "strike_type": market.strike_type,
                         "floor_strike": str(market.floor_strike),
                         "cap_strike": str(market.cap_strike),
@@ -423,7 +491,8 @@ class StaleQuoteDetector:
                         "full_kelly": str(recommendation.kelly_fraction),
                         "staked_fraction": str(recommendation.scaled_fraction),
                         "size_capped_by": recommendation.binding_constraint,
-                        "heuristic": "fixed margin, not a volatility model",
+                        "model": "driftless lognormal, EWMA minute vol",
+                        **sigma_note,
                     },
                 )
             )
@@ -504,3 +573,306 @@ class ResolutionSniperDetector:
             )
 
         return findings
+
+
+class UndervaluedScreenerDetector:
+    """Thin, wide, closing-soon markets — a reading list, not a signal.
+
+    Emits ``net_edge_cents=0`` always, and that is structural rather than a
+    placeholder: an illiquid wide-spread market is not mispriced, it is
+    *untraded*, and the spread that makes it interesting to look at is the
+    same spread you would have to cross to act. Any edge reported here would
+    be manufactured from the screener's own selection criterion.
+    """
+
+    name = "undervalued_screener"
+
+    def enabled(self, config: Config) -> bool:
+        return bool(getattr(config.detectors.undervalued_screener, "enabled", False))
+
+    async def scan(self, session: AsyncSession, config: Config) -> list[Finding]:
+        from datetime import UTC, datetime
+
+        from app.detectors.undervalued_screener import MarketSnapshot, screen
+
+        cfg = config.detectors.undervalued_screener
+        max_pct = float(getattr(cfg, "max_volume_percentile", 0.25))
+        min_spread = Decimal(str(getattr(cfg, "min_spread_cents", 2)))
+        max_hours = float(getattr(cfg, "max_hours_to_close", 168))
+
+        now = datetime.now(UTC)
+        rows = (
+            await session.execute(
+                select(Market).where(
+                    Market.status == "active",
+                    Market.close_time.isnot(None),
+                    Market.yes_bid.isnot(None),
+                    Market.yes_ask.isnot(None),
+                )
+            )
+        ).scalars().all()
+
+        snapshots: list[MarketSnapshot] = []
+        for market in rows:
+            close = market.close_time
+            if close is None:
+                continue
+            if close.tzinfo is None:
+                close = close.replace(tzinfo=UTC)
+            snapshots.append(
+                MarketSnapshot(
+                    ticker=market.ticker,
+                    volume_24h=market.volume_24h or Decimal(0),
+                    yes_bid=market.yes_bid,
+                    yes_ask=market.yes_ask,
+                    hours_to_close=(close - now).total_seconds() / 3600.0,
+                    open_interest=market.open_interest,
+                )
+            )
+
+        results = screen(
+            snapshots,
+            max_volume_percentile=max_pct,
+            min_spread_cents=min_spread,
+            max_hours_to_close=max_hours,
+        )
+
+        # The screener is a ranking, so the tail of it is noise by
+        # construction. Emitting all of it would bury every other detector's
+        # signals under hundreds of "this market is quiet" notes.
+        top = results[: int(getattr(cfg, "max_results", 20))]
+
+        return [
+            Finding(
+                detector=self.name,
+                ticker=r.ticker,
+                # Nothing here has a view on direction; YES is the neutral
+                # label the Signal schema requires, not a recommendation.
+                side=Side.YES,
+                fair_price=Decimal("0.5"),
+                net_edge_cents=Decimal(0),
+                confidence=0.1,
+                rationale=(
+                    f"RESEARCH ONLY — quiet and wide, not known to be "
+                    f"mispriced. {r.reason} Score {r.score:.1f} is an ordering "
+                    f"for attention, not cents and not a probability."
+                ),
+                evidence={
+                    "volume_percentile": r.volume_percentile,
+                    "spread_cents": str(r.spread_cents),
+                    "hours_to_close": r.hours_to_close,
+                    "score": r.score,
+                    "note": "no edge is claimed; the spread is the cost of acting",
+                },
+            )
+            for r in top
+        ]
+
+
+class WhaleFlowDetector:
+    """Unusually large prints and sweeps on the public tape.
+
+    Flow is an **input to judgement, never an instruction**. A large trade is
+    not information about value — it is information that somebody with a
+    different opinion, or a different need, transacted, and the counterparty
+    may be the informed one. Confidence is hard-capped by ``base_confidence``
+    and no amount of size can raise it.
+    """
+
+    name = "whale_flow"
+
+    def enabled(self, config: Config) -> bool:
+        return bool(getattr(config.detectors.whale_flow, "enabled", False))
+
+    async def scan(self, session: AsyncSession, config: Config) -> list[Finding]:
+        from datetime import UTC, datetime, timedelta
+
+        from app.db.models import Tape
+        from app.detectors.whale_flow import Trade, analyse
+
+        cfg = config.detectors.whale_flow
+        threshold = float(getattr(cfg, "size_zscore_threshold", 3.0))
+        window = float(getattr(cfg, "sweep_window_sec", 2.0))
+        min_levels = int(getattr(cfg, "min_levels_cleared", 2))
+        base_conf = float(getattr(cfg, "base_confidence", 0.35))
+        lookback = int(getattr(cfg, "lookback_minutes", 30))
+
+        since = datetime.now(UTC) - timedelta(minutes=lookback)
+        rows = (
+            await session.execute(
+                select(Tape).where(Tape.ts >= since).order_by(Tape.ts)
+            )
+        ).scalars().all()
+
+        by_ticker: dict[str, list[Trade]] = {}
+        for row in rows:
+            by_ticker.setdefault(row.ticker, []).append(
+                Trade(
+                    ts=row.ts,
+                    yes_price=row.yes_price,
+                    count=row.count,
+                    taker_side=row.taker_side,
+                )
+            )
+
+        findings: list[Finding] = []
+        for ticker, trades in by_ticker.items():
+            event = analyse(
+                trades,
+                zscore_threshold=threshold,
+                window_sec=window,
+                min_levels=min_levels,
+                base_confidence=base_conf,
+            )
+            if event is None:
+                continue
+
+            findings.append(
+                Finding(
+                    detector=self.name,
+                    ticker=ticker,
+                    # The side flow *went*, which is an observation about who
+                    # crossed the spread — not a recommendation to follow it.
+                    side=Side.YES if event.direction == "buy" else Side.NO,
+                    fair_price=trades[-1].yes_price,
+                    # Flow says nothing about value, so there is no edge to
+                    # report. A number here would be pure momentum dressed up.
+                    net_edge_cents=Decimal(0),
+                    confidence=event.confidence,
+                    rationale=f"RESEARCH ONLY — {event.rationale}",
+                    evidence={
+                        "direction": event.direction,
+                        "contracts": str(event.contracts),
+                        "zscore": event.zscore,
+                        "swept_levels": event.sweep.levels if event.sweep else None,
+                        "note": (
+                            "the counterparty to a large print may be the "
+                            "informed side; this is momentum, not edge"
+                        ),
+                    },
+                )
+            )
+
+        return findings
+
+
+class LongshotCalibrationDetector:
+    """Whether this market set actually shows longshot bias.
+
+    Reads the observations the worker collects continuously (one per market,
+    ever) and refuses to say anything until a bucket clears
+    ``min_samples_before_signalling``. Two observations in a bucket produce a
+    beautiful-looking rate and mean nothing.
+    """
+
+    name = "longshot_calibration"
+
+    def enabled(self, config: Config) -> bool:
+        return bool(getattr(config.detectors.longshot_calibration, "enabled", False))
+
+    async def scan(self, session: AsyncSession, config: Config) -> list[Finding]:
+        from app.db.models import CalibrationLog
+        from app.detectors.longshot_calibration import (
+            Observation,
+            calibrate,
+            significant,
+        )
+
+        cfg = config.detectors.longshot_calibration
+        min_samples = int(getattr(cfg, "min_samples_before_signalling", 500))
+
+        rows = (
+            await session.execute(
+                select(
+                    CalibrationLog.price_bucket_cents, CalibrationLog.settled_yes
+                ).where(CalibrationLog.settled_yes.isnot(None))
+            )
+        ).all()
+
+        stats = calibrate(
+            [
+                Observation(price_bucket_cents=int(b), settled_yes=bool(y))
+                for b, y in rows
+            ]
+        )
+        hits = significant(stats, min_samples=min_samples)
+        if not hits:
+            log.debug(
+                "longshot_calibration: %d settled observation(s), none past the "
+                "%d-sample floor",
+                len(rows),
+                min_samples,
+            )
+            return []
+
+        return [
+            Finding(
+                detector=self.name,
+                # A bucket is a claim about a price band, not about a market.
+                # There is no ticker to attach it to, so the band names itself.
+                ticker=f"BUCKET-{stat.bucket_cents}C",
+                side=Side.YES,
+                fair_price=Decimal(stat.observed_rate).quantize(Decimal("0.0001")),
+                # Calibration is not profitability: a 5c contract must win
+                # more than 5% of the time to cover the fee, and nothing here
+                # accounts for that. Reporting an edge would skip that step.
+                net_edge_cents=Decimal(0),
+                confidence=0.3,
+                rationale=(
+                    f"RESEARCH ONLY — {stat.bucket_cents}c contracts settled YES "
+                    f"{stat.observed_rate:.1%} of the time over {stat.samples} "
+                    f"markets (95% CI {stat.ci_low:.1%}-{stat.ci_high:.1%}); the "
+                    f"price implies {stat.implied_rate:.1%}. Calibration, not "
+                    f"profitability — fees are not in this number."
+                ),
+                evidence={
+                    "bucket_cents": stat.bucket_cents,
+                    "samples": stat.samples,
+                    "yes_count": stat.yes_count,
+                    "observed_rate": stat.observed_rate,
+                    "implied_rate": stat.implied_rate,
+                    "ci_low": stat.ci_low,
+                    "ci_high": stat.ci_high,
+                    "note": (
+                        "observations come from watched markets, so this "
+                        "measures the watchlist, not Kalshi"
+                    ),
+                },
+            )
+            for stat in hits
+        ]
+
+
+class LeaderboardWatcherDetector:
+    """Not implemented, and not buildable from anything official.
+
+    Kalshi's API exposes no leaderboard, no public trader ranking, and no
+    public profile surface; the only endpoints naming a counterparty are RFQ
+    and block-trade negotiation, which are yours alone. Checked against
+    docs.kalshi.com/openapi.yaml on 2026-07-27.
+
+    The only way to build this is to scrape the web app, which this project
+    does not do. So the class exists purely to say so out loud when someone
+    enables it — a detector that is silently absent from the registry looks
+    identical to one that is running and finding nothing, and that is the
+    worse failure.
+    """
+
+    name = "leaderboard_watcher"
+
+    def __init__(self) -> None:
+        self._warned = False
+
+    def enabled(self, config: Config) -> bool:
+        return bool(getattr(config.detectors.leaderboard_watcher, "enabled", False))
+
+    async def scan(self, session: AsyncSession, config: Config) -> list[Finding]:
+        if not self._warned:
+            log.warning(
+                "leaderboard_watcher is enabled but cannot run: Kalshi publishes "
+                "no leaderboard or trader-ranking endpoint, and this project "
+                "does not scrape. Set detectors.leaderboard_watcher.enabled to "
+                "false; nothing is being missed."
+            )
+            self._warned = True
+        return []

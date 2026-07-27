@@ -146,6 +146,17 @@ API's own signed `position_fp`.
   until M5 the system booked the cost of every held-to-resolution thesis and
   none of its proceeds. The simulated book settles from the market's own
   `result`; exchange books settle from the endpoint above. Never cross them.
+- **`category` is NOT an underlying.** "Crypto" contains BTC, ETH, SOL and
+  XRP. The stale-quote detector selected on `category == "Crypto"` and priced
+  all of them against `BTC-USD`; an ETH contract with a $1,969 strike against
+  Bitcoin at $65,154 reads as decisively YES and reported a **+72c edge** on a
+  market quoted at 26c. Every number was arithmetically right and they
+  described different assets. 1,762 markets were affected. Only the **series
+  ticker** says what a market tracks — see `reference_symbol_for()` in
+  `app/detectors/stale_quote.py`, which refuses rather than defaulting.
+- **The tape's `taker_side` is `yes`/`no`, never `buy`/`sell`.** Verified
+  against 9,604 live rows. A flow detector written to the obvious vocabulary
+  finds zero sweeps forever and looks like it is working.
 - **Candle `price` OHLC is null when no trades occurred** in that period,
   which is most periods in a thin market. Fall back to the quote midpoint or
   charts render empty.
@@ -205,9 +216,15 @@ backend/app/
     normalize.py     API payloads -> ORM rows
     streams.py       tape, candles, book snapshots
     backfill.py      REST read-through for the market page
+  btc/
+    vol.py           ⭐ driftless lognormal + EWMA vol; refuses, never guesses
+    history.py       minute-bucketed spot reader (sampling matters — see docs)
   detectors/
     set_arbitrage.py ⭐ pure set-arb math; sell side is safe, buy side is not
-    stale_quote.py   spot-vs-strike; heuristic margin, no vol model yet
+    stale_quote.py   spot-vs-strike; ⭐ owns the series->underlying map
+    undervalued_screener.py  research feed; structurally exposes no edge
+    whale_flow.py    large prints/sweeps; confidence hard-capped
+    longshot_calibration.py  Wilson intervals; refuses below the sample floor
     resolution_sniper.py  settlement lag; research only without a source
     base.py          Detector protocol + signal recording
     runner.py        the live detectors, each with its refusal rules
@@ -236,6 +253,11 @@ scripts/             operational scripts
 ## Verification — run these before claiming anything works
 
 Everything runs in Docker; no host toolchain needed.
+
+**`api`, `worker` and `ingest` are separate images from the same Dockerfile.**
+`docker compose build api` alone leaves the worker running old code. That
+happened twice while fixing the cross-asset bug above and made a correct fix
+look like it had failed. Build all three, or just `docker compose build`.
 
 ```bash
 docker compose up -d --build
@@ -267,7 +289,7 @@ a liquidity score of −450 on a 0–100 scale, fractional sizes rendering as
 | M3 HITL approval/execution rail | done |
 | M4 detectors wave 1 | done (all three; none has signalled live yet) |
 | M5 risk layer + notifications | done (Web Push deferred — needs TLS) |
-| M6 BTC engine + detectors wave 2 | pending |
+| M6 BTC engine + detectors wave 2 | done (leaderboard has no API; not built) |
 | M7 weather engine | pending |
 | M8 news/catalyst engine | pending |
 | M9 backtester + hardening | pending |
@@ -276,6 +298,18 @@ Branch: `claude/kalshi-copilot-build-bgyv2d`
 
 ### Open items for the operator
 
+- **`leaderboard_watcher` cannot be built.** Kalshi publishes no leaderboard,
+  trader ranking, or public profile endpoint — checked against the OpenAPI
+  spec on 2026-07-27. The only surfaces naming a counterparty are RFQ and
+  block trades, which are yours alone. It is registered as a detector that
+  logs a refusal when enabled, because one silently missing from the registry
+  looks identical to one that runs and finds nothing. Do not add scraping.
+- **Only BTC has a spot feed.** ETH/SOL/XRP markets are correctly refused by
+  the stale-quote detector, which is ~1,353 markets it can see and cannot
+  price. Adding feeds means adding to `SPOT_SOURCES` and polling per symbol.
+- **Signals have no duplicate guard.** Proposals do; signals do not, and the
+  screener re-emits its top 20 every scan (180 rows in nine scans). Fix that
+  before enabling `undervalued_screener` for real.
 - **No detector has signalled on a genuine edge yet.** The full path was
   exercised by dropping `min_net_edge_cents` negative so set-arb would
   propose regardless — 42 multi-leg proposals from live books, one approved
