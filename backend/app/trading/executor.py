@@ -31,15 +31,15 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_UP, Decimal
-from typing import Any, Final
+from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Config
 from app.core.logging import get_logger
-from app.core.money import format_count, format_dollars, parse_count, parse_dollars
+from app.core.money import format_count, parse_count, parse_dollars
 from app.core.redis import CH_ORDERS, get_redis
 from app.db.models import (
     Fill,
@@ -76,11 +76,22 @@ LIVE_ORDER_STATUSES = (
 
 _TIF_WIRE = {"gtc": TIF_GTC, "ioc": TIF_IOC}
 
-#: Serialise wire prices at the API's full precision rather than rounding to
-#: cents. Tick size varies per market, so a sub-cent price can be legal; a
-#: rounded one would be a different price than the operator approved, and
-#: might not even be on a valid tick.
-WIRE_PRICE_PLACES: Final = 6
+def wire_price(value: Decimal) -> str:
+    """Serialise a price for the order API at its own natural precision.
+
+    The exchange validates the *string's* decimal exponent against the
+    market's price level structure and rejects anything finer. Zero-padding
+    to a fixed width is therefore not harmless: sending ``"0.250000"`` to a
+    ``linear_cent`` market fails with ``invalid dollar precision: -6``, even
+    though the value is exactly 25c. Observed against the live demo API on
+    the first real order placed.
+
+    Padding is not the same as precision. ``normalize`` strips trailing
+    zeros, so 25c goes as ``"0.25"`` while a genuine sub-cent price such as
+    0.1234 keeps all four places. The ``f`` format is what stops ``normalize``
+    emitting exponent notation.
+    """
+    return format(value.normalize(), "f")
 
 
 class ExecutionError(RuntimeError):
@@ -91,18 +102,18 @@ class ExecutionError(RuntimeError):
         self.code = code
 
 
-def fee_cents_from_dollars(value: Any) -> int:
-    """Convert an API fee (fixed-point dollars) into whole cents.
+def fee_cents_from_dollars(value: Any) -> Decimal:
+    """Convert an API fee (fixed-point dollars) into cents, exactly.
 
-    Fees genuinely are a whole number of cents, so this is a unit change and
-    not a rounding decision — but it rounds defensively rather than
-    truncating, because losing a cent per fill in our favour would flatter
-    every P&L number we report.
+    No rounding. Kalshi bills fractional cents — 2 contracts at 20c cost
+    $0.022400, which is 2.24 cents, not 2 and not 3. Rounding to an integer
+    here loses real money from the record in whichever direction it rounds,
+    and the whole point of this column is to say what we were actually
+    charged rather than what we predicted.
     """
     if value in (None, ""):
-        return 0
-    cents = parse_dollars(value, "fee_dollars") * Decimal(100)
-    return int(cents.quantize(Decimal(1), rounding=ROUND_HALF_UP))
+        return Decimal(0)
+    return parse_dollars(value, "fee_dollars") * Decimal(100)
 
 
 class Executor:
@@ -354,18 +365,18 @@ class Executor:
 
         wire_side = book_side(order.side, order.action)
         # The wire always speaks YES prices, whichever side we are taking.
-        wire_price = to_yes_price(order.side, order.limit_price)
+        price_yes = to_yes_price(order.side, order.limit_price)
 
         log.warning(
             "placing %s order: %s %s %s @ %s (wire: %s @ %s) route=%s",
             order.route, order.action, order.contracts, order.side.value,
-            order.limit_price, wire_side, wire_price, order.route,
+            order.limit_price, wire_side, wire_price(price_yes), order.route,
         )
 
         response = await self._rest.create_order(
             ticker=order.ticker,
             book_side=wire_side,
-            price_dollars=format_dollars(wire_price, WIRE_PRICE_PLACES),
+            price_dollars=wire_price(price_yes),
             count=format_count(order.contracts),
             client_order_id=order.client_order_id,
             time_in_force=_TIF_WIRE.get(order.time_in_force, TIF_GTC),
@@ -385,7 +396,7 @@ class Executor:
                     parse_dollars(fee_per_contract, "average_fee_paid") * filled
                 )
                 if fee_per_contract not in (None, "")
-                else 0
+                else Decimal(0)
             )
             await self._record_fill(
                 session,
@@ -409,7 +420,7 @@ class Executor:
         *,
         price: Decimal,
         contracts: Decimal,
-        fee_cents: int,
+        fee_cents: Decimal | int,
         exchange_fill_id: str,
         is_taker: bool,
     ) -> Fill:
@@ -429,7 +440,7 @@ class Executor:
 
         order.filled_contracts = (order.filled_contracts or Decimal(0)) + contracts
 
-        await positions.apply_fill(session, fill, is_paper=order.is_paper)
+        await positions.apply_fill(session, fill, route=order.route)
         await proposals.audit(
             session,
             kind="fill.recorded",
@@ -440,7 +451,7 @@ class Executor:
                 "fill_id": fill.id,
                 "price": str(price),
                 "contracts": str(contracts),
-                "fee_cents": fee_cents,
+                "fee_cents": str(fee_cents),
                 "route": order.route,
             },
         )
@@ -544,7 +555,7 @@ def fill_view(fill: Fill) -> dict[str, Any]:
         "action": fill.action,
         "price": str(fill.price),
         "contracts": str(fill.contracts),
-        "fee_cents": fill.fee_cents,
+        "fee_cents": str(fill.fee_cents),
         "is_taker": fill.is_taker,
         "ts": fill.ts.isoformat() if fill.ts else None,
     }

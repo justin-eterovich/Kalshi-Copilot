@@ -235,13 +235,16 @@ export interface FillRow {
   action: string;
   price: string;
   contracts: string;
-  fee_cents: number;
+  /** Exact cents as a decimal string — the exchange bills fractional cents. */
+  fee_cents: string;
   is_taker: boolean;
   ts: string | null;
 }
 
 export interface PositionRow {
   ticker: string;
+  /** simulated | demo_exchange | live_exchange — positions are per book. */
+  route: string;
   is_paper: boolean;
   net_contracts: string;
   side: string;
@@ -250,7 +253,7 @@ export interface PositionRow {
   avg_yes_price: string;
   realized_pnl_cents: string;
   unrealized_pnl_cents: string | null;
-  fees_paid_cents: number;
+  fees_paid_cents: string;
   updated_at: string | null;
 }
 

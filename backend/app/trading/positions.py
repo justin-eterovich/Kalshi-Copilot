@@ -96,17 +96,23 @@ def realized_from_fill(
     return new_net, fill_yes_price, realized
 
 
-async def apply_fill(session: AsyncSession, fill: Fill, *, is_paper: bool) -> Position:
-    """Fold ``fill`` into the position and the day's P&L.
+async def apply_fill(session: AsyncSession, fill: Fill, *, route: str) -> Position:
+    """Fold ``fill`` into the position and the day's P&L for ``route``.
+
+    Positions are kept per route, not per ``is_paper``. A simulated fill and a
+    demo-exchange fill are both "paper", but only one of them exists at
+    Kalshi — netting them into one book makes reconciliation impossible and
+    corrupts the report card.
 
     The caller is responsible for having persisted ``fill`` first; this is
     deliberately not idempotent on its own, so fills are deduplicated by the
     unique constraint on ``exchange_fill_id`` before they get here.
     """
+    is_paper = route != "live_exchange"
     position = (
         await session.execute(
             select(Position).where(
-                Position.ticker == fill.ticker, Position.is_paper == is_paper
+                Position.ticker == fill.ticker, Position.route == route
             )
         )
     ).scalars().first()
@@ -114,11 +120,12 @@ async def apply_fill(session: AsyncSession, fill: Fill, *, is_paper: bool) -> Po
     if position is None:
         position = Position(
             ticker=fill.ticker,
+            route=route,
             is_paper=is_paper,
             net_contracts=Decimal(0),
             avg_price=Decimal(0),
             realized_pnl_cents=Decimal(0),
-            fees_paid_cents=0,
+            fees_paid_cents=Decimal(0),
         )
         session.add(position)
 
@@ -139,11 +146,14 @@ async def apply_fill(session: AsyncSession, fill: Fill, *, is_paper: bool) -> Po
     position.realized_pnl_cents = (
         position.realized_pnl_cents or Decimal(0)
     ) + realized
-    position.fees_paid_cents = (position.fees_paid_cents or 0) + fill.fee_cents
+    position.fees_paid_cents = (
+        position.fees_paid_cents or Decimal(0)
+    ) + fill.fee_cents
 
     await _roll_daily(
         session,
         day=(fill.ts or datetime.now(UTC)).date(),
+        route=route,
         is_paper=is_paper,
         realized=realized,
         fee_cents=fill.fee_cents,
@@ -156,29 +166,31 @@ async def _roll_daily(
     session: AsyncSession,
     *,
     day: date,
+    route: str,
     is_paper: bool,
     realized: Decimal,
-    fee_cents: int,
+    fee_cents: Decimal,
 ) -> None:
     row = (
         await session.execute(
-            select(PnlDaily).where(PnlDaily.day == day, PnlDaily.is_paper == is_paper)
+            select(PnlDaily).where(PnlDaily.day == day, PnlDaily.route == route)
         )
     ).scalars().first()
 
     if row is None:
         row = PnlDaily(
             day=day,
+            route=route,
             is_paper=is_paper,
             realized_pnl_cents=Decimal(0),
             unrealized_pnl_cents=Decimal(0),
-            fees_paid_cents=0,
+            fees_paid_cents=Decimal(0),
             trades=0,
         )
         session.add(row)
 
     row.realized_pnl_cents = (row.realized_pnl_cents or Decimal(0)) + realized
-    row.fees_paid_cents = (row.fees_paid_cents or 0) + fee_cents
+    row.fees_paid_cents = (row.fees_paid_cents or Decimal(0)) + fee_cents
     row.trades = (row.trades or 0) + 1
 
 
@@ -202,6 +214,7 @@ def position_view(
 
     return {
         "ticker": position.ticker,
+        "route": position.route,
         "is_paper": position.is_paper,
         "net_contracts": str(net),
         "side": side.value,
@@ -210,7 +223,7 @@ def position_view(
         "avg_yes_price": str(avg_yes),
         "realized_pnl_cents": str(position.realized_pnl_cents or Decimal(0)),
         "unrealized_pnl_cents": None if unrealized is None else str(unrealized),
-        "fees_paid_cents": position.fees_paid_cents or 0,
+        "fees_paid_cents": str(position.fees_paid_cents or Decimal(0)),
         "updated_at": (
             position.updated_at.isoformat() if position.updated_at else None
         ),

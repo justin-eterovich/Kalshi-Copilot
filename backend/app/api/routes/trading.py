@@ -479,9 +479,10 @@ async def daily_pnl(
         "days": [
             {
                 "day": row.day.isoformat(),
+                "route": row.route,
                 "is_paper": row.is_paper,
                 "realized_pnl_cents": str(row.realized_pnl_cents or Decimal(0)),
-                "fees_paid_cents": row.fees_paid_cents or 0,
+                "fees_paid_cents": str(row.fees_paid_cents or Decimal(0)),
                 "trades": row.trades or 0,
             }
             for row in rows

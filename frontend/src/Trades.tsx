@@ -247,7 +247,7 @@ export default function Trades() {
                 </thead>
                 <tbody>
                   {positions.map((p) => (
-                    <tr key={`${p.ticker}-${p.is_paper}`}>
+                    <tr key={`${p.ticker}-${p.route}`}>
                       <td className="mono">
                         <Link to={`/market/${encodeURIComponent(p.ticker)}`}>
                           {p.ticker}
@@ -315,7 +315,7 @@ export default function Trades() {
                       </td>
                       <td className="num">{centsNum(f.price, 2)}</td>
                       <td className="num">{f.contracts}</td>
-                      <td className="num">{asDollars(String(f.fee_cents))}</td>
+                      <td className="num">{asDollars(f.fee_cents)}</td>
                     </tr>
                   ))}
                 </tbody>

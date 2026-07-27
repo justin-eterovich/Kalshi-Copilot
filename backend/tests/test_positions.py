@@ -139,9 +139,9 @@ class TestFractionalPrecision:
 class TestPositionView:
     def test_a_long_reads_as_yes(self) -> None:
         position = Position(
-            ticker="T", is_paper=True,
+            ticker="T", route="simulated", is_paper=True,
             net_contracts=Decimal(10), avg_price=Decimal("0.40"),
-            realized_pnl_cents=Decimal(0), fees_paid_cents=0,
+            realized_pnl_cents=Decimal(0), fees_paid_cents=Decimal(0),
         )
         view = position_view(position, None)
         assert view["side"] == "yes"
@@ -151,9 +151,9 @@ class TestPositionView:
     def test_a_short_reads_as_no_at_the_complement(self) -> None:
         """Stored as -10 @ 0.70; a trader reads '10 NO at 30c'."""
         position = Position(
-            ticker="T", is_paper=True,
+            ticker="T", route="simulated", is_paper=True,
             net_contracts=Decimal(-10), avg_price=Decimal("0.70"),
-            realized_pnl_cents=Decimal(0), fees_paid_cents=0,
+            realized_pnl_cents=Decimal(0), fees_paid_cents=Decimal(0),
         )
         view = position_view(position, None)
         assert view["side"] == "no"
@@ -165,18 +165,18 @@ class TestPositionView:
 
     def test_unrealised_pnl_marks_a_long(self) -> None:
         position = Position(
-            ticker="T", is_paper=True,
+            ticker="T", route="simulated", is_paper=True,
             net_contracts=Decimal(10), avg_price=Decimal("0.40"),
-            realized_pnl_cents=Decimal(0), fees_paid_cents=0,
+            realized_pnl_cents=Decimal(0), fees_paid_cents=Decimal(0),
         )
         view = position_view(position, Decimal("0.50"))
         assert view["unrealized_pnl_cents"] == "100.00"
 
     def test_unrealised_pnl_marks_a_short_the_other_way(self) -> None:
         position = Position(
-            ticker="T", is_paper=True,
+            ticker="T", route="simulated", is_paper=True,
             net_contracts=Decimal(-10), avg_price=Decimal("0.70"),
-            realized_pnl_cents=Decimal(0), fees_paid_cents=0,
+            realized_pnl_cents=Decimal(0), fees_paid_cents=Decimal(0),
         )
         view = position_view(position, Decimal("0.60"))
         assert view["unrealized_pnl_cents"] == "100.00"
@@ -184,17 +184,17 @@ class TestPositionView:
     def test_no_mark_means_no_invented_number(self) -> None:
         """A market with no quote does not get a made-up valuation."""
         position = Position(
-            ticker="T", is_paper=True,
+            ticker="T", route="simulated", is_paper=True,
             net_contracts=Decimal(10), avg_price=Decimal("0.40"),
-            realized_pnl_cents=Decimal(0), fees_paid_cents=0,
+            realized_pnl_cents=Decimal(0), fees_paid_cents=Decimal(0),
         )
         assert position_view(position, None)["unrealized_pnl_cents"] is None
 
     def test_money_serialises_as_strings(self) -> None:
         position = Position(
-            ticker="T", is_paper=True,
+            ticker="T", route="simulated", is_paper=True,
             net_contracts=Decimal("0.50"), avg_price=Decimal("0.405"),
-            realized_pnl_cents=Decimal("1.5"), fees_paid_cents=3,
+            realized_pnl_cents=Decimal("1.5"), fees_paid_cents=Decimal(3),
         )
         view = position_view(position, Decimal("0.5"))
         for key in ("net_contracts", "avg_price", "realized_pnl_cents"):

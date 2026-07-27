@@ -104,8 +104,36 @@ class Settings(BaseSettings):
         return self.is_prod and self.live_trading
 
     def credentials_present(self) -> bool:
-        """True when the active environment has a key ID and a readable key file."""
-        return bool(self.key_id) and self.private_key_path.is_file()
+        """True when the active environment has a key ID and a readable key file.
+
+        Never raises. ``Path.is_file()`` propagates ``PermissionError`` when a
+        parent directory is not traversable, and this is called from
+        ``resolve_route`` — which runs at startup and on every request to
+        ``/api/trading/state``. Letting it escape took the whole API down,
+        public market data included, because a key file was mode 600 and the
+        container runs as a different uid.
+
+        An unreadable key is reported as "no usable credentials", which is
+        exactly what it is. It is logged at ERROR rather than swallowed,
+        because "you have a key but I cannot read it" is a different problem
+        from "you have no key" and needs a different fix.
+        """
+        if not self.key_id:
+            return False
+        try:
+            return self.private_key_path.is_file()
+        except OSError as exc:
+            from app.core.logging import get_logger
+
+            get_logger(__name__).error(
+                "private key at %s exists but cannot be read (%s). The "
+                "containers run as uid 10001; a key that is mode 600 and owned "
+                "by another user is unreadable to them. Treating this as no "
+                "usable credentials.",
+                self.private_key_path,
+                exc.__class__.__name__,
+            )
+            return False
 
 
 @lru_cache(maxsize=1)

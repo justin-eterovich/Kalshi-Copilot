@@ -378,6 +378,26 @@ class TestWireTranslation:
 
         assert Decimal(rest.create_calls[0]["price_dollars"]) == Decimal("0.505")
 
+    async def test_the_wire_price_is_not_zero_padded(
+        self, key_file: Path
+    ) -> None:
+        """Regression: the first real order to Kalshi demo was rejected.
+
+        The exchange validates the *string's* decimal exponent against the
+        market's tick structure, so ``"0.250000"`` fails a ``linear_cent``
+        market with ``invalid dollar precision: -6`` even though the value is
+        exactly 25c. Padding is not the same as precision.
+        """
+        session = session_with_market()
+        rest = FakeRest()
+        executor = Executor(rest, demo_settings(key_file), make_config())
+
+        await executor.approve_and_execute(
+            session, make_proposal(limit_price=Decimal("0.25")), confirmed=True
+        )
+
+        assert rest.create_calls[0]["price_dollars"] == "0.25"
+
     async def test_the_client_order_id_is_sent(self, key_file: Path) -> None:
         session = session_with_market()
         rest = FakeRest()
@@ -613,17 +633,22 @@ class TestSimulatedFills:
 
 
 class TestFeeConversion:
-    def test_dollars_become_whole_cents(self) -> None:
-        assert fee_cents_from_dollars("0.0175") == 2
-        assert fee_cents_from_dollars("1.75") == 175
+    def test_dollars_become_cents(self) -> None:
+        assert fee_cents_from_dollars("1.75") == Decimal("175")
 
     def test_missing_fee_is_zero_not_an_error(self) -> None:
-        assert fee_cents_from_dollars(None) == 0
-        assert fee_cents_from_dollars("") == 0
+        assert fee_cents_from_dollars(None) == Decimal(0)
+        assert fee_cents_from_dollars("") == Decimal(0)
 
-    def test_rounds_up_rather_than_truncating(self) -> None:
-        """Losing a cent per fill in our favour would flatter every P&L."""
-        assert fee_cents_from_dollars("0.005") == 1
+    def test_fractional_cents_are_kept_exactly(self) -> None:
+        """Regression: observed against the live demo exchange.
+
+        Two contracts at 20c were billed $0.022400 — 2.24 cents. Rounding
+        that to 2 understates what we paid and flatters P&L; rounding to 3
+        overstates it. The record has to say what we were actually charged.
+        """
+        assert fee_cents_from_dollars("0.022400") == Decimal("2.24")
+        assert fee_cents_from_dollars("0.033600") == Decimal("3.36")
 
 
 class TestOrderView:

@@ -45,15 +45,27 @@ entire milestone's schema when it was discovered late; do not reintroduce it.
 |---------|-------------|----------|
 | Price | `"0.5600"` — dollars, up to **6 decimals** | `Decimal` dollars, `Numeric(12,6)` |
 | Count | `"10.00"` — **fractional to 0.01** | `Decimal`, `Numeric(16,2)` |
-| Fee | `"0.0175"` dollars on the wire | integer **cents** (it exactly is) |
+| Fee **charged** | `"0.022400"` dollars | `Decimal` cents, `Numeric(20,6)` |
+| Fee **estimate** | — | integer cents, rounded **up** |
 | Realised P&L | — | `Decimal` cents, `Numeric(20,6)` |
 
-Fees are whole cents because the exchange charges whole cents. **Realised P&L
-is not** — it is a price difference times a count, and both factors can be
-fractional (closing 0.50 contracts on a 1c move earns half a cent). M3
-corrected this: rounding each realisation would accumulate drift in the one
-number the report card is judged on, so it is carried exactly and rounded
-only for display.
+**Nothing here is a whole number of cents, including fees.** That was assumed
+until M3 put a real order on the demo exchange and read the bill back:
+
+- 2 contracts at 20c were charged `$0.022400` — **2.24 cents**. Not 2, not 3.
+- 3 contracts at 20c were charged `$0.033600` — 3.36 cents.
+
+So the exchange bills `0.07 * C * P * (1-P)` to six decimal places of a
+dollar, with no rounding, at least on demo. `Fill.fee_cents` therefore
+records the exact charge; truncating it to an integer understated cost and
+flattered P&L.
+
+`core/fees.py` still rounds **up** to a whole cent for *estimates*, which is
+the published formula and the conservative direction — it makes an edge look
+worse than it is rather than better. **Whether production rounds up is
+unverified**: the fee schedule PDF says it does, demo demonstrably does not.
+Resolve this when verifying the schedule; if prod rounds up, the estimate is
+already right and only demo differs.
 
 - Tick size varies per market (`price_level_structure`), so sub-cent prices
   are real. Never round a quote on ingest.

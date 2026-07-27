@@ -56,9 +56,12 @@ from app.db.base import Base
 PriceType = Numeric(12, 6)
 #: Contract count, 0.01 granularity.
 QtyType = Numeric(16, 2)
-#: Realised/unrealised P&L in cents. Fractional because a price difference
-#: times a fractional count is fractional — see the module docstring.
-PnlCentsType = Numeric(20, 6)
+#: Money in cents, carried exactly. Fractional because neither of the things
+#: stored in it is a whole number of cents: P&L is a price difference times a
+#: possibly-fractional count, and the exchange bills fees to six decimal
+#: places of a dollar (observed on demo: 2 contracts at 20c cost $0.022400,
+#: i.e. 2.24 cents, not 3).
+CentsType = Numeric(20, 6)
 
 
 class Side(enum.StrEnum):
@@ -413,8 +416,13 @@ class Fill(Base):
     #: Price on ``side``, in dollars — 0.30 for a NO fill at 30c.
     price: Mapped[Decimal] = mapped_column(PriceType, nullable=False)
     contracts: Mapped[Decimal] = mapped_column(QtyType, nullable=False)
-    #: Fees round up per fill, so this is recorded per fill, not per order.
-    fee_cents: Mapped[int] = mapped_column(Integer, default=0)
+    #: What the exchange actually charged for this fill, in cents, exactly.
+    #: Recorded per fill because fees are billed per fill. NOT an integer:
+    #: Kalshi bills fractional cents (2 contracts at 20c cost 2.24c on demo),
+    #: and truncating that to 2 quietly flatters every P&L number downstream.
+    #: The *estimate* in app.core.fees still rounds up, deliberately — see the
+    #: note in that module about which direction to be wrong in.
+    fee_cents: Mapped[Decimal] = mapped_column(CentsType, default=Decimal(0))
     is_taker: Mapped[bool] = mapped_column(Boolean, default=True)
     ts: Mapped[datetime] = _ts()
 
@@ -433,19 +441,25 @@ class Position(Base):
     """
 
     __tablename__ = "positions"
-    __table_args__ = (UniqueConstraint("ticker", "is_paper", name="uq_position"),)
+    __table_args__ = (UniqueConstraint("ticker", "route", name="uq_position"),)
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     ticker: Mapped[str] = mapped_column(String(128), nullable=False)
-    #: False only for orders that reached the live exchange with real money.
-    #: Demo-exchange orders are paper: the rail is real, the money is not.
+    #: Which rail these fills came from. Positions are keyed on it because a
+    #: simulated fill and a demo-exchange fill are not the same position:
+    #: only one of them exists at Kalshi. Netting them into one book makes
+    #: reconciliation against the exchange impossible and silently corrupts
+    #: the report card. Observed live — a simulated -27 and a real +2 merged
+    #: into -25 while Kalshi held +2.
+    route: Mapped[str] = mapped_column(String(16), default="simulated", nullable=False)
+    #: Convenience flag: False only for the live exchange. Derived from route.
     is_paper: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     net_contracts: Mapped[Decimal] = mapped_column(QtyType, default=Decimal(0))
     avg_price: Mapped[Decimal] = mapped_column(PriceType, default=Decimal(0))
     realized_pnl_cents: Mapped[Decimal] = mapped_column(
-        PnlCentsType, default=Decimal(0)
+        CentsType, default=Decimal(0)
     )
-    fees_paid_cents: Mapped[int] = mapped_column(BigInteger, default=0)
+    fees_paid_cents: Mapped[Decimal] = mapped_column(CentsType, default=Decimal(0))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
@@ -453,18 +467,21 @@ class Position(Base):
 
 class PnlDaily(Base):
     __tablename__ = "pnl_daily"
-    __table_args__ = (UniqueConstraint("day", "is_paper", name="uq_pnl_day"),)
+    __table_args__ = (UniqueConstraint("day", "route", name="uq_pnl_day"),)
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     day: Mapped[date] = mapped_column(Date, nullable=False)
+    #: Same reasoning as Position.route — simulated and real P&L are separate
+    #: books and must never be summed together.
+    route: Mapped[str] = mapped_column(String(16), default="simulated", nullable=False)
     is_paper: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     realized_pnl_cents: Mapped[Decimal] = mapped_column(
-        PnlCentsType, default=Decimal(0)
+        CentsType, default=Decimal(0)
     )
     unrealized_pnl_cents: Mapped[Decimal] = mapped_column(
-        PnlCentsType, default=Decimal(0)
+        CentsType, default=Decimal(0)
     )
-    fees_paid_cents: Mapped[int] = mapped_column(BigInteger, default=0)
+    fees_paid_cents: Mapped[Decimal] = mapped_column(CentsType, default=Decimal(0))
     trades: Mapped[int] = mapped_column(Integer, default=0)
 
 

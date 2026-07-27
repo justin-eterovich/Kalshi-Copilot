@@ -154,7 +154,7 @@ async def reconcile_order(
         known.add(fill_id)
 
         order.filled_contracts = (order.filled_contracts or Decimal(0)) + count
-        await positions.apply_fill(session, fill, is_paper=order.is_paper)
+        await positions.apply_fill(session, fill, route=order.route)
         await proposals.audit(
             session,
             kind="fill.reconciled",

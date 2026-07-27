@@ -58,7 +58,7 @@ forgets.
 ## Verification
 
 ```
-384 backend tests pass          (was 213 before M3; +171)
+385 backend tests pass          (was 213 before M3; +172)
 ruff check app/                 clean
 mypy app/core app/config.py app/settings.py    clean
 mypy app/trading app/worker/maintenance.py     clean  (beyond the strict scope)
@@ -148,13 +148,51 @@ so every entry from one request shares a timestamp and ties broke arbitrarily
 — rendering `fill.recorded` above the `proposal.approved` that caused it. Now
 ordered by `(ts desc, id desc)`.
 
+### Run against the real demo exchange
+
+Credentials were added afterwards and the rail was pointed at Kalshi demo
+(`execution_route: demo_exchange`, balance $100). Real orders were placed and
+filled. **Three more bugs surfaced on the first attempt**, none of which any
+amount of simulated testing would have found.
+
+**Bug 5 — the wire price was zero-padded and rejected.** The very first order
+came back `HTTP 400: invalid price: invalid dollar precision: -6`. Prices were
+serialised at a fixed 6 decimal places on the reasoning that rounding to cents
+might miss a valid sub-cent tick. That was wrong in the other direction: the
+exchange validates the *string's* exponent against the market's price level
+structure, so `"0.250000"` is rejected by a `linear_cent` market even though
+the value is exactly 25c. Padding is not precision. `wire_price` now
+normalises, so 25c goes as `"0.25"` and a genuine 0.1234 keeps four places.
+
+**Bug 6 — a permission error took down the whole API.** The key file was mode
+600 owned by uid 1000; the containers run as uid 10001. `Path.is_file()`
+propagates `PermissionError`, `credentials_present()` did not catch it, and
+`resolve_route` calls it at startup *and* on every `/api/trading/state`
+request — so an unreadable key crash-looped the API, public market data
+included. It now reports "no usable credentials" and logs the real reason at
+ERROR. (Operationally: `secrets/` is 711 and the key 604, since a container
+running as a different uid can only read via the "other" bits and `chown`
+needs root.)
+
+**Bug 7 — simulated and demo fills netted into one position.** `Position` was
+unique on `(ticker, is_paper)`, and both `simulated` and `demo_exchange` are
+paper. A simulated −27 merged with a real +2 into −25 while Kalshi held +2,
+making reconciliation impossible and quietly corrupting the report card M9
+depends on. Positions and daily P&L are now keyed on **route**. Verified: our
+`demo_exchange` book matches Kalshi's position and fees exactly.
+
+**And a wrong assumption, corrected.** Reading the bill back showed Kalshi
+charges *fractional* cents — 2 contracts at 20c cost `$0.022400`, i.e. 2.24
+cents. `Fill.fee_cents` was an integer, so it recorded 2 and lost 0.24c of
+real cost, flattering P&L. Fees are now `Decimal` cents. The *estimate* in
+`core/fees.py` still rounds up (conservative, and what the published formula
+says); whether production rounds up is **unverified** and should be settled
+when the fee schedule PDF is checked.
+
 ### Still not verified
 
-- **No demo order has been placed**, because no Kalshi credentials exist on
-  this machine. The `demo_exchange` and `live_exchange` routes, the V2 order
-  payload, and `reconcile_order` have unit coverage but have never met the
-  real endpoint. **This is the biggest remaining gap** — do it first on the
-  test VM.
+- **The `live_exchange` route has never run.** By design — it needs
+  `KALSHI_ENV=prod` and real money.
 - **No UI screenshots.** Chromium will not launch here (missing system
   libraries, needs root). The React components were mounted in jsdom against
   realistic payloads, which confirmed fractional sizes render as `0.50` not
