@@ -28,9 +28,11 @@ from app.db.base import dispose_engine, get_session_factory
 from app.ingest.catalog import CatalogSync
 from app.ingest.spot import fetch_spot, record_spot
 from app.ingest.streams import StreamProcessor
+from app.ingest.weather import backfill_actuals, sweep_weather, tracked_stations
 from app.kalshi.client import build_rest_client, build_websocket
 from app.kalshi.rest import KalshiRestClient
 from app.settings import get_settings
+from app.weather.client import NwsClient
 
 log = get_logger(__name__)
 
@@ -196,6 +198,66 @@ async def _spot_loop(stop: asyncio.Event) -> None:
             await asyncio.wait_for(stop.wait(), timeout=SPOT_POLL_SEC)
 
 
+async def _weather_loop(stop: asyncio.Event) -> None:
+    """Poll NWS observations and forecasts for every station we trade.
+
+    Runs on the *observation* interval and folds forecasts in on their own,
+    slower schedule: a forecast is reissued a handful of times a day, so
+    fetching it every five minutes would be a dozen wasted requests per
+    station against a free public API for a number that has not changed.
+
+    Every forecast issuance is kept. That history is the calibration dataset,
+    and without it the engine has no measured sigma and refuses to price
+    anything — which is the correct behaviour, and also useless, so the
+    collection has to start long before the detector is switched on.
+    """
+    config = get_config()
+    if not config.weather.enabled:
+        log.info("weather engine disabled (weather.enabled=false)")
+        return
+
+    stations = tracked_stations()
+    if not stations:
+        log.warning(
+            "weather enabled but no station has been asserted; nothing to poll"
+        )
+        return
+
+    sessions = get_session_factory()
+    log.info("weather feed: %d station(s) — %s", len(stations), ", ".join(stations))
+
+    forecast_every = max(
+        1, config.weather.refresh_forecast_sec // config.weather.refresh_observations_sec
+    )
+    tick = 0
+
+    async with NwsClient(user_agent=config.weather.user_agent) as client:
+        while not stop.is_set():
+            want_forecast = tick % forecast_every == 0
+            try:
+                async with sessions() as session:
+                    observed, forecasts = await sweep_weather(
+                        session, client, forecasts=want_forecast
+                    )
+                    filled = await backfill_actuals(session)
+                    await session.commit()
+                if observed or forecasts or filled:
+                    log.info(
+                        "weather: %d observation(s), %d forecast(s), %d actual(s)",
+                        observed,
+                        forecasts,
+                        filled,
+                    )
+            except Exception as exc:  # noqa: BLE001 - never kill the loop
+                log.warning("weather sweep failed: %s", exc)
+
+            tick += 1
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    stop.wait(), timeout=config.weather.refresh_observations_sec
+                )
+
+
 async def run() -> None:
     settings = get_settings()
     configure_logging(settings.log_level, settings.log_format)
@@ -224,6 +286,7 @@ async def run() -> None:
         asyncio.create_task(_catalog_loop(client, stop), name="catalog"),
         asyncio.create_task(_stream_loop(stop), name="stream"),
         asyncio.create_task(_spot_loop(stop), name="spot"),
+        asyncio.create_task(_weather_loop(stop), name="weather"),
     ]
 
     try:

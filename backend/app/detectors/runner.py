@@ -40,6 +40,7 @@ from app.kalshi.rest import KalshiApiError, KalshiRestClient
 from app.settings import get_settings
 from app.trading import risk
 from app.trading.sizing import recommend_size
+from app.weather.stations import SERIES_STATIONS
 
 log = get_logger(__name__)
 
@@ -51,6 +52,7 @@ __all__ = [
     "WhaleFlowDetector",
     "LongshotCalibrationDetector",
     "LeaderboardWatcherDetector",
+    "WeatherDetector",
 ]
 
 #: Set sizes to price, largest first. A bigger set walks deeper into the book
@@ -898,3 +900,270 @@ class LeaderboardWatcherDetector:
             )
             self._warned = True
         return []
+
+
+class WeatherDetector:
+    """Prices NWS-settled temperature markets from a forecast plus measured error.
+
+    Three things have to be true before this will quote a number, and each is
+    a refusal rather than a fallback:
+
+    1. **We have asserted which station the series settles on.** The rules name
+       a city, not a thermometer, and `app/weather/stations.py` is where a human
+       claims which one. An unlisted series is skipped.
+    2. **The market settles from the NWS.** The hourly family settles from The
+       Weather Company, so our data would be a proxy for a different source —
+       priceable in principle, dishonest to quote as if it were the same thing.
+    3. **We have measured how wrong this station's forecasts are** at this lead
+       time, across at least `weather.min_calibration_samples` days. Without
+       that there is no sigma, and a sigma invented here would produce
+       confident prices on a station the system has never verified against.
+
+    The engine therefore says nothing at all for weeks after being switched on,
+    which is correct: it is accumulating the forecast-error history that the
+    prices depend on.
+    """
+
+    name = "weather"
+
+    def enabled(self, config: Config) -> bool:
+        return bool(config.weather.enabled)
+
+    async def scan(self, session: AsyncSession, config: Config) -> list[Finding]:
+        from datetime import UTC, datetime, timedelta
+
+        from app.core.fees import net_edge_cents
+        from app.weather.calibration import debias, lead_bucket, sigma_for
+        from app.weather.distribution import fair_price as weather_fair_price
+        from app.weather.rules import parse_rules
+        from app.weather.stations import station_for_series
+
+        cfg = config.weather
+        min_edge = Decimal(str(cfg.min_net_edge_cents))
+        min_samples = int(cfg.min_calibration_samples)
+        now = datetime.now(UTC)
+
+        markets = (
+            await session.execute(
+                select(Market).where(
+                    Market.status == "active",
+                    Market.series_ticker.in_(list(SERIES_STATIONS)),
+                    Market.close_time.isnot(None),
+                    Market.close_time > now,
+                    Market.close_time <= now + timedelta(days=7),
+                    Market.yes_bid.isnot(None),
+                    Market.yes_ask.isnot(None),
+                )
+            )
+        ).scalars().all()
+        if not markets:
+            return []
+
+        schedule = load_fee_schedule()
+        slippage = Decimal(str(config.costs.slippage_buffer_cents))
+        state = await risk.halt_state(session, config, get_settings())
+        headroom = state.headroom_cents if state else None
+
+        # Forecast-error history per station, computed once per scan.
+        stats_cache: dict[str, Any] = {}
+        findings: list[Finding] = []
+
+        for market in markets:
+            claim = station_for_series(market.series_ticker)
+            if claim is None:
+                continue
+
+            # The rules are the authority on what settles this market; the
+            # station map only says where. A market that turns out to settle
+            # from The Weather Company is skipped even though we have a
+            # station for its city.
+            ref = parse_rules(market.rules_primary)
+            if ref is None or not ref.settles_from_nws:
+                continue
+
+            station = claim.station_id
+            if station not in stats_cache:
+                stats_cache[station] = await self._error_stats(session, station)
+            stats = stats_cache[station]
+            if not stats:
+                continue
+
+            forecast = await self._latest_forecast(session, station, market, now)
+            if forecast is None:
+                continue
+            point_f, lead_hours = forecast
+
+            bucket = lead_bucket(lead_hours)
+            sigma = sigma_for(stats, lead_hours, min_samples=min_samples)
+            if sigma is None:
+                continue
+
+            matching = next(
+                (s for s in stats if s.lead_bucket_hours == bucket), None
+            )
+            adjusted = debias(point_f, matching) if matching else point_f
+
+            fair = weather_fair_price(
+                strike_type=market.strike_type,
+                floor_strike=market.floor_strike,
+                cap_strike=market.cap_strike,
+                forecast=adjusted,
+                sigma=sigma,
+            )
+            if fair is None:
+                continue
+
+            # Buy whichever side the model thinks is cheap.
+            if fair > (market.yes_ask or Decimal(1)):
+                side, price, model = Side.YES, market.yes_ask, fair
+            elif (Decimal(1) - fair) > (Decimal(1) - (market.yes_bid or Decimal(0))):
+                side = Side.NO
+                price = Decimal(1) - (market.yes_bid or Decimal(0))
+                model = Decimal(1) - fair
+            else:
+                continue
+            if price is None or not (Decimal(0) < price < Decimal(1)):
+                continue
+
+            probe = Decimal(str(getattr(cfg, "size_hint", 10)))
+            probe_edge = net_edge_cents(
+                model, price, probe, series_of(market.ticker),
+                slippage_cents=slippage, schedule=schedule,
+            )
+            if probe_edge < min_edge:
+                continue
+
+            cost = model - probe_edge / Decimal(100)
+            recommendation = recommend_size(
+                fair_price=model,
+                cost_per_contract=cost,
+                config=config,
+                available_contracts=(
+                    market.yes_ask_size if side is Side.YES else market.yes_bid_size
+                ),
+                exposure_headroom_cents=headroom,
+            )
+            if not recommendation.is_tradeable:
+                continue
+
+            size = recommendation.contracts
+            edge = net_edge_cents(
+                model, price, size, series_of(market.ticker),
+                slippage_cents=slippage, schedule=schedule,
+            )
+            if edge < min_edge:
+                continue
+
+            findings.append(
+                Finding(
+                    detector=self.name,
+                    ticker=market.ticker,
+                    side=side,
+                    fair_price=model,
+                    net_edge_cents=edge,
+                    # Capped well below certainty. A normal around a point
+                    # forecast has thinner tails than real forecast error, so
+                    # the model is least trustworthy on exactly the cheap
+                    # far-from-forecast buckets that look most attractive.
+                    confidence=min(0.7, 0.35 + float(matching.samples) / 400.0)
+                    if matching
+                    else 0.35,
+                    size_hint=size,
+                    rationale=(
+                        f"{claim.station_id} ({claim.described_as}) forecast "
+                        f"{point_f:.1f}F, debiased {adjusted:.1f}F, sigma "
+                        f"{sigma:.2f}F at {lead_hours:.0f}h lead; model "
+                        f"{model} vs {side.value} at {price}. "
+                        f"{size} contracts, capped by "
+                        f"{recommendation.binding_constraint}."
+                    ),
+                    evidence={
+                        "station_id": claim.station_id,
+                        "station_described_as": claim.described_as,
+                        "station_explicit_in_rules": claim.explicit_in_rules,
+                        "settlement_source": ref.source.value,
+                        "forecast_f": f"{point_f:.2f}",
+                        "debiased_f": f"{adjusted:.2f}",
+                        "sigma_f": f"{sigma:.3f}",
+                        "lead_hours": round(lead_hours, 1),
+                        "calibration_samples": matching.samples if matching else 0,
+                        "bias_f": f"{matching.bias_f:.2f}" if matching else None,
+                        "note": (
+                            "hourly observations are a proxy for the "
+                            "Climatological Report (Daily) that settles this"
+                        ),
+                    },
+                )
+            )
+
+        return findings
+
+    async def _error_stats(self, session: AsyncSession, station: str) -> list[Any]:
+        """Measured forecast error for a station, by lead-time bucket."""
+        from app.db.models import WeatherForecast
+        from app.weather.calibration import ForecastError, calibrate
+
+        rows = (
+            await session.execute(
+                select(
+                    WeatherForecast.lead_hours,
+                    WeatherForecast.temperature_f,
+                    WeatherForecast.actual_f,
+                ).where(
+                    WeatherForecast.station_id == station,
+                    WeatherForecast.actual_f.isnot(None),
+                    WeatherForecast.lead_hours.isnot(None),
+                )
+            )
+        ).all()
+
+        errors = [
+            ForecastError(
+                lead_hours=float(lead),
+                forecast_f=float(fc),
+                actual_f=float(actual),
+            )
+            for lead, fc, actual in rows
+            if lead is not None and fc is not None and actual is not None
+        ]
+        return calibrate(errors, min_samples=1)
+
+    async def _latest_forecast(
+        self,
+        session: AsyncSession,
+        station: str,
+        market: Market,
+        now: Any,
+    ) -> tuple[float, float] | None:
+        """Most recent forecast for the local day this market names.
+
+        The target day comes from the forecast row rather than being parsed
+        out of the ticker: the ticker's date encoding is a convention, and the
+        stored ``target_date`` is what the ingest actually computed from the
+        forecast office's own local offset.
+        """
+        from app.db.models import WeatherForecast
+
+        close = market.close_time
+        if close is None:
+            return None
+
+        row = (
+            await session.execute(
+                select(WeatherForecast)
+                .where(
+                    WeatherForecast.station_id == station,
+                    WeatherForecast.target_date == close.date(),
+                    WeatherForecast.measure == "high",
+                )
+                .order_by(WeatherForecast.issued_at.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        if row is None or row.temperature_f is None:
+            return None
+
+        lead_hours = (close - now).total_seconds() / 3600.0
+        if lead_hours < 0:
+            return None
+        return float(row.temperature_f), lead_hours

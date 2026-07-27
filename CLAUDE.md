@@ -146,6 +146,24 @@ API's own signed `position_fp`.
   until M5 the system booked the cost of every held-to-resolution thesis and
   none of its proceeds. The simulated book settles from the market's own
   `result`; exchange books settle from the endpoint above. Never cross them.
+- **Kalshi temperature markets settle on INTEGER degrees.** "between 96-97°"
+  is the two-outcome set {96, 97}, not the continuous interval — pricing it as
+  continuous understates every bucket by ~2x (measured: 0.2611 vs 0.1324). And
+  "greater than 96" means `T >= 97`, differing by the whole mass at 96. See
+  `app/weather/distribution.py`.
+- **Two weather families, two settlement sources.** Daily high/low settles on
+  the **NWS** Climatological Report (Daily); the hourly family (`KXTEMPNYCH`)
+  settles on **The Weather Company**, for which we have no feed — so NWS data
+  there is a proxy for a different source and those markets are refused.
+- **The NWS spells units three ways.** Observations use
+  `{"unitCode": "wmoUnit:degC"}`; `/forecast` uses a bare number plus
+  `"temperatureUnit": "F"`; the raw gridpoint product uses `uom`. Trust the
+  unit code, refuse an unrecognised one. `?units=si` flips `/forecast` to
+  Celsius, so the client deliberately sends no `units` parameter.
+- **Series tickers are names, not a namespace.** `KXLOW` is Lowe's Companies
+  Inc. and `KXSNOWFLAKE` is Snowflake Inc. A prefix match would route earnings
+  markets to a weather station. `station_for_series` is an exact dict lookup
+  and must stay one.
 - **`category` is NOT an underlying.** "Crypto" contains BTC, ETH, SOL and
   XRP. The stale-quote detector selected on `category == "Crypto"` and priced
   all of them against `BTC-USD`; an ETH contract with a $1,969 strike against
@@ -219,6 +237,13 @@ backend/app/
   btc/
     vol.py           ⭐ driftless lognormal + EWMA vol; refuses, never guesses
     history.py       minute-bucketed spot reader (sampling matters — see docs)
+  weather/
+    rules.py         ⭐ parses settlement rules; NWS vs The Weather Company
+    stations.py      ⭐ series -> station. Every row is a CLAIM, not API data.
+    distribution.py  ⭐ INTEGER-degree buckets; not a continuous interval
+    calibration.py   measured forecast error by lead time; no default sigma
+    nws_parse.py     api.weather.gov payloads; unit code is authoritative
+    client.py        NWS HTTP transport
   detectors/
     set_arbitrage.py ⭐ pure set-arb math; sell side is safe, buy side is not
     stale_quote.py   spot-vs-strike; ⭐ owns the series->underlying map
@@ -290,7 +315,7 @@ a liquidity score of −450 on a 0–100 scale, fractional sizes rendering as
 | M4 detectors wave 1 | done (all three; none has signalled live yet) |
 | M5 risk layer + notifications | done (Web Push deferred — needs TLS) |
 | M6 BTC engine + detectors wave 2 | done (leaderboard has no API; not built) |
-| M7 weather engine | pending |
+| M7 weather engine | done (needs ~30d of history before it prices) |
 | M8 news/catalyst engine | pending |
 | M9 backtester + hardening | pending |
 

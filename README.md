@@ -26,8 +26,8 @@ model-driven fair value.
 | **M4** | Detectors wave 1 (set-arb, resolution sniper, BTC stale-quote) | ✅ done |
 | **M5** | Risk layer, settlements, Kelly sizing, in-tab alerts | ✅ done |
 | **M6** | BTC volatility engine + detectors wave 2 | ✅ done |
-| M7 | Weather engine | **next** |
-| M8 | News + catalyst engine | pending |
+| **M7** | Weather engine (NWS forecast + measured error) | ✅ done |
+| M8 | News + catalyst engine | **next** |
 | M9 | Backtester, report card, hardening | pending |
 
 ---
@@ -352,6 +352,52 @@ underlying and refuses any market whose feed is missing — it does not fall
 back to a default symbol. It did once, and reported a 72¢ edge on an Ethereum
 contract by comparing its $1,969 strike to Bitcoin at $65,154. Only BTC has a
 feed today, so ETH/SOL/XRP markets are seen and refused.
+
+---
+
+## The weather engine
+
+Set `weather.enabled: true` to start polling the NWS. **It will not price
+anything for about a month**, and that is the design rather than a bug — see
+below.
+
+Kalshi's daily-temperature markets settle on the National Weather Service
+Climatological Report (Daily), which reports **whole degrees Fahrenheit**. So
+"between 96-97°" is the two-outcome set **{96, 97}**, not the continuous
+interval, and "greater than 96" means **T >= 97**. Pricing those as continuous
+understates every bucket by roughly half — measured, 0.2611 vs 0.1324 — so the
+model builds a probability mass function over integer degrees and sums the
+integers each bucket actually contains.
+
+Fair value needs three things, and each missing one is a refusal rather than a
+fallback:
+
+1. **A station has been asserted for the series.** The rules usually name a
+   city — "Atlanta", "Boston" — and a city is not a thermometer. The
+   Climatological Report is issued per station, so `app/weather/stations.py`
+   is a table of *claims*, the same status as `exhaustive_series`. 21
+   stations are asserted; an unlisted series is skipped.
+2. **The market settles from the NWS.** The hourly family (`KXTEMPNYCH`)
+   settles from **The Weather Company**, which we have no feed for — so NWS
+   data there is a proxy for a different source, and those markets are refused
+   rather than quoted as if they were the same thing.
+3. **The station's forecast error has been measured** at that lead time, over
+   at least `weather.min_calibration_samples` days. Sigma is the spread about
+   the *measured bias*, bucketed by lead — there is deliberately no global
+   default and no fallback to a neighbouring bucket, because a 48-hour sigma
+   is not an approximation of a 24-hour one.
+
+Collection runs whenever the engine is enabled, independent of the detector,
+since a system that only starts gathering when switched on is useless for
+months afterwards. Every forecast issuance is kept: that history *is* the
+calibration dataset.
+
+Two API details worth knowing before touching this: the NWS spells units
+**three different ways** across its products (observations use
+`wmoUnit:degC`, `/forecast` uses a bare `"F"`, the gridpoint product uses
+`uom`), so the parser trusts the unit code and refuses one it does not
+recognise. And `?units=si` silently flips `/forecast` to Celsius, which is why
+the client sends no `units` parameter at all.
 
 ---
 

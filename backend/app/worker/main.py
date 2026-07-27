@@ -28,6 +28,7 @@ from app.detectors.runner import (
     SetArbitrageDetector,
     StaleQuoteDetector,
     UndervaluedScreenerDetector,
+    WeatherDetector,
     WhaleFlowDetector,
 )
 from app.kalshi.client import build_rest_client
@@ -220,6 +221,7 @@ async def run() -> None:
         WhaleFlowDetector(),
         LongshotCalibrationDetector(),
         LeaderboardWatcherDetector(),
+        WeatherDetector(),
     ]
     log.info("order maintenance ready (authenticated=%s)", client.authenticated)
     log.info(

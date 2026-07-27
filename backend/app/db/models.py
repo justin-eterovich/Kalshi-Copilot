@@ -548,6 +548,74 @@ class Position(Base):
     )
 
 
+class WeatherObservation(Base):
+    """A station reading, in Fahrenheit because that is how these settle.
+
+    Stored in the settlement's own unit rather than the API's. The NWS reports
+    Celsius; converting once on ingest means the conversion is auditable in one
+    place instead of being repeated — and occasionally forgotten — everywhere a
+    temperature is compared to a strike.
+
+    These are hourly observations, which are a **proxy** for the product these
+    markets actually settle on: the Climatological Report (Daily) is a separate
+    once-a-day publication, and a running maximum of hourly readings is not
+    guaranteed to equal the daily high it reports.
+    """
+
+    __tablename__ = "weather_observations"
+    __table_args__ = (
+        UniqueConstraint("station_id", "observed_at", name="uq_weather_obs"),
+        Index("ix_weather_obs_station_ts", "station_id", "observed_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    station_id: Mapped[str] = mapped_column(String(16), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    temperature_f: Mapped[Decimal | None] = mapped_column(Numeric(8, 3))
+    #: The NWS's own QC marker for the reading. Kept rather than filtered on,
+    #: because which values mean "trustworthy" is not something to guess at.
+    quality_control: Mapped[str | None] = mapped_column(String(8))
+    fetched_at: Mapped[datetime] = _ts()
+
+
+class WeatherForecast(Base):
+    """A forecast high/low for one station and one local day.
+
+    ``lead_hours`` is what makes the calibration possible: the same day is
+    forecast repeatedly as it approaches, and a forecast three days out is far
+    less certain than one made this morning. Keeping every issuance rather than
+    overwriting is the entire point — a table that holds only the latest
+    forecast can never measure how wrong forecasts are.
+    """
+
+    __tablename__ = "weather_forecasts"
+    __table_args__ = (
+        UniqueConstraint(
+            "station_id", "target_date", "measure", "issued_at",
+            name="uq_weather_forecast",
+        ),
+        Index("ix_weather_fc_station_date", "station_id", "target_date"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    station_id: Mapped[str] = mapped_column(String(16), nullable=False)
+    #: Local calendar day at the station — the day the market names.
+    target_date: Mapped[date] = mapped_column(Date, nullable=False)
+    #: high | low
+    measure: Mapped[str] = mapped_column(String(8), nullable=False)
+    issued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    temperature_f: Mapped[Decimal] = mapped_column(Numeric(8, 3), nullable=False)
+    lead_hours: Mapped[float | None] = mapped_column(Float)
+    #: Filled in after the day resolves, so (forecast, actual) pairs can be
+    #: read straight out of this table by the calibration.
+    actual_f: Mapped[Decimal | None] = mapped_column(Numeric(8, 3))
+    fetched_at: Mapped[datetime] = _ts()
+
+
 class Settlement(Base):
     """A market that resolved while we held a position in it.
 
