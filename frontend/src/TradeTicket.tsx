@@ -111,7 +111,10 @@ export default function TradeTicket({
       const err = e as ApiError;
       // A market whose fee multiplier is unverified cannot be priced at all,
       // and that is a different thing from a typo in the form.
-      if (err.code === "unverified_fee_category") {
+      if (
+        err.code === "unverified_fee_schedule" ||
+        err.code === "unknown_series"
+      ) {
         setBlocked(err.detail || String(err));
       } else {
         setError(err.detail || String(err));
@@ -266,7 +269,7 @@ export default function TradeTicket({
         <div className="quote-box">
           <Row k="cost">{asDollars(quote.notional_cents)}</Row>
           <Row k="fee">
-            {asDollars(String(quote.est_fee_cents))}
+            {asDollars(quote.est_fee_cents)}
             <span className="muted"> ({quote.is_taker ? "taker" : "maker"})</span>
           </Row>
           <Row k="total">

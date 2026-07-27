@@ -9,10 +9,14 @@ not.  So every modelling choice here is deliberately the unfavourable one:
   fees, always.
 - **We walk the book.** Size beyond the top level fills at worse prices,
   which is where slippage actually comes from.
-- **Each price level is its own fill.** Fees round up to a whole cent per
-  fill, so an order sweeping three levels rounds up three times. Modelling
-  the order as one fill would understate the cost of size in a thin book,
-  which is precisely the kind of market this system hunts in.
+- **Each price level is its own fill**, priced separately, because that is
+  how the exchange charges. Note this is *not* the conservative choice — an
+  earlier version of this comment claimed it was. The fee is
+  ``k*C*P*(1-P)``, concave in ``P``, so by Jensen a single fee computed at
+  the blended VWAP comes out slightly *higher* than the sum of the per-level
+  fees. Per-level is used because it is accurate, not because it is
+  pessimistic; the rounding penalty that used to make it pessimistic was an
+  artifact of rounding to a cent instead of a centicent.
 - **We never fill through the limit.** Levels worse than the limit price are
   left alone and the remainder rests, exactly as a real limit order would.
 - **A stale book fills nothing.** :class:`~app.kalshi.orderbook.BookStaleError`
@@ -31,7 +35,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-from app.core.fees import taker_fee_cents
+from app.core.fees import series_of, taker_fee_cents
 from app.core.money import parse_count, parse_dollars
 from app.db.models import Side
 from app.trading.direction import BUY
@@ -45,7 +49,7 @@ class SimulatedFill:
 
     price: Decimal
     contracts: Decimal
-    fee_cents: int
+    fee_cents: Decimal
 
 
 def levels_for(
@@ -100,7 +104,7 @@ def simulate_fills(
     action: str,
     limit_price: Decimal,
     contracts: Decimal,
-    category: str | None,
+    ticker: str,
     slippage_cents: Decimal = Decimal(0),
 ) -> list[SimulatedFill]:
     """Fill ``contracts`` against ``book``, returning one fill per level.
@@ -150,7 +154,7 @@ def simulate_fills(
                 contracts=take,
                 # Per level, because that is per fill, because that is how
                 # the exchange rounds.
-                fee_cents=taker_fee_cents(effective, take, category),
+                fee_cents=taker_fee_cents(effective, take, series_of(ticker)),
             )
         )
         remaining -= take

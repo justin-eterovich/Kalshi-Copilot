@@ -43,7 +43,6 @@ from app.core.money import format_count, parse_count, parse_dollars
 from app.core.redis import CH_ORDERS, get_redis
 from app.db.models import (
     Fill,
-    Market,
     Order,
     OrderStatus,
     ProposalStatus,
@@ -302,8 +301,6 @@ class Executor:
     ) -> None:
         """Fill against the live book locally. No API call is made."""
         book = await self._current_book(order.ticker)
-        market = await session.get(Market, order.ticker)
-        category = market.category if market else None
 
         if book is None:
             # No book means nothing to fill against. The order rests and the
@@ -319,7 +316,7 @@ class Executor:
             action=order.action,
             limit_price=order.limit_price,
             contracts=order.contracts,
-            category=category,
+            ticker=order.ticker,
             slippage_cents=Decimal(str(self._config.costs.slippage_buffer_cents)),
         )
 

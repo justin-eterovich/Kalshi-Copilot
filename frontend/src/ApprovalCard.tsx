@@ -127,7 +127,7 @@ export default function ApprovalCard({
           <span className="stat-value">
             {proposal.est_fee_cents === null
               ? "—"
-              : asDollars(String(proposal.est_fee_cents))}
+              : asDollars(proposal.est_fee_cents)}
           </span>
         </div>
         <div className="stat">

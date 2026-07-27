@@ -40,7 +40,7 @@ def fill(book: dict, **overrides: object):
         "action": "buy",
         "limit_price": Decimal("0.99"),
         "contracts": Decimal(10),
-        "category": "Sports",
+        "ticker": "KXTEST-26JUL-A",
     }
     kwargs.update(overrides)
     return simulate_fills(**kwargs)  # type: ignore[arg-type]
@@ -116,24 +116,31 @@ class TestFilling:
         fills = fill(book, contracts=Decimal(200))
         assert len(fills) == 2
 
-    def test_per_level_fees_cost_more_than_one_blended_fill(
+    def test_per_level_fees_match_the_engine_level_by_level(
         self, book: dict
     ) -> None:
-        """The reason the previous test matters, asserted in money.
+        """Per-level pricing is what the exchange does, so that is what we do.
 
-        Two fills round up twice. Pricing the same 200 contracts as a single
-        blended fill would understate the cost — in exactly the thin markets
-        this system is built to trade.
+        It is worth being precise about *why*: this is the accurate model, not
+        the conservative one. The fee is concave in price, so a single fee
+        computed at the blended VWAP is slightly **higher** than the sum of
+        the per-level fees — the opposite of what an earlier version of this
+        test claimed. That claim was only true while fees rounded to a whole
+        cent, where the per-fill rounding penalty swamped the concavity.
         """
         fills = fill(book, contracts=Decimal(200))
         per_level = sum(f.fee_cents for f in fills)
-        blended = taker_fee_cents(Decimal("0.456"), Decimal(200), "Sports")
-        assert per_level >= blended
+        assert per_level == (
+            taker_fee_cents(Decimal("0.45"), Decimal(80), "KXTEST")
+            + taker_fee_cents(Decimal("0.46"), Decimal(120), "KXTEST")
+        )
+        blended = taker_fee_cents(Decimal("0.456"), Decimal(200), "KXTEST")
+        assert per_level < blended
 
     def test_fee_per_level_matches_the_fee_engine(self, book: dict) -> None:
         fills = fill(book, contracts=Decimal(10))
         assert fills[0].fee_cents == taker_fee_cents(
-            Decimal("0.45"), Decimal(10), "Sports"
+            Decimal("0.45"), Decimal(10), "KXTEST"
         )
 
     def test_partial_fill_when_the_book_is_too_thin(self, book: dict) -> None:

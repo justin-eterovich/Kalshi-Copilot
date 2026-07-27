@@ -19,8 +19,9 @@ import pytest
 
 from app.config import Config
 from app.core.fees import (
-    UncategorisedMarket,
-    UnverifiedFeeCategory,
+    FeeSchedule,
+    UnverifiedFeeSchedule,
+    series_of,
     taker_fee_cents,
 )
 from app.db.models import Side
@@ -34,9 +35,20 @@ def config() -> Config:
     )
 
 
+VERIFIED = FeeSchedule.from_dict(
+    {
+        "meta": {"verified_on": "2026-07-27"},
+        "formula": {"base_taker_rate": "0.07", "base_maker_rate": "0.0175"},
+        "defaults": {"taker_multiplier": 1, "maker_multiplier": 0},
+        "series": {"KXFREE": {"maker": 0, "taker": 0}},
+    }
+)
+
+
 def quote(config: Config, **overrides: object):
     kwargs: dict = {
-        "ticker": "TEST-MKT",
+        "schedule": VERIFIED,
+        "ticker": "KXTEST-26JUL-A",
         "side": Side.YES,
         "action": "buy",
         "limit_price": "0.50",
@@ -56,8 +68,10 @@ class TestCost:
     def test_fee_matches_the_fee_engine(self, config: Config) -> None:
         """No second implementation. If these ever disagree, one is wrong."""
         q = quote(config)
-        assert q.est_fee_cents == taker_fee_cents("0.50", "100", "Sports")
-        assert q.est_fee_cents == 175
+        assert q.est_fee_cents == taker_fee_cents(
+            "0.50", "100", "KXTEST", VERIFIED
+        )
+        assert q.est_fee_cents == Decimal(175)
 
     def test_total_cost_includes_the_fee(self, config: Config) -> None:
         q = quote(config)
@@ -167,8 +181,8 @@ class TestNetEdge:
         )
         # 5c gross. The fee at 0.55 is 174c over 100 contracts — lower than
         # the 175c at the money, because P*(1-P) peaks at 0.50.
-        assert q.est_fee_cents == 174
-        assert q.net_edge_cents == Decimal("3.26")
+        assert q.est_fee_cents == Decimal("173.25")
+        assert q.net_edge_cents == Decimal("3.2675")
 
     def test_selling_below_fair_is_a_negative_edge(self, config: Config) -> None:
         q = quote(
@@ -179,41 +193,36 @@ class TestNetEdge:
 
 
 class TestFailClosed:
-    def test_unverified_category_refuses_to_price(self, config: Config) -> None:
-        """A market we cannot fee-price cannot be proposed."""
-        with pytest.raises(UnverifiedFeeCategory):
-            quote(config, category="Crypto")
+    def test_an_unverified_schedule_refuses_to_price(self, config: Config) -> None:
+        """Every edge figure is net of fees; an unchecked fee table makes all
+        of them untrustworthy, so nothing may be proposed against one."""
+        never_checked = FeeSchedule.from_dict(
+            {"meta": {"verified_on": None}, "series": {}}
+        )
+        with pytest.raises(UnverifiedFeeSchedule):
+            quote(config, schedule=never_checked)
 
-    def test_a_market_with_no_category_refuses_to_price(
+    def test_a_null_category_no_longer_blocks_pricing(
         self, config: Config
     ) -> None:
-        """Regression: found on a live stack.
+        """Regression, in the opposite direction from before.
 
-        Categories are joined from the parent Event after a long sync. Until
-        that lands, a Crypto market has ``category = None`` and looks exactly
-        like an ordinary one — and the default multiplier priced it happily,
-        returning HTTP 200 for a Bitcoin market while ``crypto`` was still
-        unverified. "Not looked up yet" is not "ordinary".
+        Fees used to be keyed by category, which arrives from the Event sync
+        and is null until it lands — so pricing depended on a join that might
+        not have run. Fees are keyed by series now, which is in the ticker, so
+        a missing category is irrelevant to cost.
         """
-        with pytest.raises(UncategorisedMarket):
-            quote(config, category=None)
+        q = quote(config, category=None)
+        assert q.est_fee_cents == Decimal(175)
 
-    def test_the_uncategorised_error_is_caught_by_existing_handlers(
-        self, config: Config
-    ) -> None:
-        """It subclasses UnverifiedFeeCategory so every fail-closed path —
-        the API's 409, the detector exclusion — catches it unmodified."""
-        with pytest.raises(UnverifiedFeeCategory) as exc:
-            quote(config, category=None)
-        assert exc.value.category == "uncategorised"
+    def test_the_series_comes_from_the_ticker(self, config: Config) -> None:
+        q = quote(config, ticker="KXFEDDECISION-26JUL-H25")
+        assert q.series == "KXFEDDECISION"
+        assert series_of("KXFEDDECISION-26JUL-H25") == "KXFEDDECISION"
 
-    def test_a_recognised_category_still_prices_normally(
-        self, config: Config
-    ) -> None:
-        """The fallback is intact for categories that exist but are not
-        premium-rated; only None is refused."""
-        q = quote(config, category="Politics")
-        assert q.est_fee_cents == taker_fee_cents("0.50", "100", "Politics")
+    def test_a_fee_free_series_costs_nothing(self, config: Config) -> None:
+        q = quote(config, ticker="KXFREE-26JUL-A")
+        assert q.est_fee_cents == 0
 
 
 class TestValidation:
@@ -267,5 +276,6 @@ class TestSerialisation:
             "count": "100",
         }
 
-    def test_fee_stays_an_integer(self, config: Config) -> None:
-        assert isinstance(quote(config).as_dict()["est_fee_cents"], int)
+    def test_fee_serialises_as_a_string(self, config: Config) -> None:
+        """Fees are fractional cents now; an int would round them."""
+        assert quote(config).as_dict()["est_fee_cents"] == "175.0000"

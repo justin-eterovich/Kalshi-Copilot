@@ -45,27 +45,17 @@ entire milestone's schema when it was discovered late; do not reintroduce it.
 |---------|-------------|----------|
 | Price | `"0.5600"` — dollars, up to **6 decimals** | `Decimal` dollars, `Numeric(12,6)` |
 | Count | `"10.00"` — **fractional to 0.01** | `Decimal`, `Numeric(16,2)` |
-| Fee **charged** | `"0.022400"` dollars | `Decimal` cents, `Numeric(20,6)` |
-| Fee **estimate** | — | integer cents, rounded **up** |
+| Fee | `"0.022400"` dollars | `Decimal` cents, `Numeric(20,6)` |
 | Realised P&L | — | `Decimal` cents, `Numeric(20,6)` |
 
-**Nothing here is a whole number of cents, including fees.** That was assumed
-until M3 put a real order on the demo exchange and read the bill back:
+**Nothing here is a whole number of cents, including fees.** The schedule
+rounds fees up to a **centicent** (`$0.0001`), not a cent — "rounds up such
+that the fee + positionCost is rounded to a centicent". One contract at 50c
+costs **1.75c**, not 2c. Confirmed against real demo fills: 2 contracts at
+20c were billed `$0.022400`.
 
-- 2 contracts at 20c were charged `$0.022400` — **2.24 cents**. Not 2, not 3.
-- 3 contracts at 20c were charged `$0.033600` — 3.36 cents.
-
-So the exchange bills `0.07 * C * P * (1-P)` to six decimal places of a
-dollar, with no rounding, at least on demo. `Fill.fee_cents` therefore
-records the exact charge; truncating it to an integer understated cost and
-flattered P&L.
-
-`core/fees.py` still rounds **up** to a whole cent for *estimates*, which is
-the published formula and the conservative direction — it makes an edge look
-worse than it is rather than better. **Whether production rounds up is
-unverified**: the fee schedule PDF says it does, demo demonstrably does not.
-Resolve this when verifying the schedule; if prod rounds up, the estimate is
-already right and only demo differs.
+This was wrong for three milestones and made every fee in the system ~14%
+high on small orders.
 
 - Tick size varies per market (`price_level_structure`), so sub-cent prices
   are real. Never round a quote on ingest.
@@ -128,10 +118,15 @@ API's own signed `position_fp`.
 - **The WebSocket requires auth even for public market-data channels.** REST
   public market data does not. This is why the market page reads through to
   REST: it works with no key at all.
-- **`category` is on the Event, not the Market.** `/markets` has no category
-  field. `fees.py` picks the multiplier *by category*, so ingest joins it
-  across on every sync. Without that join every market silently resolves to
-  the default multiplier and the unverified-category guard never fires.
+- **Fees are keyed by SERIES, not category.** The schedule has no category
+  dimension at all. It lists ~85 "Non-Standard Fees" *series tickers*; every
+  series not listed takes the documented defaults of **taker M=1** and
+  **maker M=0** — meaning most markets charge **no maker fee**. Ten series
+  (including `KXBTCY` and `KXETHY`) are listed at 0/0 and charge nothing.
+  An earlier design keyed this by category and left `crypto: null`, which
+  excluded ~50,000 markets from proposals over a multiplier that does not
+  exist. `category` is still on the Event, not the Market, and is still
+  joined across for display and detectors — it just does not price anything.
 - **Candle `price` OHLC is null when no trades occurred** in that period,
   which is most periods in a thin market. Fall back to the quote midpoint or
   charts render empty.

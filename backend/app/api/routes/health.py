@@ -13,7 +13,12 @@ from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
 
 from app.config import get_config
-from app.core.fees import UnverifiedFeeCategory, load_fee_schedule
+from app.core.fees import (
+    UnknownSeries,
+    UnverifiedFeeSchedule,
+    load_fee_schedule,
+    series_of,
+)
 from app.core.redis import HEARTBEAT_KEY, get_redis
 from app.db.base import get_engine
 from app.settings import get_settings
@@ -57,11 +62,12 @@ async def system() -> dict[str, Any]:
             heartbeats[service] = False
 
     schedule = load_fee_schedule(settings.fee_schedule_path)
-    unverified = [
-        name
-        for name, value in schedule.category_multipliers.items()
-        if value is None
-    ]
+    # Multipliers are keyed by series and the table is complete (defaults plus
+    # listed exceptions), so there is no per-category "unverified" list any
+    # more. What matters is whether the table itself has been checked.
+    fee_free = sorted(
+        name for name, (mk, tk) in schedule.series.items() if mk == 0 and tk == 0
+    )
 
     return {
         "environment": settings.kalshi_env.value,
@@ -77,8 +83,10 @@ async def system() -> dict[str, Any]:
             "verified_on": schedule.verified_on,
             "schedule_revision": schedule.schedule_revision,
             "base_taker_rate": float(schedule.base_taker_rate),
-            "maker_rate_fraction": float(schedule.maker_rate_fraction),
-            "unverified_categories": unverified,
+            "base_maker_rate": float(schedule.base_maker_rate),
+            "series_listed": len(schedule.series),
+            "fee_free_series": fee_free,
+            "default_is_safe": schedule.default_is_safe,
         },
         "endpoints": {"rest": settings.rest_url, "ws": settings.ws_url},
     }
@@ -88,7 +96,7 @@ async def system() -> dict[str, Any]:
 async def fee_quote(
     price_dollars: str,
     contracts: str,
-    category: str = "default",
+    ticker: str | None = None,
     is_taker: bool = True,
 ) -> dict[str, Any]:
     """Fee preview for the UI trade ticket.
@@ -99,6 +107,8 @@ async def fee_quote(
     Args:
         price_dollars: Price as the API quotes it, e.g. ``0.5600``. Not cents.
         contracts: Contract count; fractional values down to 0.01 are valid.
+        ticker: Market or series ticker. Fees are keyed by series; omit it to
+            price at the default multiplier.
     """
     from decimal import Decimal
 
@@ -108,14 +118,18 @@ async def fee_quote(
     fn = taker_fee_cents if is_taker else maker_fee_cents
 
     try:
-        fee = fn(price_dollars, contracts, category, schedule)
-    except UnverifiedFeeCategory as exc:
-        # Fail closed: the market is excluded rather than priced with a guess.
+        series = series_of(ticker)
+        fee = fn(price_dollars, contracts, series, schedule)
+    except (UnverifiedFeeSchedule, UnknownSeries) as exc:
+        # Fail closed: excluded rather than priced with a guess.
         raise HTTPException(
             status_code=409,
             detail={
-                "error": "unverified_fee_category",
-                "category": exc.category,
+                "error": (
+                    "unverified_fee_schedule"
+                    if isinstance(exc, UnverifiedFeeSchedule)
+                    else "unknown_series"
+                ),
                 "message": str(exc),
             },
         ) from exc
@@ -124,12 +138,11 @@ async def fee_quote(
 
     qty = Decimal(contracts)
     return {
-        "fee_cents": fee,
-        "fee_per_contract_cents": (
-            str(round(Decimal(fee) / qty, 4)) if qty > 0 else "0"
-        ),
+        # Decimal cents to centicent precision — the exchange bills fractions.
+        "fee_cents": str(fee),
+        "fee_per_contract_cents": (str(round(fee / qty, 6)) if qty > 0 else "0"),
         "price_dollars": price_dollars,
         "contracts": contracts,
-        "category": category,
+        "series": series,
         "is_taker": is_taker,
     }

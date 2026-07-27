@@ -6,48 +6,129 @@
 # Refresh with:
 #     python scripts/refresh_fee_schedule.py
 #
-# That script downloads the current PDF, extracts the formula + per-category
-# multipliers, and shows you a diff against this file.  Run it from your
-# homelab: kalshi.com sits behind bot protection that blocks datacenter IPs.
+# Run it from your homelab: kalshi.com sits behind bot protection that blocks
+# datacenter IPs.
+#
+# STRUCTURE NOTE.  Kalshi keys multipliers by SERIES TICKER, not by category.
+# There is no category dimension in the schedule at all. An earlier version of
+# this file assumed one, which left ~50,000 Crypto markets excluded from
+# proposals for a multiplier that does not exist.
 # ============================================================================
 
 meta:
-  # Bump when you re-verify against the PDF.
   source_url: https://kalshi.com/docs/kalshi-fee-schedule.pdf
-  # Date the numbers below were last confirmed against the official PDF.
-  # null  => never verified on this machine; unknown categories fail closed.
-  verified_on: null
-  # Fee-schedule revision string printed on the PDF, once known.
-  schedule_revision: null
+  # Date the numbers below were confirmed against the official PDF.
+  # null => never verified on this machine.
+  verified_on: 2026-07-27
+  # The revision string printed on the PDF itself.
+  schedule_revision: "Last updated and effective: July 7, 2026"
 
 formula:
-  # Taker fee for an order of C contracts at price P (dollars, 0 < P < 1):
+  # Taker:  fees = round_up(M * 0.07   * C * P * (1 - P))   M defaults to 1
+  # Maker:  fees = round_up(M * 0.0175 * C * P * (1 - P))   M defaults to 0
   #
-  #     fee = round_up_to_cent( multiplier * base_rate * C * P * (1 - P) )
-  #
-  # Note the rounding applies to the ORDER AGGREGATE, not per contract:
-  #   1 contract  @ $0.50 -> ceil($0.0175) = $0.02
-  #   100 contracts @ $0.50 -> $1.75 exactly
-  # Each fill is charged separately, so partial fills round up independently.
+  # ROUNDING IS TO A CENTICENT ($0.0001), NOT A CENT. The PDF says the fee is
+  # rounded up 'such that the fee + positionCost is rounded to a centicent'.
+  # Confirmed against the live demo exchange: 2 contracts at $0.20 were billed
+  # $0.022400 — 2.24 cents, which cent-rounding would have made $0.03.
   base_taker_rate: 0.07
+  base_maker_rate: 0.0175
+  rounding_increment_dollars: 0.0001
 
-  # Maker (resting, liquidity-adding) fees are a fraction of the taker rate.
-  # Many markets charge no maker fee at all; those are listed in
-  # `maker_free_categories` below.
-  maker_rate_fraction: 0.25
+defaults:
+  # 'default is 1 unless otherwise indicated' — the PDF, on the taker M.
+  taker_multiplier: 1
+  # 'default is 0 unless otherwise indicated' — the PDF, on the maker M.
+  # Maker fees are therefore NOT charged unless the series is listed below.
+  maker_multiplier: 0
 
-# Per-category multiplier applied on top of base_taker_rate.
-#   1.0   => the standard 0.07 rate
-#   null  => UNVERIFIED. fees.py raises UnverifiedFeeCategory and the market is
-#            excluded from proposals, so we can never understate a fee and
-#            overstate an edge.  Run the refresh script to resolve.
-categories:
-  default: 1.0
-
-  # Kalshi's schedule applies a higher multiplier to some premium categories.
-  # These are left deliberately unverified rather than guessed — an invented
-  # multiplier here would silently inflate every edge number in the system.
-  crypto: null
-
-# Categories documented as charging no maker fee.
-maker_free_categories: []
+# Every series the PDF lists under 'Non-Standard Fees'. Anything absent uses
+# the defaults above. Two shapes appear in practice:
+#   maker 1 / taker 1 -> standard taker rate, and maker fees DO apply
+#   maker 0 / taker 0 -> no trading fees at all on that series
+series:
+  KXAAAGASM: {maker: 1, taker: 1}  # US gas price
+  KXATPMATCH: {maker: 1, taker: 1}  # ATP Tennis Match
+  KXBALLONDOR: {maker: 1, taker: 1}  # Ballon d'Or
+  KXBTCMAX150: {maker: 1, taker: 1}  # When will bitcoin hit 150k?
+  KXBTCY: {maker: 0, taker: 0}  # BTC price range EOY
+  KXCITRINI: {maker: 0, taker: 0}  # Will the Citrini scenario materialize?
+  KXCPI: {maker: 1, taker: 1}  # CPI
+  KXCPIYOY: {maker: 1, taker: 1}  # Inflation
+  KXDOED: {maker: 0, taker: 0}  # DOE eliminated
+  KXEGGS: {maker: 1, taker: 1}  # Egg prices
+  KXELECTIRAN: {maker: 0, taker: 0}  # Will Iran hold a presidential election?
+  KXEMMYCACTO: {maker: 1, taker: 1}  # Emmys Award for Lead Comedy Actor
+  KXEMMYCACTR: {maker: 1, taker: 1}  # Emmys Award for Lead Comedy Actress
+  KXEMMYCSERIES: {maker: 1, taker: 1}  # Emmys Award for Comedy Series
+  KXEMMYDACTO: {maker: 1, taker: 1}  # Emmys Award for Lead Drama Actor
+  KXEMMYDACTR: {maker: 1, taker: 1}  # Emmys Award for Lead Drama Actress
+  KXEMMYDSERIES: {maker: 1, taker: 1}  # Emmys Award for Drama Series
+  KXETHY: {maker: 0, taker: 0}  # ETH price EOY
+  KXFED: {maker: 1, taker: 1}  # Fed funds rate
+  KXFEDDECISION: {maker: 1, taker: 1}  # Fed meeting
+  KXGAMBLINGREPEAL: {maker: 0, taker: 0}  # Gambling Repeal
+  KXGDP: {maker: 1, taker: 1}  # US GDP growth
+  KXGREENLAND: {maker: 0, taker: 0}  # Greenland purchase
+  KXHEISMAN: {maker: 1, taker: 1}  # Heisman Trophy Winner
+  KXINXY: {maker: 1, taker: 1}  # S&P 500 yearly range
+  KXIPO: {maker: 1, taker: 1}  # IPOs
+  KXIRANDEMOCRACY: {maker: 0, taker: 0}  # Will Iran become a democracy in 2026?
+  KXLALIGA: {maker: 1, taker: 1}  # LA LIGA
+  KXLAYOFFSYINFO: {maker: 0, taker: 0}  # Tech layoffs
+  KXLLM1: {maker: 1, taker: 1}  # Year-end top LLM
+  KXMARMAD: {maker: 1, taker: 1}  # College Basketball Champion
+  KXMENWORLDCUP: {maker: 1, taker: 1}  # Men's World Cup winner
+  KXMLB: {maker: 1, taker: 1}  # World Series
+  KXMLBAL: {maker: 1, taker: 1}  # MLB American League Championship
+  KXMLBASGAME: {maker: 1, taker: 1}  # Professional Baseball All-Star Game
+  KXMLBGAME: {maker: 1, taker: 1}  # Professional Baseball Game
+  KXMLBNL: {maker: 1, taker: 1}  # MLB National League Championship
+  KXNASDAQ100Y: {maker: 1, taker: 1}  # Nasdaq yearly range
+  KXNBA: {maker: 1, taker: 1}  # Pro Basketball Champion
+  KXNBAEAST: {maker: 1, taker: 1}  # Pro Basketball Eastern Conference Champion
+  KXNBAMVP: {maker: 1, taker: 1}  # Pro Basketball MVP
+  KXNBAROY: {maker: 1, taker: 1}  # Pro Basketball Rookie of the Year
+  KXNBAWEST: {maker: 1, taker: 1}  # Pro Basketball Western Conference Champion
+  KXNCAAF: {maker: 1, taker: 1}  # NCAAF Championship
+  KXNCAAFACC: {maker: 1, taker: 1}  # ACC Champion
+  KXNCAAFB10: {maker: 1, taker: 1}  # Big Ten Champion
+  KXNCAAFB12: {maker: 1, taker: 1}  # Big 12 Champion
+  KXNCAAFGAME: {maker: 1, taker: 1}  # College Football Game
+  KXNCAAFPLAYOFF: {maker: 1, taker: 1}  # College Football Playoff Qualifiers
+  KXNCAAFSEC: {maker: 1, taker: 1}  # SEC Champion
+  KXNFLAFCCHAMP: {maker: 1, taker: 1}  # American Football Conference Champion
+  KXNFLAFCEAST: {maker: 1, taker: 1}  # American Football Conference East Winner
+  KXNFLAFCNORTH: {maker: 1, taker: 1}  # American Football Conference North Winner
+  KXNFLAFCSOUTH: {maker: 1, taker: 1}  # American Football Conference South Winner
+  KXNFLAFCWEST: {maker: 1, taker: 1}  # American Football Conference West Winner
+  KXNFLCOTY: {maker: 1, taker: 1}  # AP Pro Football Coach Of The Year
+  KXNFLCPOTY: {maker: 1, taker: 1}  # AP Pro Football Comeback Player of the Year
+  KXNFLDPOTY: {maker: 1, taker: 1}  # AP Pro Football Defensive Player Of The Year
+  KXNFLDROTY: {maker: 1, taker: 1}  # AP Pro Football Defensive Rookie of the Year
+  KXNFLGAME: {maker: 1, taker: 1}  # Professional Football Game
+  KXNFLMVP: {maker: 1, taker: 1}  # AP Pro Football Regular Season MVP
+  KXNFLNFCCHAMP: {maker: 1, taker: 1}  # National Football Conference Champion
+  KXNFLNFCEAST: {maker: 1, taker: 1}  # National Football Conference East Winner
+  KXNFLNFCNORTH: {maker: 1, taker: 1}  # National Football Conference North Winner
+  KXNFLNFCSOUTH: {maker: 1, taker: 1}  # National Football Conference South Winner
+  KXNFLNFCWEST: {maker: 1, taker: 1}  # National Football Conference West Winner
+  KXNFLOPOTY: {maker: 1, taker: 1}  # AP Pro Football Offensive Player Of The Year
+  KXNFLOROTY: {maker: 1, taker: 1}  # AP Pro Football Offensive Rookie of the Year
+  KXNHL: {maker: 1, taker: 1}  # Stanley Cup
+  KXNHLEAST: {maker: 1, taker: 1}  # Eastern Conference Championship
+  KXNHLWEST: {maker: 1, taker: 1}  # Western Conference Champion
+  KXPAHLAVIHEAD: {maker: 0, taker: 0}  # Will Pahlavi lead Iran?
+  KXPAYROLLS: {maker: 1, taker: 1}  # Jobs numbers
+  KXPGARYDER: {maker: 1, taker: 1}  # Ryder Cup
+  KXPGASOLHEIM: {maker: 1, taker: 1}  # Solheim Cup
+  KXPGATOUR: {maker: 1, taker: 1}  # PGA Tour
+  KXRATECUTCOUNT: {maker: 1, taker: 1}  # Number of rate cuts
+  KXSB: {maker: 1, taker: 1}  # Super Bowl
+  KXSUPERBOWLHEADLINE: {maker: 1, taker: 1}  # Who will headline super bowl LX
+  KXU3: {maker: 1, taker: 1}  # Unemployment
+  KXUCL: {maker: 1, taker: 1}  # UEFA Champions League
+  KXUCLGAME: {maker: 1, taker: 1}  # UEFA Champions League Game
+  KXWCGAME: {maker: 1, taker: 1}  # World Cup Game
+  KXWNBA: {maker: 1, taker: 1}  # WNBA Championship
+  KXWNBAGAME: {maker: 1, taker: 1}  # Women's Pro Basketball Game

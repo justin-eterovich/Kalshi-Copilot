@@ -48,12 +48,9 @@ export default function SystemPanel({
         <div className="banner">
           <strong>Fee schedule unverified.</strong> Run{" "}
           <code>python scripts/refresh_fee_schedule.py</code> to confirm the
-          multipliers against Kalshi's official PDF. Categories with an unknown
-          multiplier
-          {system.fees.unverified_categories.length > 0 && (
-            <> ({system.fees.unverified_categories.join(", ")})</>
-          )}{" "}
-          are excluded from proposals rather than priced with a guess.
+          series multipliers against Kalshi's official PDF. Until then nothing
+          can be proposed — every edge figure is net of fees, so an unchecked
+          fee table makes all of them untrustworthy.
         </div>
       )}
 
@@ -119,7 +116,8 @@ export default function SystemPanel({
           {system && (
             <>
               <Row k="base taker rate">{system.fees.base_taker_rate}</Row>
-              <Row k="maker fraction">{system.fees.maker_rate_fraction}</Row>
+              <Row k="base maker rate">{system.fees.base_maker_rate}</Row>
+              <Row k="series listed">{system.fees.series_listed}</Row>
               <Row k="verified">
                 <Pill
                   ok={!!system.fees.verified_on}
@@ -128,8 +126,13 @@ export default function SystemPanel({
                   {system.fees.verified_on ?? "never"}
                 </Pill>
               </Row>
-              <Row k="unverified cats">
-                {system.fees.unverified_categories.join(", ") || "none"}
+              <Row k="fee-free series">
+                {system.fees.fee_free_series.length || "none"}
+              </Row>
+              <Row k="default safe">
+                <Pill ok={system.fees.default_is_safe} warn={!system.fees.default_is_safe}>
+                  {system.fees.default_is_safe ? "yes" : "NO — unlisted series refused"}
+                </Pill>
               </Row>
             </>
           )}

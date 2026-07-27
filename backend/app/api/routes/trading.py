@@ -36,7 +36,7 @@ from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Config, get_config
-from app.core.fees import UnverifiedFeeCategory
+from app.core.fees import UnknownSeries, UnverifiedFeeSchedule
 from app.core.logging import get_logger
 from app.db.base import session_scope
 from app.db.models import (
@@ -74,13 +74,16 @@ def _executor(request: Request, settings: Settings, config: Config) -> Executor:
     return Executor(_rest(request), settings, config)
 
 
-def _fee_guard(exc: UnverifiedFeeCategory) -> HTTPException:
+def _fee_guard(exc: UnverifiedFeeSchedule | UnknownSeries) -> HTTPException:
     """Fail closed at the API boundary, with the reason the operator needs."""
     return HTTPException(
         status_code=409,
         detail={
-            "error": "unverified_fee_category",
-            "category": exc.category,
+            "error": (
+                "unverified_fee_schedule"
+                if isinstance(exc, UnverifiedFeeSchedule)
+                else "unknown_series"
+            ),
             "message": str(exc),
         },
     )
@@ -210,7 +213,7 @@ async def quote_ticket(
             contracts=ticket.contracts,
             fair_price=ticket.fair_price,
         )
-    except UnverifiedFeeCategory as exc:
+    except (UnverifiedFeeSchedule, UnknownSeries) as exc:
         raise _fee_guard(exc) from exc
     except prop.ProposalError as exc:
         raise HTTPException(
@@ -263,7 +266,7 @@ async def create_proposal(
             ttl_sec=ticket.ttl_sec,
             source="manual",
         )
-    except UnverifiedFeeCategory as exc:
+    except (UnverifiedFeeSchedule, UnknownSeries) as exc:
         raise _fee_guard(exc) from exc
     except prop.ProposalError as exc:
         raise HTTPException(

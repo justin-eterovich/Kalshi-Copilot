@@ -102,8 +102,8 @@ http://<homelab-lan-ip>:8080
 ### 5. Verify the fee schedule
 
 Every edge number in this system is net of fees, so the fee table has to be
-right. The shipped `data/fee_schedule.yaml` encodes the general formula but
-leaves premium-category multipliers **unverified**:
+right. Nothing can be proposed until it has been checked against the official
+PDF:
 
 ```bash
 docker compose run --rm tools python scripts/refresh_fee_schedule.py
@@ -122,18 +122,19 @@ docker compose run --rm tools python scripts/refresh_fee_schedule.py \
     --file data/kalshi-fee-schedule.pdf
 ```
 
-Fill the reported multipliers into `data/fee_schedule.yaml`, then:
+The script prints the formula constants, the rounding rule, and a ready-made
+`series:` block — the whole non-standard fee table. Paste it into
+`data/fee_schedule.yaml`, check the constants above it, then:
 
 ```bash
 docker compose run --rm tools python scripts/refresh_fee_schedule.py --mark-verified
 docker compose restart api worker
 ```
 
-`--mark-verified` refuses while any multiplier is still `null`, so you cannot
-accidentally clear the warning while markets remain unpriceable.
+`--mark-verified` refuses while any rate, default, or series multiplier is
+missing, so you cannot clear the warning while the table is incomplete.
 
-Until then, any category with an unknown multiplier is **excluded from
-proposals** rather than priced with a guess. See "Fees" below.
+Until it is verified, **nothing can be proposed at all**. See "Fees" below.
 
 ---
 
@@ -180,9 +181,14 @@ even when demo credentials exist.
 ### Paper fills are deliberately pessimistic
 
 The simulator crosses the spread, walks the book, and charges a **separate
-taker fee per price level** — because fees round up per fill, and an order
-sweeping three levels rounds up three times. It never fills through your
-limit, and a market with no book fills nothing rather than inventing a price.
+taker fee per price level**, because that is how the exchange bills. It never
+fills through your limit, and a market with no book fills nothing rather than
+inventing a price.
+
+(Per-level pricing is the *accurate* model, not the conservative one: the fee
+is concave in price, so a single fee at the blended VWAP actually comes out
+slightly higher. It only looked conservative while fees rounded to a whole
+cent.)
 
 A simulator that flatters itself produces a report card saying a detector
 works when it does not, and that report card is what decides whether real
@@ -296,35 +302,38 @@ config.yaml          runtime tunables
 sizing layer, and the UI all call into it, so "net edge" means the same thing
 everywhere.
 
-The taker formula:
+The formulas, from the schedule PDF:
 
 ```
-fee = round_up_to_cent( M × 0.07 × C × P × (1 − P) )
+taker = round up(M × 0.07   × C × P × (1 - P))     M defaults to 1
+maker = round up(M × 0.0175 × C × P × (1 - P))     M defaults to 0
 ```
 
 `P` is a price in **dollars** and `C` may be **fractional**, because that is
 what the API actually speaks — see "Units" below.
 
-Two details the implementation gets right and most don't:
+Four details the implementation gets right and most don't:
 
-- **Rounding is on the order aggregate, not per contract.** One contract at 50¢
-  costs 2¢; one hundred contracts at 50¢ cost exactly $1.75, not $2.00.
-  Rounding per contract overstates fees by ~14% at the money.
-- **Each fill is charged separately.** An order filling in three pieces rounds
-  up three times, which is a real cost of resting size in a thin book.
+- **Rounding is to a centicent (`$0.0001`), not a cent.** The schedule says
+  the fee rounds up "such that the fee + positionCost is rounded to a
+  centicent". One contract at 50¢ costs **1.75¢**, not 2¢. Rounding to the
+  cent overstates small orders by up to 14%.
+- **Rounding is on the order aggregate, not per contract.** One hundred
+  contracts at 50¢ cost exactly $1.75.
+- **Each fill is charged separately.** An order filling in three pieces is
+  three charges — a real cost of resting size in a thin book.
+- **Maker fees default to zero.** The maker multiplier's documented default
+  is 0, so most markets charge no maker fee at all.
 
-Maker fees are a fraction of the taker rate, and some categories charge none.
+**Multipliers are keyed by SERIES ticker, not category.** The schedule has no
+category dimension. It lists ~85 non-standard series; anything absent takes
+the defaults. Ten series — including `KXBTCY` and `KXETHY` — are listed at
+0/0 and charge no trading fees whatsoever.
 
-**Category comes from the event, not the market.** The `/markets` payload
-carries no category at all; it lives on the parent event. Ingest joins it
-across on every sync, because `fees.py` selects the multiplier *by category* —
-without that join every Crypto market would quietly price at the standard rate
-and the guard below would never fire.
-
-**Unverified categories fail closed.** If `data/fee_schedule.yaml` has a `null`
-multiplier for a category, `fees.py` raises `UnverifiedFeeCategory` and those
-markets are excluded from proposals. An understated fee silently inflates every
-downstream EV number, so the system refuses to guess.
+**An unverified schedule fails closed.** If `data/fee_schedule.yaml` has
+never been checked against the PDF, nothing can be proposed: every edge
+figure is net of fees, so an unchecked fee table makes all of them
+untrustworthy.
 
 ```bash
 cd backend && python -m pytest tests/test_fees.py -v
@@ -374,14 +383,14 @@ easiest way to produce a confident, wrong edge number.
 |---------|-------------|---------------|
 | Price | `FixedPointDollars`, e.g. `"0.5600"`, up to **6 decimals** | `Decimal` dollars, `Numeric(12,6)` |
 | Contract count | `FixedPointCount`, e.g. `"10.00"`, **fractional to 0.01** | `Decimal`, `Numeric(16,2)` |
-| Fee | `"0.0175"` dollars | integer **cents**, which it exactly is |
+| Fee | `"0.022400"` dollars | `Decimal` cents, `Numeric(20,6)` |
 | Realised P&L | — | `Decimal` cents, `Numeric(20,6)` |
 
-Fees are whole cents because the exchange charges whole cents. Realised P&L
-is **not**: it is a price difference times a count, and with sub-cent ticks
-and fractional contracts both can be fractional — closing 0.50 contracts on a
-1c move earns half a cent. Rounding each realisation would accumulate drift
-in the one number the report card is judged on.
+**Neither fees nor P&L are whole cents.** Fees round up to a **centicent**
+(`$0.0001`), so one contract at 50c costs 1.75c. P&L is a price difference
+times a count, and with sub-cent ticks and fractional contracts both can be
+fractional. Rounding either would accumulate drift in the numbers the report
+card is judged on.
 
 Consequences that are easy to miss:
 

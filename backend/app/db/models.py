@@ -342,7 +342,8 @@ class ProposedTrade(Base):
     #: detector signals; optional on a manual ticket.
     fair_price: Mapped[Decimal | None] = mapped_column(PriceType)
     net_edge_cents: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
-    est_fee_cents: Mapped[int | None] = mapped_column(Integer)
+    #: Estimated fee in cents, fractional (fees round to a centicent).
+    est_fee_cents: Mapped[Decimal | None] = mapped_column(CentsType)
     pct_of_bankroll: Mapped[float | None] = mapped_column(Float)
     rationale: Mapped[str | None] = mapped_column(Text)
 

@@ -7,17 +7,23 @@ owns the *composition*: cost, breakeven, worst case, and net edge.
 
 Two things this refuses to do, both deliberately:
 
-- **Guess a fee.** A market whose category has no verified multiplier raises
-  :class:`~app.core.fees.UnverifiedFeeCategory` and never becomes a proposal.
-  An understated fee inflates every downstream number, and the operator would
-  have no way to see it.
+- **Price against an unverified schedule.** If ``fee_schedule.yaml`` has never
+  been checked against the official PDF, :class:`UnverifiedFeeSchedule` is
+  raised and nothing becomes a proposal. Every edge figure is net of fees, so
+  an unchecked fee table makes all of them untrustworthy.
 - **Report a gross edge.** ``net_edge_cents`` is populated only when the
   caller supplies a fair value, and it is always net. There is no gross field
   to accidentally render.
 
+Fees are keyed by **series**, derived from the market ticker. That matters:
+the previous design keyed them by category, which comes from the parent Event
+and is null until a long sync lands — so a market could be priced before its
+fee multiplier was knowable. Series is in the ticker, always.
+
 Units, restated because this is where they meet: prices are Decimal dollars,
-counts are Decimal contracts (fractional to 0.01), fees are integer cents,
-and everything the caller reads back is either a Decimal or a string.
+counts are Decimal contracts (fractional to 0.01), fees are Decimal cents to
+centicent precision, and everything the caller reads back is a Decimal or a
+string.
 """
 
 from __future__ import annotations
@@ -29,9 +35,11 @@ from typing import Any
 from app.config import Config
 from app.core.fees import (
     FeeSchedule,
-    UncategorisedMarket,
+    UnverifiedFeeSchedule,
+    load_fee_schedule,
     maker_fee_cents,
     net_edge_cents,
+    series_of,
     taker_fee_cents,
 )
 from app.core.money import parse_count, parse_dollars
@@ -58,6 +66,9 @@ class TicketQuote:
     category: str | None
     is_taker: bool
 
+    #: Series ticker, which is what the fee schedule is keyed by.
+    series: str | None
+
     #: The same order as the exchange sees it. Carried here so the approval
     #: card can show the operator exactly what will be sent.
     wire_book_side: str
@@ -65,7 +76,7 @@ class TicketQuote:
 
     #: Contracts * price, in cents. Exact — no rounding.
     notional_cents: Decimal
-    est_fee_cents: int
+    est_fee_cents: Decimal
     #: Notional plus fee for a buy. What leaves the account.
     total_cost_cents: Decimal
     #: Price at which this trade breaks even, in cents, fee included. Above
@@ -88,6 +99,7 @@ class TicketQuote:
             "limit_price": str(self.limit_price),
             "contracts": str(self.contracts),
             "category": self.category,
+            "series": self.series,
             "is_taker": self.is_taker,
             "wire": {
                 "book_side": self.wire_book_side,
@@ -95,7 +107,7 @@ class TicketQuote:
                 "count": str(self.contracts),
             },
             "notional_cents": str(self.notional_cents),
-            "est_fee_cents": self.est_fee_cents,
+            "est_fee_cents": str(self.est_fee_cents),
             "total_cost_cents": str(self.total_cost_cents),
             "breakeven_cents": str(self.breakeven_cents),
             "max_loss_cents": str(self.max_loss_cents),
@@ -126,8 +138,8 @@ def price_ticket(
         limit_price: Price on the traded side, in dollars. For "buy NO at
             30c" this is ``0.30``; the YES price sent to the exchange is
             derived, not supplied.
-        category: The market's category, which selects the fee multiplier.
-            Comes from the Event, not the Market — see the catalog sync.
+        category: The market's category. Carried for display and for the
+            detectors; it does *not* select the fee multiplier — series does.
         fair_price: Optional model or operator fair value on the traded side.
             Supplying it is what turns on ``net_edge_cents``.
         is_taker: Defaults to ``costs.assume_taker``. A resting order that
@@ -135,8 +147,11 @@ def price_ticket(
             we intend to execute now would understate cost.
 
     Raises:
-        UnverifiedFeeCategory: The market cannot be priced, so it cannot be
-            proposed.
+        UnverifiedFeeSchedule: The fee table has never been checked against
+            the official PDF, so no cost here can be trusted.
+        UnknownSeries: Only if the schedule gains a multiplier above the
+            default, which would make the "unlisted means standard" assumption
+            unsafe.
         ValueError: A price outside (0, 1) — including a cents-style ``56``,
             which is rejected rather than read as $56.
     """
@@ -144,15 +159,17 @@ def price_ticket(
     if action not in ("buy", "sell"):
         raise ValueError(f"action must be 'buy' or 'sell', got {action!r}")
 
-    # A market with no category cannot be priced. `fees.py` falls back to the
-    # default multiplier for a category it does not recognise, which is right
-    # for a real category that is simply not premium-rated — and wrong here,
-    # because None means "not looked up yet", not "ordinary". Categories are
-    # joined from the parent Event after a long sync, so during bootstrap
-    # every Crypto market is indistinguishable from an ordinary one and would
-    # price at the standard rate while `crypto` is still unverified.
-    if category is None:
-        raise UncategorisedMarket(ticker)
+    # Fees are keyed by series, which is derivable from the market ticker —
+    # unlike the old category lookup, this never depends on the Event sync
+    # having landed. `category` is still carried for display and for the
+    # detectors, but it no longer gates pricing.
+    series = series_of(ticker)
+
+    # Fail closed on an unverified schedule: every edge figure is net of fees,
+    # so numbers computed against an unchecked table are not trustworthy.
+    sched = schedule or load_fee_schedule()
+    if not sched.is_verified:
+        raise UnverifiedFeeSchedule()
 
     price = parse_dollars(limit_price, "limit_price")
     qty = parse_count(contracts, "contracts")
@@ -169,10 +186,10 @@ def price_ticket(
     # Fees round up per fill; this prices the whole order as one fill, which
     # is the optimistic end. The paper simulator prices each level separately
     # because that is what actually happens when an order sweeps a book.
-    fee = fee_fn(price, qty, category, schedule)
+    fee = fee_fn(price, qty, series, sched)
 
     notional_cents = price * qty * HUNDRED
-    fee_per_contract = Decimal(fee) / qty
+    fee_per_contract = fee / qty
 
     if action == BUY:
         # Pay price + fee now; receive $1 per contract if it settles your way.
@@ -183,7 +200,7 @@ def price_ticket(
     else:
         # Selling an existing position: you receive the price and pay the fee.
         # Downside is bounded by what you gave up, not by the premium.
-        total_cost_cents = Decimal(fee) - notional_cents
+        total_cost_cents = fee - notional_cents
         breakeven_cents = price * HUNDRED - fee_per_contract
         max_loss_cents = (ONE - price) * qty * HUNDRED + fee
         max_win_cents = notional_cents - fee
@@ -205,10 +222,10 @@ def price_ticket(
             edge_fair,
             edge_price,
             qty,
-            category,
+            series,
             slippage_cents=Decimal(str(config.costs.slippage_buffer_cents)),
             is_taker=taker,
-            schedule=schedule,
+            schedule=sched,
         )
 
     return TicketQuote(
@@ -218,6 +235,7 @@ def price_ticket(
         limit_price=price,
         contracts=qty,
         category=category,
+        series=series,
         is_taker=taker,
         wire_book_side=book_side(side, action),
         wire_yes_price=to_yes_price(side, price),

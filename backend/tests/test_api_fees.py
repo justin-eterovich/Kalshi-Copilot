@@ -1,12 +1,19 @@
 """Tests for the fee-quote endpoint.
 
-Regression coverage for a real break: when fee inputs migrated from integer
-cents to dollar strings, this endpoint kept passing cents and every call
-500'd. The engine's validation caught it, but only at runtime — nothing
-tested the API layer. Now something does.
+Regression coverage for two real breaks at this boundary:
+
+1. When fee inputs migrated from integer cents to dollar strings, this
+   endpoint kept passing cents and every call 500'd. The engine's validation
+   caught it, but only at runtime — nothing tested the API layer.
+2. When the schedule turned out to be keyed by series rather than category,
+   this endpoint's ``category`` parameter became meaningless.
+
+Money leaves as strings here, because fees are fractional cents.
 """
 
 from __future__ import annotations
+
+from decimal import Decimal
 
 import pytest
 from fastapi import HTTPException
@@ -17,49 +24,55 @@ from app.api.routes.health import fee_quote
 class TestFeeQuote:
     async def test_prices_a_normal_market(self) -> None:
         result = await fee_quote(price_dollars="0.5000", contracts="100")
-        assert result["fee_cents"] == 175
-        # Fixed 4dp so the UI has a predictable string to format.
-        assert result["fee_per_contract_cents"] == "1.7500"
+        assert Decimal(result["fee_cents"]) == Decimal(175)
+        assert Decimal(result["fee_per_contract_cents"]) == Decimal("1.75")
 
-    async def test_single_contract_rounds_up(self) -> None:
+    async def test_single_contract_is_1_75_not_2(self) -> None:
+        """Rounding is to a centicent, so 0.07 * 0.5 * 0.5 stands as-is."""
         result = await fee_quote(price_dollars="0.5000", contracts="1")
-        assert result["fee_cents"] == 2
+        assert Decimal(result["fee_cents"]) == Decimal("1.75")
 
     async def test_accepts_fractional_contracts(self) -> None:
         result = await fee_quote(price_dollars="0.5000", contracts="2.50")
-        assert result["fee_cents"] == 5
+        # $0.04375 is 437.5 centicents -> rounds up to 438 -> 4.38c
+        assert Decimal(result["fee_cents"]) == Decimal("4.38")
 
-    async def test_maker_is_cheaper_than_taker(self) -> None:
-        taker = await fee_quote(price_dollars="0.5000", contracts="1000")
+    async def test_maker_is_free_on_an_unlisted_series(self) -> None:
+        """The documented default maker multiplier is 0."""
         maker = await fee_quote(
             price_dollars="0.5000", contracts="1000", is_taker=False
         )
-        assert maker["fee_cents"] < taker["fee_cents"]
+        assert Decimal(maker["fee_cents"]) == 0
 
-    async def test_unverified_category_returns_409_not_a_number(self) -> None:
-        """Fail closed at the API boundary, not just in the engine."""
-        with pytest.raises(HTTPException) as exc:
-            await fee_quote(
-                price_dollars="0.5000", contracts="100", category="Crypto"
-            )
-        assert exc.value.status_code == 409
-        assert exc.value.detail["error"] == "unverified_fee_category"
-        assert exc.value.detail["category"] == "crypto"
-
-    async def test_category_matching_is_case_insensitive(self) -> None:
-        """The catalog stores 'Crypto'; the schedule keys on 'crypto'."""
-        for spelling in ("Crypto", "crypto", "CRYPTO"):
-            with pytest.raises(HTTPException) as exc:
-                await fee_quote(
-                    price_dollars="0.5000", contracts="100", category=spelling
-                )
-            assert exc.value.status_code == 409
-
-    async def test_known_category_is_priced_normally(self) -> None:
-        result = await fee_quote(
-            price_dollars="0.5000", contracts="100", category="Sports"
+    async def test_maker_is_charged_on_a_listed_series(self) -> None:
+        maker = await fee_quote(
+            price_dollars="0.5000",
+            contracts="1000",
+            ticker="KXCPI-26JUL",
+            is_taker=False,
         )
-        assert result["fee_cents"] == 175
+        taker = await fee_quote(
+            price_dollars="0.5000", contracts="1000", ticker="KXCPI-26JUL"
+        )
+        assert 0 < Decimal(maker["fee_cents"]) < Decimal(taker["fee_cents"])
+
+    async def test_a_fee_free_series_costs_nothing(self) -> None:
+        """KXBTCY is listed at 0/0 in the real schedule."""
+        result = await fee_quote(
+            price_dollars="0.5000", contracts="100", ticker="KXBTCY-26DEC31-B1"
+        )
+        assert Decimal(result["fee_cents"]) == 0
+
+    async def test_the_series_is_derived_from_a_market_ticker(self) -> None:
+        result = await fee_quote(
+            price_dollars="0.5000", contracts="100", ticker="KXFEDDECISION-26JUL-H25"
+        )
+        assert result["series"] == "KXFEDDECISION"
+
+    async def test_omitting_the_ticker_prices_at_the_default(self) -> None:
+        result = await fee_quote(price_dollars="0.5000", contracts="100")
+        assert result["series"] is None
+        assert Decimal(result["fee_cents"]) == Decimal(175)
 
     @pytest.mark.parametrize("bad_price", ["50", "0", "1", "-0.5", "nonsense"])
     async def test_bad_price_returns_400(self, bad_price: str) -> None:
@@ -70,7 +83,7 @@ class TestFeeQuote:
 
     async def test_zero_contracts_is_free(self) -> None:
         result = await fee_quote(price_dollars="0.5000", contracts="0")
-        assert result["fee_cents"] == 0
+        assert Decimal(result["fee_cents"]) == 0
         assert result["fee_per_contract_cents"] == "0"
 
     async def test_echoes_inputs_for_ui_display(self) -> None:
@@ -78,3 +91,8 @@ class TestFeeQuote:
         assert result["price_dollars"] == "0.5600"
         assert result["contracts"] == "100"
         assert result["is_taker"] is True
+
+    async def test_money_leaves_as_a_string(self) -> None:
+        """Fees are fractional cents; a JSON number would invite rounding."""
+        result = await fee_quote(price_dollars="0.5000", contracts="1")
+        assert isinstance(result["fee_cents"], str)

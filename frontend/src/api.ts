@@ -17,8 +17,14 @@ export interface SystemStatus {
     verified_on: string | null;
     schedule_revision: string | null;
     base_taker_rate: number;
-    maker_rate_fraction: number;
-    unverified_categories: string[];
+    base_maker_rate: number;
+    /** Series the schedule lists as non-standard. */
+    series_listed: number;
+    /** Series that charge no trading fees at all. */
+    fee_free_series: string[];
+    /** False if a listed multiplier exceeds the default, making the
+     *  "unlisted means standard" assumption unsafe. */
+    default_is_safe: boolean;
   };
   endpoints: { rest: string; ws: string };
 }
@@ -171,11 +177,14 @@ export interface TicketQuote {
   limit_price: string;
   contracts: string;
   category: string | null;
+  /** Series ticker — what the fee schedule is actually keyed by. */
+  series: string | null;
   is_taker: boolean;
   /** Exactly what will be sent to Kalshi, so it can be shown before approval. */
   wire: { book_side: string; yes_price: string; count: string };
   notional_cents: string;
-  est_fee_cents: number;
+  /** Fractional cents as a decimal string — fees round to a centicent. */
+  est_fee_cents: string;
   total_cost_cents: string;
   breakeven_cents: string;
   max_loss_cents: string;
@@ -196,7 +205,7 @@ export interface Proposal {
   contracts: string;
   fair_price: string | null;
   net_edge_cents: string | null;
-  est_fee_cents: number | null;
+  est_fee_cents: string | null;
   pct_of_bankroll: number | null;
   rationale: string | null;
   status: string;

@@ -61,8 +61,7 @@ async def _market_or_raise(session: AsyncSession, ticker: str) -> Market:
         raise ProposalError(
             "unknown_market",
             f"{ticker} is not in the local catalog. Proposals price against "
-            "stored market data, including the category the fee multiplier "
-            "depends on.",
+            "stored market data.",
         )
     if market.status not in (None, "active", "open", "initialized"):
         raise ProposalError(
@@ -127,8 +126,8 @@ async def create_proposal(
 
     Raises:
         ProposalError: market unknown or untradeable.
-        UnverifiedFeeCategory: the market's fees cannot be trusted, so it is
-            excluded rather than proposed with a guessed cost.
+        UnverifiedFeeSchedule: the fee table has never been checked against
+            the official PDF, so no cost can be trusted.
     """
     _, quote = await quote_for(
         session,
@@ -289,7 +288,10 @@ def proposal_view(proposal: ProposedTrade) -> dict[str, Any]:
         "net_edge_cents": (
             None if proposal.net_edge_cents is None else str(proposal.net_edge_cents)
         ),
-        "est_fee_cents": proposal.est_fee_cents,
+        "est_fee_cents": (
+            None if proposal.est_fee_cents is None
+            else str(proposal.est_fee_cents)
+        ),
         "pct_of_bankroll": proposal.pct_of_bankroll,
         "rationale": proposal.rationale,
         "status": proposal.status.value,
