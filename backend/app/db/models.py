@@ -548,6 +548,68 @@ class Position(Base):
     )
 
 
+class NewsHeadline(Base):
+    """A headline seen in a watched feed.
+
+    Deduplicated on the feed's own identity (``guid``), because feeds
+    re-publish, reorder and revise constantly; without it every poll would
+    re-record the same morning's news and the escalation-rate cap would be
+    computed against a denominator made mostly of duplicates.
+
+    **A headline is not an edge, and nothing about this table implies it is.**
+    By the time an item reaches an RSS feed the market has moved — and on
+    Kalshi's scheduled economic releases the market has *closed* minutes
+    before the number publishes. There is no price, no direction and no
+    sentiment column here on purpose.
+    """
+
+    __tablename__ = "news_headlines"
+    __table_args__ = (
+        UniqueConstraint("guid", name="uq_headline_guid"),
+        Index("ix_headline_published", "published_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    guid: Mapped[str] = mapped_column(String(256), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    link: Mapped[str | None] = mapped_column(Text)
+    summary: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    #: Tickers the cheap pre-filter thought this could be about. Empty is the
+    #: expected outcome for the overwhelming majority of world news.
+    matched_tickers: Mapped[list | None] = mapped_column(JSONB)
+    #: Set once the headline has been through triage, so a restart does not
+    #: re-spend the budget on news it has already read.
+    triaged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    escalated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    seen_at: Mapped[datetime] = _ts()
+
+
+class LlmSpend(Base):
+    """Daily LLM spend, keyed by UTC day to match the daily loss limit.
+
+    Persisted rather than held in memory because the budget must survive a
+    restart: a guard that resets to zero whenever the worker reboots is not a
+    daily budget, it is a per-uptime one, and an unattended crash loop would
+    spend without limit.
+    """
+
+    __tablename__ = "llm_spend"
+    __table_args__ = (UniqueConstraint("day", name="uq_llm_spend_day"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    day: Mapped[date] = mapped_column(Date, nullable=False)
+    spent_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), default=Decimal(0))
+    triaged: Mapped[int] = mapped_column(Integer, default=0)
+    escalated: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class WeatherObservation(Base):
     """A station reading, in Fahrenheit because that is how these settle.
 

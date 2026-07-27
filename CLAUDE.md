@@ -151,6 +151,14 @@ API's own signed `position_fp`.
   continuous understates every bucket by ~2x (measured: 0.2611 vs 0.1324). And
   "greater than 96" means `T >= 97`, differing by the whole mass at 96. See
   `app/weather/distribution.py`.
+- **Scheduled releases CLOSE the market before the data lands.** CPI's market
+  stops trading at 12:25 UTC for a 12:30 print; FOMC at 17:59 for 18:00. There
+  is no trade-the-news window — a catalyst is a *deadline*. Every such release
+  closes 1-5 min before a quarter-hour boundary, which is how
+  `app/news/calendar.py` infers the release time without a timezone database.
+- **BLS and SEC serve an HTML "Access Denied" page with HTTP 200** to
+  unrecognised user agents — a silent failure a status check passes. Identify
+  properly via `news.user_agent`; the feed parser also refuses on root tag.
 - **A daily LOW is assigned by the forecast period's END date; a daily HIGH
   by its START.** An NWS night period runs 18:00 local to 06:00 next morning
   and its minimum falls in the *following* calendar day — "Monday Night" is
@@ -322,7 +330,7 @@ a liquidity score of −450 on a 0–100 scale, fractional sizes rendering as
 | M5 risk layer + notifications | done (Web Push deferred — needs TLS) |
 | M6 BTC engine + detectors wave 2 | done (leaderboard has no API; not built) |
 | M7 weather engine | done (needs ~30d of history before it prices) |
-| M8 news/catalyst engine | pending |
+| M8 news/catalyst engine | done (LLM tier guarded, not built — no key) |
 | M9 backtester + hardening | pending |
 
 Branch: `claude/kalshi-copilot-build-bgyv2d`

@@ -10,6 +10,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import ApprovalCard from "./ApprovalCard";
 import EnginePanel from "./EnginePanel";
+import NewsPanel from "./NewsPanel";
 import RiskPanel from "./RiskPanel";
 import {
   api,
@@ -25,6 +26,7 @@ import {
   type PositionRow,
   type Proposal,
   type EngineState,
+  type NewsState,
   type RiskResponse,
   type SettlementRow,
   type SignalRow,
@@ -50,6 +52,7 @@ export default function Trades() {
   const [risk, setRisk] = useState<RiskResponse | null>(null);
   const [settlements, setSettlements] = useState<SettlementRow[]>([]);
   const [engine, setEngine] = useState<EngineState | null>(null);
+  const [news, setNews] = useState<NewsState | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Null until the first poll lands — an empty set here would be read as "the
@@ -58,7 +61,7 @@ export default function Trades() {
 
   const load = useCallback(async () => {
     try {
-      const [s, p, o, pos, f, a, sig, r, settled, eng] = await Promise.all([
+      const [s, p, o, pos, f, a, sig, r, settled, eng, nws] = await Promise.all([
         api.tradingState(),
         api.proposals(),
         api.orders(),
@@ -69,6 +72,7 @@ export default function Trades() {
         api.risk(),
         api.settlements(),
         api.engine(),
+        api.news(),
       ]);
       setState(s);
       setProposals(p.proposals);
@@ -80,6 +84,7 @@ export default function Trades() {
       setRisk(r);
       setSettlements(settled.settlements);
       setEngine(eng);
+      setNews(nws);
       setError(null);
 
       // A proposal lives about two minutes. If the tab is in the background
@@ -533,6 +538,8 @@ export default function Trades() {
           </div>
         )}
       </section>
+
+      <NewsPanel news={news} />
 
       <EnginePanel engine={engine} />
 

@@ -26,11 +26,13 @@ from app.core.logging import configure_logging, get_logger
 from app.core.redis import beat, close_redis, get_redis
 from app.db.base import dispose_engine, get_session_factory
 from app.ingest.catalog import CatalogSync
+from app.ingest.news import sweep_headlines
 from app.ingest.spot import fetch_spot, record_spot
 from app.ingest.streams import StreamProcessor
 from app.ingest.weather import backfill_actuals, sweep_weather, tracked_stations
 from app.kalshi.client import build_rest_client, build_websocket
 from app.kalshi.rest import KalshiRestClient
+from app.news.client import FeedClient
 from app.settings import get_settings
 from app.weather.client import NwsClient
 
@@ -43,6 +45,9 @@ MAX_FULL_DEPTH_MARKETS = 100
 #: Spot is only useful to a detector while it is fresh, and the
 #: stale-quote detector's default tolerance is seconds.
 SPOT_POLL_SEC = 3
+#: Feeds are other people's free servers, and an item that arrives thirty
+#: seconds sooner is still an item published after the market moved.
+NEWS_POLL_SEC = 300
 
 
 async def _heartbeat_loop(stop: asyncio.Event) -> None:
@@ -258,6 +263,37 @@ async def _weather_loop(stop: asyncio.Event) -> None:
                 )
 
 
+async def _news_loop(stop: asyncio.Event) -> None:
+    """Poll the configured RSS feeds.
+
+    Collection only. Nothing here scores a headline or spends money — the LLM
+    triage is a separate step behind the budget guard, and it is off on this
+    deployment. Storing the text is cheap and useful on its own: it is the
+    record of what was public and when.
+    """
+    config = get_config()
+    if not (config.news.enabled and config.news.headlines.enabled):
+        log.info("news headlines disabled (news.headlines.enabled=false)")
+        return
+    if not config.news.headlines.rss_feeds:
+        log.info("news enabled but no feeds configured; nothing to poll")
+        return
+
+    sessions = get_session_factory()
+    log.info("news feeds: %d configured", len(config.news.headlines.rss_feeds))
+
+    async with FeedClient(user_agent=config.news.user_agent) as client:
+        while not stop.is_set():
+            try:
+                async with sessions() as session:
+                    await sweep_headlines(session, client, config)
+                    await session.commit()
+            except Exception as exc:  # noqa: BLE001 - never kill the loop
+                log.warning("news sweep failed: %s", exc)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=NEWS_POLL_SEC)
+
+
 async def run() -> None:
     settings = get_settings()
     configure_logging(settings.log_level, settings.log_format)
@@ -287,6 +323,7 @@ async def run() -> None:
         asyncio.create_task(_stream_loop(stop), name="stream"),
         asyncio.create_task(_spot_loop(stop), name="spot"),
         asyncio.create_task(_weather_loop(stop), name="weather"),
+        asyncio.create_task(_news_loop(stop), name="news"),
     ]
 
     try:

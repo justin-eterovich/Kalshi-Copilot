@@ -338,6 +338,59 @@ export interface EngineState {
   };
 }
 
+/**
+ * A scheduled catalyst and, more importantly, when its trading window shuts.
+ *
+ * On Kalshi's economic releases the market closes *before* the data lands —
+ * CPI's market stops trading five minutes ahead of the print. So `close_time`
+ * is a deadline, not a resolution, and `expected_release` is inferred from it
+ * rather than published by the API.
+ */
+export interface CatalystRow {
+  ticker: string;
+  series_ticker: string;
+  label: string;
+  title: string | null;
+  /** Tradeable markets sharing this deadline — one FOMC meeting is many. */
+  market_count: number;
+  close_time: string;
+  expected_release: string | null;
+  /** open | closing_soon | closed_pending_settlement | settled */
+  state: string;
+  minutes_to_close: number;
+  /** False once the window has shut. Not an opportunity — a missed one. */
+  actionable: boolean;
+}
+
+/** A headline. Deliberately carries no score, direction or sentiment. */
+export interface HeadlineRow {
+  title: string;
+  source: string;
+  link: string | null;
+  published_at: string;
+  matched_tickers: string[];
+}
+
+/** LLM spend against the two independent caps. */
+export interface NewsBudget {
+  enabled: boolean;
+  has_api_key: boolean;
+  day: string;
+  spent_usd: string;
+  budget_usd: string;
+  triaged: number;
+  escalated: number;
+  escalation_rate: number;
+  escalation_rate_cap: number;
+}
+
+export interface NewsState {
+  catalysts: CatalystRow[];
+  headlines: HeadlineRow[];
+  budget: NewsBudget;
+  feeds_configured: number;
+}
+
 /** A market that resolved while we held a position in it. */
 export interface SettlementRow {
   ticker: string;
@@ -556,6 +609,8 @@ export const api = {
   risk: () => getJson<RiskResponse>("/api/risk"),
 
   engine: () => getJson<EngineState>("/api/engine"),
+
+  news: () => getJson<NewsState>("/api/news"),
 
   settlements: () =>
     getJson<{ settlements: SettlementRow[] }>("/api/settlements?limit=50"),

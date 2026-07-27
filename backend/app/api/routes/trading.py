@@ -26,7 +26,7 @@ times out of three.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
@@ -44,7 +44,9 @@ from app.db.models import (
     CalibrationLog,
     ExternalPrice,
     Fill,
+    LlmSpend,
     Market,
+    NewsHeadline,
     Order,
     OrderStatus,
     PnlDaily,
@@ -56,6 +58,7 @@ from app.db.models import (
 )
 from app.detectors.stale_quote import REFERENCE_PREFIXES
 from app.kalshi.rest import KalshiApiError, KalshiRestClient
+from app.news.calendar import KNOWN_CATALYSTS, catalyst_for
 from app.settings import Settings, get_settings
 from app.trading import proposals as prop
 from app.trading import risk
@@ -661,6 +664,126 @@ async def engine_state(session: SessionDep, config: ConfigDep) -> dict[str, Any]
                 for b, n in buckets
             ],
         },
+    }
+
+
+@router.get("/news")
+async def news_state(
+    session: SessionDep, settings: SettingsDep, config: ConfigDep
+) -> dict[str, Any]:
+    """Scheduled catalysts, recent headlines, and LLM spend.
+
+    The catalyst list is a **deadline board**, not an opportunity feed. On
+    Kalshi's scheduled releases the market closes minutes before the number
+    publishes, so a row that has passed its close is a window the operator has
+    missed — which is worth showing, and is not the same thing as an edge.
+    """
+    now = datetime.now(UTC)
+
+    markets = (
+        await session.execute(
+            select(
+                Market.ticker,
+                Market.series_ticker,
+                Market.title,
+                Market.close_time,
+                Market.status,
+            ).where(
+                Market.series_ticker.in_(list(KNOWN_CATALYSTS)),
+                Market.close_time.isnot(None),
+                Market.close_time >= now - timedelta(hours=12),
+                Market.close_time <= now + timedelta(days=14),
+            )
+        )
+    ).all()
+
+    # Grouped by (series, close) rather than listed per market. One FOMC
+    # meeting is 40 tradeable strikes but *one* deadline, and forty identical
+    # rows is the same failure as an unfoldable signals table: a board nobody
+    # reads. The market count is what the operator actually wants — "FOMC rate
+    # decision, 11 markets, closes in 2d".
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for ticker, series, title, close, status in markets:
+        cat = catalyst_for(
+            series_ticker=series,
+            close_time=close,
+            now=now,
+            settled=status in ("settled", "finalized"),
+        )
+        if cat is None:
+            continue
+
+        key = (cat.series_ticker, cat.close_time.isoformat())
+        row = grouped.get(key)
+        if row is None:
+            grouped[key] = {
+                # A representative market, so the row can still link somewhere.
+                "ticker": ticker,
+                "series_ticker": cat.series_ticker,
+                "label": cat.label,
+                "title": title,
+                "market_count": 1,
+                "close_time": cat.close_time.isoformat(),
+                "expected_release": (
+                    cat.expected_release.isoformat()
+                    if cat.expected_release
+                    else None
+                ),
+                "state": cat.state.value,
+                "minutes_to_close": round(cat.minutes_to_close, 1),
+                "actionable": cat.actionable,
+            }
+        else:
+            row["market_count"] += 1
+
+    catalysts = list(grouped.values())
+    # Soonest deadline first among the ones still tradeable.
+    catalysts.sort(key=lambda c: (not c["actionable"], c["minutes_to_close"]))
+
+    headlines = (
+        await session.execute(
+            select(NewsHeadline)
+            .order_by(desc(NewsHeadline.published_at))
+            .limit(30)
+        )
+    ).scalars().all()
+
+    spend = (
+        await session.execute(
+            select(LlmSpend).where(LlmSpend.day == now.date())
+        )
+    ).scalars().first()
+
+    triaged = spend.triaged if spend else 0
+    escalated = spend.escalated if spend else 0
+    hcfg = config.news.headlines
+
+    return {
+        "catalysts": catalysts[:40],
+        "headlines": [
+            {
+                "title": h.title,
+                "source": h.source,
+                "link": h.link,
+                "published_at": h.published_at.isoformat(),
+                "matched_tickers": h.matched_tickers or [],
+            }
+            for h in headlines
+        ],
+        "budget": {
+            "enabled": bool(config.news.enabled and hcfg.enabled),
+            # Surfaced so "the engine is silent" has a visible cause rather
+            # than looking like a bug.
+            "has_api_key": bool(settings.anthropic_api_key.strip()),
+            "day": now.date().isoformat(),
+            "spent_usd": str(spend.spent_usd if spend else Decimal(0)),
+            "budget_usd": str(hcfg.daily_budget_usd),
+            "triaged": triaged,
+            "escalated": escalated,
+            "escalation_rate": (escalated / triaged) if triaged else 0.0,
+            "escalation_rate_cap": hcfg.escalation_rate_cap,
+        },
+        "feeds_configured": len(hcfg.rss_feeds),
     }
 
 

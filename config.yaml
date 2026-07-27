@@ -305,16 +305,34 @@ weather:
 # ---------------------------------------------------------------------------
 news:
   enabled: false
+  # BLS and SEC serve an HTML "Access Denied" page with HTTP 200 to
+  # unrecognised agents — a failure that looks like an empty feed rather than
+  # an error. Identify properly, with a contact.
+  user_agent: "kalshi-copilot (self-hosted; contact: set-me@example.com)"
   calendar:
     enabled: false
     sources: [bls, bea, fed]
   headlines:
     enabled: false
+    # Ships empty. Each feed is a decision about what this system reads, and
+    # a wide feed is not a better one: relevance matching is precision-first
+    # and an unmatched headline is the expected outcome for almost all world
+    # news, so a general newswire mostly buys noise. Official sources whose
+    # releases actually settle Kalshi markets are the useful ones.
     rss_feeds: []
-    # Two-tier: cheap triage model on everything, strong model on the hits.
-    # Model IDs are resolved at build time against docs.claude.com.
-    triage_model: null
-    scoring_model: null
+    #   - {source: fed, url: "https://www.federalreserve.gov/feeds/press_all.xml"}
+    #   - {source: bls, url: "https://www.bls.gov/feed/bls_latest.rss"}
+
+    # Two-tier: cheap triage on every novel headline, strong model only on the
+    # hits. Haiku is roughly an order of magnitude cheaper than Sonnet, which
+    # is what makes reading everything affordable at all.
+    triage_model: claude-haiku-4-5-20251001
+    scoring_model: claude-sonnet-5
+
+    # Two independent limits that fail differently. The budget caps the money.
+    # The escalation cap catches triage *breaking*: if it starts escalating
+    # everything, that is a regression, and stopping beats spending the day's
+    # budget in ten minutes and calling it working.
     daily_budget_usd: 2.00
     escalation_rate_cap: 0.10    # escalate at most 10% of novel headlines
 

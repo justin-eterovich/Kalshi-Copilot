@@ -133,17 +133,36 @@ class CalendarConfig(_Base):
     sources: list[str] = Field(default_factory=list)
 
 
+class FeedConfig(_Base):
+    """One RSS/Atom feed. ``source`` is the label stored on every headline.
+
+    Provenance is not decoration: "which feed said so" is the first question
+    asked when a headline turns out to be wrong or duplicated, and a headline
+    whose origin is unknown cannot be audited later.
+    """
+
+    source: str = Field(min_length=1, max_length=64)
+    url: str = Field(min_length=1)
+
+
 class HeadlinesConfig(_Base):
     enabled: bool = False
-    rss_feeds: list[str] = Field(default_factory=list)
+    rss_feeds: list[FeedConfig] = Field(default_factory=list)
     triage_model: str | None = None
     scoring_model: str | None = None
+    #: Zero is not "unlimited" — the budget guard refuses everything at zero,
+    #: deliberately, so a blank config cannot spend money.
     daily_budget_usd: float = Field(2.0, ge=0)
     escalation_rate_cap: float = Field(0.10, gt=0, le=1)
 
 
 class NewsConfig(_Base):
     enabled: bool = False
+    #: Sent on every feed request. Not cosmetic: BLS and SEC serve an HTML
+    #: "Access Denied" page **with HTTP 200** to unrecognised agents, so a
+    #: missing or generic UA fails silently rather than loudly. The parser
+    #: catches it on the root tag, but the fix is to identify properly.
+    user_agent: str = "kalshi-copilot (self-hosted)"
     calendar: CalendarConfig = CalendarConfig()
     headlines: HeadlinesConfig = HeadlinesConfig()
 

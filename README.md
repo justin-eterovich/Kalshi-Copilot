@@ -27,8 +27,8 @@ model-driven fair value.
 | **M5** | Risk layer, settlements, Kelly sizing, in-tab alerts | ✅ done |
 | **M6** | BTC volatility engine + detectors wave 2 | ✅ done |
 | **M7** | Weather engine (NWS forecast + measured error) | ✅ done |
-| M8 | News + catalyst engine | **next** |
-| M9 | Backtester, report card, hardening | pending |
+| **M8** | News + catalyst engine | ✅ done |
+| M9 | Backtester, report card, hardening | **next** |
 
 ---
 
