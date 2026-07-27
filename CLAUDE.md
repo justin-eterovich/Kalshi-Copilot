@@ -260,16 +260,16 @@ Branch: `claude/kalshi-copilot-build-bgyv2d`
 
 ### Open items for the operator
 
-- **No detector has ever produced a signal against live data.** All three
-  were run and all three correctly found nothing — the right answer on
-  liquid two-sided books — but it means the signal → proposal → approval
-  path has only been exercised with a hand-built proposal. Watch the first
-  real one closely.
-- **Risk limits are displayed but not enforced.** `max_pct_per_market`,
-  `max_total_exposure_pct` and `daily_loss_limit_pct` do nothing yet; the
-  approval card shows `pct_of_bankroll` and that is the only brake besides
-  your own judgement. This matters more now that detectors can generate
-  proposals. It is M5.
+- **No detector has signalled on a genuine edge yet.** The full path was
+  exercised by dropping `min_net_edge_cents` negative so set-arb would
+  propose regardless — 42 multi-leg proposals from live books, one approved
+  to the demo exchange. That proves the plumbing, not the strategy. A real
+  edge has still never appeared, which on liquid two-sided books is the
+  expected answer.
+- **Two risk limits remain unenforced**: `max_total_exposure_pct` (needs live
+  position aggregation) and `daily_loss_limit_pct` (needs `PnlDaily` wired to
+  a halt). Both are M5. `max_pct_per_market` *is* now enforced, alongside a
+  queue-depth cap and a duplicate guard — see `risk.max_pending_proposals`.
 - **The watchlist goes stale.** Set arbitrage only considers events where
   *every* active leg is in `ingest.watchlist`, so as events settle the
   coverage decays. Regenerate from the top mutually-exclusive events by 24h

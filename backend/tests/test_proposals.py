@@ -196,3 +196,102 @@ class TestBankrollShare:
         )
         # 5175c risked against a 100000c bankroll.
         assert prop._pct_of_bankroll(quote, config) == pytest.approx(0.05175)
+
+
+# ---------------------------------------------------------------------------
+# Risk guards
+# ---------------------------------------------------------------------------
+
+
+def risk_config(**risk: object) -> Config:
+    base = {"bankroll_usd": 1000.0, "max_pending_proposals": 3,
+            "max_pct_per_market": 0.05}
+    base.update(risk)
+    return Config.model_validate({"risk": base})
+
+
+class CountingSession(FakeSession):
+    """FakeSession whose SELECT count() answers are scripted."""
+
+    def __init__(self, counts: list[int]) -> None:
+        super().__init__()
+        self._counts = counts
+
+    async def execute(self, _stmt: Any) -> Any:
+        class R:
+            def __init__(self, value: int) -> None:
+                self._value = value
+
+            def scalar_one(self) -> int:
+                return self._value
+
+        return R(self._counts.pop(0) if self._counts else 0)
+
+
+class TestQueueDepthGuard:
+    """The safety model is a human reading each proposal.
+
+    A detector scanning every 20s produced 20 proposals per scan across 22
+    watched events — a queue nobody reads is rubber-stamped, which removes
+    the only real control in the system.
+    """
+
+    async def test_allows_while_below_the_cap(self) -> None:
+        await prop._guard_queue_depth(CountingSession([2]), risk_config())
+
+    async def test_refuses_at_the_cap(self) -> None:
+        with pytest.raises(prop.ProposalError) as exc:
+            await prop._guard_queue_depth(CountingSession([3]), risk_config())
+        assert exc.value.code == "queue_full"
+
+    async def test_the_message_names_the_knob(self) -> None:
+        with pytest.raises(prop.ProposalError) as exc:
+            await prop._guard_queue_depth(CountingSession([9]), risk_config())
+        assert "max_pending_proposals" in str(exc.value)
+
+
+class TestDuplicateGuard:
+    """A detector re-derives the same opportunity on every scan."""
+
+    async def test_allows_a_new_event(self) -> None:
+        await prop._guard_duplicate(
+            CountingSession([0]), source="set_arbitrage", key="KXEV-26"
+        )
+
+    async def test_refuses_one_already_pending(self) -> None:
+        with pytest.raises(prop.ProposalError) as exc:
+            await prop._guard_duplicate(
+                CountingSession([1]), source="set_arbitrage", key="KXEV-26"
+            )
+        assert exc.value.code == "already_pending"
+
+
+class TestMarketSizeGuard:
+    """`max_pct_per_market` was displayed on the approval card for a whole
+    milestone without being enforced. Tolerable while only a human could
+    create proposals; not once detectors can."""
+
+    def test_allows_a_small_trade(self) -> None:
+        # $10 of a $1000 bankroll is 1%.
+        pct = prop._guard_market_size(Decimal(1000), risk_config(), what="T")
+        assert pct == pytest.approx(0.01)
+
+    def test_refuses_an_oversized_trade(self) -> None:
+        # $100 of a $1000 bankroll is 10%, over the 5% limit.
+        with pytest.raises(prop.ProposalError) as exc:
+            prop._guard_market_size(Decimal(10_000), risk_config(), what="T")
+        assert exc.value.code == "exceeds_market_limit"
+
+    def test_the_message_reports_both_numbers(self) -> None:
+        with pytest.raises(prop.ProposalError) as exc:
+            prop._guard_market_size(Decimal(10_000), risk_config(), what="T")
+        assert "10.00%" in str(exc.value) and "5.00%" in str(exc.value)
+
+    def test_exactly_at_the_limit_is_allowed(self) -> None:
+        prop._guard_market_size(Decimal(5000), risk_config(), what="T")
+
+    def test_an_unknown_worst_case_is_not_silently_allowed_as_large(self) -> None:
+        """None means "not supplied", and returns zero rather than raising —
+        the caller is responsible for supplying it. Asserted so the behaviour
+        is deliberate rather than incidental."""
+        assert prop._guard_market_size(None, risk_config(), what="T") == 0.0

@@ -46,6 +46,11 @@ trading:
 # ---------------------------------------------------------------------------
 risk:
   bankroll_usd: 1000.0
+  # Hard ceiling on proposals awaiting a decision. The safety model is a
+  # human reading each one; a detector scanning every 20s can fill a queue
+  # faster than anyone reads it, and a queue that long is rubber-stamped
+  # rather than reviewed. Approval fatigue is a failure no test catches.
+  max_pending_proposals: 10
   kelly_fraction: 0.25          # quarter-Kelly
   max_pct_per_market: 0.05      # 5% of bankroll in any single market
   max_total_exposure_pct: 0.40  # 40% of bankroll deployed at once

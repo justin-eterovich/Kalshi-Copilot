@@ -134,6 +134,16 @@ async def propose_finding(
         return None
 
     direction = finding.evidence.get("direction", "sell")
+
+    # Worst case for the whole set, so the per-market bankroll guard has a
+    # number to judge. Selling a set collects `gross_sum` per set and pays out
+    # at most $1, so the exposure is what is still owed if it goes against us.
+    contracts = Decimal(str(finding.evidence.get("contracts", 0) or 0))
+    gross = Decimal(str(finding.evidence.get("gross_sum", 0) or 0))
+    fees = Decimal(str(finding.evidence.get("total_fee_cents", 0) or 0))
+    shortfall = (Decimal(1) - gross) if direction == "sell" else gross
+    max_loss_cents = max(Decimal(0), shortfall) * contracts * Decimal(100) + fees
+
     return await create_multi_leg_proposal(
         session,
         config,
@@ -158,6 +168,7 @@ async def propose_finding(
             if "total_fee_cents" in finding.evidence
             else None
         ),
+        max_loss_cents=max_loss_cents,
         rationale=finding.rationale,
         ttl_sec=finding.ttl_sec,
         signal_id=signal.id,

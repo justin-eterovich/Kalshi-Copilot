@@ -30,6 +30,7 @@ from app.kalshi.client import build_rest_client
 from app.settings import get_settings
 from app.trading.executor import Executor
 from app.trading.interlocks import InterlockError, resolve_route
+from app.trading.proposals import ProposalError
 from app.worker import maintenance
 
 log = get_logger(__name__)
@@ -92,6 +93,7 @@ async def _detector_loop(detectors: list[Any], stop: asyncio.Event) -> None:
     while not stop.is_set():
         config = get_config()
         active = [d for d in detectors if d.enabled(config)]
+        refused: dict[str, int] = {}
         if active and not config.risk.kill_switch:
             for detector in active:
                 try:
@@ -100,15 +102,28 @@ async def _detector_loop(detectors: list[Any], stop: asyncio.Event) -> None:
                         for finding in findings:
                             sig = await record(session, finding)
                             # A multi-leg finding becomes one proposal, so the
-                            # legs are approved together or not at all.
-                            await propose_finding(session, config, finding, sig)
+                            # legs are approved together or not at all. The
+                            # risk guards refuse routinely — a full queue or a
+                            # duplicate is expected, not an error — so the
+                            # signal is still recorded either way.
+                            try:
+                                await propose_finding(
+                                    session, config, finding, sig
+                                )
+                            except ProposalError as exc:
+                                refused[exc.code] = refused.get(exc.code, 0) + 1
                         await session.commit()
                     if findings:
                         log.info(
-                            "%s: %d signal(s), best %.2fc/contract",
+                            "%s: %d signal(s), best %.2fc/contract%s",
                             detector.name,
                             len(findings),
                             max(float(f.net_edge_cents) for f in findings),
+                            (
+                                f" ({', '.join(f'{n} {c}' for c, n in refused.items())})"
+                                if refused
+                                else ""
+                            ),
                         )
                 except Exception as exc:  # noqa: BLE001 - never kill the loop
                     log.exception("%s scan failed: %s", detector.name, exc)

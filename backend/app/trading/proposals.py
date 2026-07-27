@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Config
@@ -55,6 +55,86 @@ __all__ = [
 
 #: Statuses that still need a human decision.
 OPEN_STATUSES = (ProposalStatus.PENDING,)
+
+
+async def _guard_queue_depth(session: AsyncSession, config: Config) -> None:
+    """Refuse to add to a queue nobody can read.
+
+    The whole safety model is a human evaluating each proposal. A detector
+    that scans every 20 seconds can produce dozens a minute — observed: 20
+    per scan across 22 watched events — and a queue that long is not reviewed,
+    it is rubber-stamped. Capping it protects the one control that matters.
+    """
+    pending = (
+        await session.execute(
+            select(func.count())
+            .select_from(ProposedTrade)
+            .where(ProposedTrade.status == ProposalStatus.PENDING)
+        )
+    ).scalar_one()
+
+    if pending >= config.risk.max_pending_proposals:
+        raise ProposalError(
+            "queue_full",
+            f"{pending} proposals already await a decision "
+            f"(risk.max_pending_proposals = "
+            f"{config.risk.max_pending_proposals}). Decide on those first — a "
+            f"queue longer than you will actually read is not a safety "
+            f"mechanism.",
+        )
+
+
+async def _guard_duplicate(
+    session: AsyncSession, *, source: str, key: str
+) -> None:
+    """Refuse to re-propose something already awaiting a decision.
+
+    A detector re-derives the same opportunity on every scan. Without this the
+    queue fills with the same handful of events over and over, which is both
+    noise and a way to push a real proposal off the screen.
+    """
+    existing = (
+        await session.execute(
+            select(func.count())
+            .select_from(ProposedTrade)
+            .where(
+                ProposedTrade.status == ProposalStatus.PENDING,
+                ProposedTrade.source == source,
+                (ProposedTrade.event_ticker == key)
+                | (ProposedTrade.ticker == key),
+            )
+        )
+    ).scalar_one()
+
+    if existing:
+        raise ProposalError(
+            "already_pending",
+            f"{source} already has a pending proposal for {key}.",
+        )
+
+
+def _guard_market_size(
+    max_loss_cents: Decimal | None, config: Config, *, what: str
+) -> float:
+    """Refuse a proposal that risks more of the bankroll than allowed.
+
+    Returns the fraction risked. ``max_pct_per_market`` was displayed on the
+    approval card but never enforced; that was tolerable while only a human
+    could create proposals and is not now that detectors can.
+    """
+    bankroll_cents = Decimal(str(config.risk.bankroll_usd)) * Decimal(100)
+    if bankroll_cents <= 0 or max_loss_cents is None:
+        return 0.0
+
+    fraction = float(max_loss_cents / bankroll_cents)
+    if fraction > config.risk.max_pct_per_market:
+        raise ProposalError(
+            "exceeds_market_limit",
+            f"{what} risks {fraction:.2%} of bankroll; "
+            f"risk.max_pct_per_market is "
+            f"{config.risk.max_pct_per_market:.2%}.",
+        )
+    return fraction
 
 
 class ProposalError(RuntimeError):
@@ -150,6 +230,9 @@ async def create_proposal(
         fair_price=fair_price,
     )
 
+    await _guard_queue_depth(session, config)
+    pct = _guard_market_size(quote.max_loss_cents, config, what=ticker)
+
     ttl = ttl_sec if ttl_sec is not None else config.trading.default_proposal_ttl_sec
     now = datetime.now(UTC)
 
@@ -160,7 +243,7 @@ async def create_proposal(
         leg_count=1,
         net_edge_cents=quote.net_edge_cents,
         est_fee_cents=quote.est_fee_cents,
-        pct_of_bankroll=_pct_of_bankroll(quote, config),
+        pct_of_bankroll=pct,
         rationale=rationale,
         status=ProposalStatus.PENDING,
         expires_at=now + timedelta(seconds=ttl),
@@ -366,6 +449,9 @@ async def create_multi_leg_proposal(
     source: str,
     net_edge_cents: Decimal | None = None,
     est_fee_cents: Decimal | None = None,
+    #: Worst case for the whole set, in cents. Required to enforce the
+    #: per-market bankroll limit; without it the guard cannot judge size.
+    max_loss_cents: Decimal | None = None,
     rationale: str | None = None,
     ttl_sec: int | None = None,
     signal_id: int | None = None,
@@ -388,6 +474,10 @@ async def create_multi_leg_proposal(
             "create_proposal for a single-market ticket.",
         )
 
+    await _guard_queue_depth(session, config)
+    await _guard_duplicate(session, source=source, key=event_ticker)
+    pct = _guard_market_size(max_loss_cents, config, what=event_ticker)
+
     now = datetime.now(UTC)
     ttl = ttl_sec if ttl_sec is not None else config.trading.default_proposal_ttl_sec
 
@@ -399,6 +489,7 @@ async def create_multi_leg_proposal(
         leg_count=len(legs),
         net_edge_cents=net_edge_cents,
         est_fee_cents=est_fee_cents,
+        pct_of_bankroll=pct,
         rationale=rationale,
         status=ProposalStatus.PENDING,
         expires_at=now + timedelta(seconds=ttl),

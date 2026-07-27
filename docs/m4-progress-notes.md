@@ -208,12 +208,51 @@ observations rather than recommendations, and a `net_edge_cents` of zero
 renders as `—` rather than `+0.00¢`, because it means the detector declined
 to claim an edge — not that it found one worth nothing.
 
-## Not finished
+## The full path, exercised
 
-- **No detector has ever produced a signal against live data.** All three
-  correctly found nothing, which is the right answer on liquid two-sided
-  books, but it means the signal → proposal → approval path has only been
-  exercised with a hand-built proposal. The first real signal is still ahead.
+The signal → proposal → approval → order chain has now run end to end with a
+**detector-generated** proposal, not a hand-built one. Forcing it took a
+config change and no code: `set_arbitrage.min_net_edge_cents` was set to a
+large negative number on the demo stack so the detector would emit against
+real books regardless of edge.
+
+It produced 40 signals and 42 multi-leg proposals from live order books in
+under a minute; one was approved and both legs went to the demo exchange as a
+single IOC batch. Nothing filled — the prices were deliberately unprofitable
+— and both legs came back `canceled` with the proposal balanced.
+
+That experiment also made the queue-flooding problem concrete, which is what
+the risk guards below exist for. Revert the edge bar afterwards; a detector
+with a negative threshold proposes everything it sees.
+
+## Risk guards
+
+`max_pct_per_market` had been displayed on the approval card for a whole
+milestone without being enforced. That was tolerable while only a human could
+create proposals. It is not once detectors can, so three guards now run at
+proposal creation:
+
+| guard | refuses when |
+|---|---|
+| `queue_full` | pending proposals ≥ `risk.max_pending_proposals` (default 10) |
+| `already_pending` | the same detector already has a live proposal for that event |
+| `exceeds_market_limit` | worst case exceeds `risk.max_pct_per_market` |
+
+The queue cap is the important one, and it is not really a *risk* limit — it
+protects **attention**. The safety model is a human genuinely evaluating each
+proposal; a detector scanning every 20s produced 20 per scan across 22 watched
+events, and a queue that long is rubber-stamped rather than reviewed.
+Approval fatigue is a failure mode no test catches.
+
+Measured live: pending went from 50-and-climbing to a steady 10, one per
+event, with `20 queue_full` refusals logged per scan. Signals are still
+recorded either way — the observation is never lost, only the redundant queue
+entry.
+
+Still unenforced, and still M5: `max_total_exposure_pct` (needs live position
+aggregation) and `daily_loss_limit_pct` (needs `PnlDaily` wired to a halt).
+
+## Not finished
 - **The resolution sniper cannot act at all** until a settlement source
   exists. It is a research feed by construction.
 - **No volatility model**, so stale-quote's margin threshold is a guess with

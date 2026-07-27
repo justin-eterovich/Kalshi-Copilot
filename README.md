@@ -612,6 +612,9 @@ python -m pytest tests/ -v
 | Multi-leg all-or-none | A set arb is one proposal. Execution is *not* atomic — Kalshi has no such primitive — so legs go out in one IOC batch and any imbalance is reported as `PARTIAL`, never hidden. |
 | No write retries | A timed-out order POST may have been accepted, so it raises instead of retrying. Recovery is reconciliation by client order ID. |
 | Kill switch | Halts all proposals and cancels resting orders. |
+| Queue depth cap | `risk.max_pending_proposals` (default 10). Not a risk limit — it protects *attention*. A detector scanning every 20s produced 20 proposals per scan, and a queue nobody reads is rubber-stamped rather than reviewed. |
+| Per-market size limit | `risk.max_pct_per_market` is enforced at proposal creation, not merely displayed. |
+| Duplicate guard | A detector re-derives the same opportunity every scan; one live proposal per event per detector. |
 | Detector flags | Each detector independently enabled; all off by default. |
 | Fee fail-closed | Unknown fee multiplier ⇒ market excluded, never guessed. |
 | Idempotent orders | Client-supplied order IDs; a network retry cannot double-place. |

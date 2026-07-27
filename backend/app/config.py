@@ -40,6 +40,11 @@ class TradingConfig(_Base):
 
 class RiskConfig(_Base):
     bankroll_usd: float = Field(1000.0, gt=0)
+    #: Hard ceiling on proposals awaiting a decision. The safety model rests
+    #: on a human genuinely reading each one; a detector scanning every 20s
+    #: can fill a queue faster than anyone can, and approval fatigue is a
+    #: failure mode no test catches.
+    max_pending_proposals: int = Field(10, ge=1)
     kelly_fraction: float = Field(0.25, gt=0, le=1)
     max_pct_per_market: float = Field(0.05, gt=0, le=1)
     max_total_exposure_pct: float = Field(0.40, gt=0, le=1)
