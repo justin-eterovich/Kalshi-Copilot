@@ -46,6 +46,7 @@ log = get_logger(__name__)
 
 __all__ = [
     "KalshiRestClient",
+    "build_order_body",
     "KalshiApiError",
     "TIF_GTC",
     "TIF_IOC",
@@ -70,6 +71,47 @@ VALID_TIF: Final = frozenset({TIF_GTC, TIF_IOC, TIF_FOK})
 #: they draw on the *write* budget, which on the basic tier holds only about a
 #: second of burst. Named so the cost is visible at the call site.
 ORDER_TOKEN_COST: Final = 10
+
+
+def build_order_body(
+    *,
+    ticker: str,
+    book_side: str,
+    price_dollars: str,
+    count: str,
+    client_order_id: str,
+    time_in_force: str = TIF_GTC,
+    post_only: bool = False,
+    self_trade_prevention: str = "taker_at_cross",
+    expiration_time: int | None = None,
+) -> dict[str, Any]:
+    """Build one V2 order body.
+
+    Single and batch placement both go through here. They did not always:
+    the batch path once assembled its own dict and omitted
+    ``self_trade_prevention_type``, which the API requires, so every multi-leg
+    order was rejected while single orders worked. One builder is the fix.
+    """
+    if book_side not in ("bid", "ask"):
+        raise ValueError(f"book_side must be 'bid' or 'ask', got {book_side!r}")
+    if time_in_force not in VALID_TIF:
+        raise ValueError(
+            f"time_in_force must be one of {sorted(VALID_TIF)}, got {time_in_force!r}"
+        )
+
+    body: dict[str, Any] = {
+        "ticker": ticker,
+        "side": book_side,
+        "price": price_dollars,
+        "count": count,
+        "client_order_id": client_order_id,
+        "time_in_force": time_in_force,
+        "self_trade_prevention_type": self_trade_prevention,
+        "post_only": post_only,
+    }
+    if expiration_time is not None:
+        body["expiration_time"] = expiration_time
+    return body
 
 
 class KalshiApiError(RuntimeError):
@@ -421,31 +463,49 @@ class KalshiRestClient:
         ``average_fill_price`` and ``average_fee_paid`` (both *per contract*).
         """
         self._require_auth("/portfolio/events/orders")
-
-        if book_side not in ("bid", "ask"):
-            raise ValueError(f"book_side must be 'bid' or 'ask', got {book_side!r}")
-        if time_in_force not in VALID_TIF:
-            raise ValueError(
-                f"time_in_force must be one of {sorted(VALID_TIF)}, "
-                f"got {time_in_force!r}"
-            )
-
-        body: dict[str, Any] = {
-            "ticker": ticker,
-            "side": book_side,
-            "price": price_dollars,
-            "count": count,
-            "client_order_id": client_order_id,
-            "time_in_force": time_in_force,
-            "self_trade_prevention_type": self_trade_prevention,
-            "post_only": post_only,
-        }
-        if expiration_time is not None:
-            body["expiration_time"] = expiration_time
-
+        body = build_order_body(
+            ticker=ticker,
+            book_side=book_side,
+            price_dollars=price_dollars,
+            count=count,
+            client_order_id=client_order_id,
+            time_in_force=time_in_force,
+            post_only=post_only,
+            self_trade_prevention=self_trade_prevention,
+            expiration_time=expiration_time,
+        )
         return await self.request(
             "POST", "/portfolio/events/orders", json=body, cost=ORDER_TOKEN_COST
         )
+
+    async def create_orders_batch(
+        self, orders: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Submit several orders in one request.
+
+        **This is not atomic.** The response carries a separate result per
+        order — its own ``order_id``, ``fill_count``, and nullable fields —
+        and nothing in the API promises all-or-nothing. It is a rate-limit
+        convenience, not a transaction.
+
+        It is still the right primitive for a multi-leg trade, because it
+        collapses the window between legs to a single round trip instead of N.
+        That reduces leg risk; it cannot remove it. Callers must check every
+        result and handle an unbalanced outcome.
+
+        Billed 10 tokens *per order*, so the whole batch draws N x 10 from the
+        write budget.
+        """
+        self._require_auth("/portfolio/events/orders/batched")
+        if not orders:
+            return []
+        payload = await self.request(
+            "POST",
+            "/portfolio/events/orders/batched",
+            json={"orders": [build_order_body(**o) for o in orders]},
+            cost=ORDER_TOKEN_COST * len(orders),
+        )
+        return list(payload.get("orders") or [])
 
     async def cancel_order(
         self, order_id: str, *, market_ticker: str | None = None

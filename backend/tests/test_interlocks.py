@@ -12,13 +12,12 @@ The properties worth protecting:
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
 from app.config import Config
-from app.db.models import ProposalStatus, ProposedTrade, Side
+from app.db.models import ProposalStatus, ProposedTrade
 from app.settings import KalshiEnv, Settings
 from app.trading.interlocks import (
     ExecutionRoute,
@@ -73,10 +72,7 @@ def make_config(**overrides: object) -> Config:
 def make_proposal(**overrides: object) -> ProposedTrade:
     proposal = ProposedTrade(
         ticker="TEST-MKT",
-        side=Side.YES,
-        action="buy",
-        limit_price=Decimal("0.50"),
-        contracts=Decimal(10),
+        leg_count=1,
         status=ProposalStatus.PENDING,
         expires_at=datetime.now(UTC) + timedelta(seconds=60),
     )

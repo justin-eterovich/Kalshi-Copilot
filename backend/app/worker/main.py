@@ -19,7 +19,7 @@ from app.config import get_config
 from app.core.logging import configure_logging, get_logger
 from app.core.redis import beat, close_redis, get_redis
 from app.db.base import dispose_engine, get_session_factory
-from app.detectors.base import record
+from app.detectors.base import propose_finding, record
 from app.detectors.runner import SetArbitrageDetector
 from app.kalshi.client import build_rest_client
 from app.settings import get_settings
@@ -95,7 +95,10 @@ async def _detector_loop(
                     async with sessions() as session:
                         findings = await detector.scan(session, config)
                         for finding in findings:
-                            await record(session, finding)
+                            sig = await record(session, finding)
+                            # A multi-leg finding becomes one proposal, so the
+                            # legs are approved together or not at all.
+                            await propose_finding(session, config, finding, sig)
                         await session.commit()
                     if findings:
                         log.info(

@@ -14,7 +14,13 @@ from typing import Any
 import pytest
 
 from app.config import Config
-from app.db.models import AuditLog, ProposalStatus, ProposedTrade, Side
+from app.db.models import (
+    AuditLog,
+    ProposalLeg,
+    ProposalStatus,
+    ProposedTrade,
+    Side,
+)
 from app.trading import proposals as prop
 
 
@@ -62,10 +68,7 @@ def make_proposal(**overrides: object) -> ProposedTrade:
     proposal = ProposedTrade(
         source="manual",
         ticker="TEST-MKT",
-        side=Side.YES,
-        action="buy",
-        limit_price=Decimal("0.50"),
-        contracts=Decimal(10),
+        leg_count=1,
         status=ProposalStatus.PENDING,
         expires_at=datetime.now(UTC) + timedelta(seconds=60),
         created_at=datetime.now(UTC),
@@ -133,16 +136,31 @@ class TestRejection:
 
 class TestProposalView:
     def test_money_serialises_as_strings(self) -> None:
-        view = prop.proposal_view(
-            make_proposal(
-                limit_price=Decimal("0.505"),
-                contracts=Decimal("2.50"),
-                net_edge_cents=Decimal("3.2500"),
-            )
+        leg = ProposalLeg(
+            proposal_id=1, seq=0, ticker="TEST-MKT", side=Side.YES, action="buy",
+            limit_price=Decimal("0.505"), contracts=Decimal("2.50"),
         )
-        assert view["limit_price"] == "0.505"
-        assert view["contracts"] == "2.50"
+        view = prop.proposal_view(
+            make_proposal(net_edge_cents=Decimal("3.2500")), [leg]
+        )
         assert view["net_edge_cents"] == "3.2500"
+        assert view["legs"][0]["limit_price"] == "0.505"
+        assert view["legs"][0]["contracts"] == "2.50"
+
+    def test_a_multi_leg_proposal_lists_every_leg(self) -> None:
+        """The card has to name what it would trade, or approving it is blind."""
+        legs = [
+            ProposalLeg(proposal_id=1, seq=i, ticker=f"KXEV-26-{c}", side=Side.YES,
+                        action="sell", limit_price=Decimal("0.55"),
+                        contracts=Decimal(10))
+            for i, c in enumerate("AB")
+        ]
+        view = prop.proposal_view(
+            make_proposal(leg_count=2, event_ticker="KXEV-26"), legs
+        )
+        assert view["leg_count"] == 2
+        assert view["event_ticker"] == "KXEV-26"
+        assert [leg["ticker"] for leg in view["legs"]] == ["KXEV-26-A", "KXEV-26-B"]
 
     def test_countdown_is_exposed_for_the_ui(self) -> None:
         view = prop.proposal_view(

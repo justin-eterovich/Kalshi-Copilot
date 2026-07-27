@@ -75,6 +75,10 @@ class ProposalStatus(enum.StrEnum):
     REJECTED = "rejected"
     EXPIRED = "expired"
     EXECUTED = "executed"
+    #: Some legs executed and others did not. The exchange has no atomic
+    #: multi-order primitive, so this is a real outcome, not a bug — and it
+    #: needs a human, because the position is unbalanced.
+    PARTIAL = "partial"
     FAILED = "failed"
 
 
@@ -330,6 +334,17 @@ class Signal(Base):
 
 
 class ProposedTrade(Base):
+    """One decision for a human, covering one or more legs.
+
+    A manual ticket has a single leg. A set arbitrage has one per market in
+    the event, and they are approved together or not at all — approving three
+    legs of a five-leg arb leaves an uncovered position, which is the exact
+    opposite of what the arb was.
+
+    The legs are the source of truth for what would be traded; this row holds
+    only the aggregate economics and the decision state.
+    """
+
     __tablename__ = "proposed_trades"
     __table_args__ = (Index("ix_proposals_status_ts", "status", "created_at"),)
 
@@ -340,18 +355,13 @@ class ProposedTrade(Base):
     #: "manual" for quick-ticket proposals, else the detector name.
     source: Mapped[str] = mapped_column(String(64), nullable=False, default="manual")
 
+    #: The event, when the legs span one. Null for a standalone ticket.
+    event_ticker: Mapped[str | None] = mapped_column(String(128), index=True)
+    #: Denormalised from the first leg purely so the queue can be listed and
+    #: indexed without a join. Never write to it directly — legs decide.
     ticker: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
-    side: Mapped[Side] = mapped_column(Enum(Side, name="side"), nullable=False)
-    action: Mapped[str] = mapped_column(String(8), nullable=False, default="buy")
-    #: Price on the traded side, in dollars — what you pay per contract on a
-    #: buy. "Buy NO at 30c" stores 0.30 here; the YES price the exchange
-    #: wants is derived at the wire boundary. See app.trading.direction.
-    limit_price: Mapped[Decimal] = mapped_column(PriceType, nullable=False)
-    contracts: Mapped[Decimal] = mapped_column(QtyType, nullable=False)
+    leg_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
-    #: Fair value on the traded side, when the source had one. Present for
-    #: detector signals; optional on a manual ticket.
-    fair_price: Mapped[Decimal | None] = mapped_column(PriceType)
     net_edge_cents: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
     #: Estimated fee in cents, fractional (fees round to a centicent).
     est_fee_cents: Mapped[Decimal | None] = mapped_column(CentsType)
@@ -369,12 +379,53 @@ class ProposedTrade(Base):
     created_at: Mapped[datetime] = _ts()
 
 
+class ProposalLeg(Base):
+    """One market's worth of a proposal.
+
+    Every proposal has at least one. Multi-leg proposals are approved as a
+    unit, but **the exchange has no atomic multi-order primitive** — the batch
+    endpoint returns a separate result per order and promises nothing about
+    all-or-nothing. Legs are therefore submitted together and immediately,
+    with IOC time-in-force so nothing rests half-done, and any imbalance is
+    surfaced rather than hidden. Leg risk is reduced, not eliminated.
+    """
+
+    __tablename__ = "proposal_legs"
+    __table_args__ = (
+        UniqueConstraint("proposal_id", "seq", name="uq_leg_seq"),
+        Index("ix_leg_ticker", "ticker"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    proposal_id: Mapped[int] = mapped_column(
+        ForeignKey("proposed_trades.id", ondelete="CASCADE"), nullable=False
+    )
+    #: Submission order, stable so the audit trail reads the same way twice.
+    seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    ticker: Mapped[str] = mapped_column(String(128), nullable=False)
+    side: Mapped[Side] = mapped_column(Enum(Side, name="side"), nullable=False)
+    action: Mapped[str] = mapped_column(String(8), nullable=False, default="buy")
+    #: Price on the traded side, in dollars — what you pay per contract on a
+    #: buy. "Buy NO at 30c" stores 0.30 here; the YES price the exchange
+    #: wants is derived at the wire boundary. See app.trading.direction.
+    limit_price: Mapped[Decimal] = mapped_column(PriceType, nullable=False)
+    contracts: Mapped[Decimal] = mapped_column(QtyType, nullable=False)
+    #: Fair value on the traded side, when the source had one.
+    fair_price: Mapped[Decimal | None] = mapped_column(PriceType)
+    est_fee_cents: Mapped[Decimal | None] = mapped_column(CentsType)
+
+
 class Order(Base):
     __tablename__ = "orders"
 
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     proposal_id: Mapped[int | None] = mapped_column(
         ForeignKey("proposed_trades.id", ondelete="SET NULL")
+    )
+    #: Which leg of that proposal this order is. Null for pre-M4 rows.
+    leg_id: Mapped[int | None] = mapped_column(
+        ForeignKey("proposal_legs.id", ondelete="SET NULL")
     )
     #: Client-supplied UUID: makes retries idempotent so a network blip can
     #: never double-place an order.

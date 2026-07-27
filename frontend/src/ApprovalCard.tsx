@@ -59,8 +59,14 @@ export default function ApprovalCard({
   const pending = proposal.status === "pending" && !expired;
 
   const needsPhrase = state?.requires_typed_confirmation ?? false;
+  // A multi-leg proposal is one decision about an event; no single market
+  // names it, so that is what has to be typed.
+  const confirmTarget =
+    proposal.leg_count > 1 && proposal.event_ticker
+      ? proposal.event_ticker
+      : proposal.ticker;
   const phraseOk =
-    !needsPhrase || phrase.trim().toUpperCase() === proposal.ticker.toUpperCase();
+    !needsPhrase || phrase.trim().toUpperCase() === confirmTarget.toUpperCase();
 
   const decide = async (approve: boolean) => {
     setBusy(true);
@@ -95,13 +101,25 @@ export default function ApprovalCard({
             to={`/market/${encodeURIComponent(proposal.ticker)}`}
             className="mono approval-ticker"
           >
-            {proposal.ticker}
+            {proposal.leg_count > 1 && proposal.event_ticker
+              ? proposal.event_ticker
+              : proposal.ticker}
           </Link>
           <div className="approval-sub">
             <span className="chip">{proposal.source}</span>
-            <span className={proposal.action === "buy" ? "chip up" : "chip down"}>
-              {proposal.action} {proposal.side.toUpperCase()}
-            </span>
+            {proposal.leg_count > 1 ? (
+              <span className="chip warn">{proposal.leg_count} legs · all or none</span>
+            ) : (
+              proposal.legs[0] && (
+                <span
+                  className={
+                    proposal.legs[0].action === "buy" ? "chip up" : "chip down"
+                  }
+                >
+                  {proposal.legs[0].action} {proposal.legs[0].side.toUpperCase()}
+                </span>
+              )
+            )}
             <span className="chip">{proposal.status}</span>
           </div>
         </div>
@@ -115,12 +133,18 @@ export default function ApprovalCard({
 
       <div className="approval-grid">
         <div className="stat">
-          <span className="stat-label">price</span>
-          <span className="stat-value">{centsNum(proposal.limit_price, 2)}¢</span>
+          <span className="stat-label">
+            {proposal.leg_count > 1 ? "legs" : "price"}
+          </span>
+          <span className="stat-value">
+            {proposal.leg_count > 1
+              ? proposal.leg_count
+              : `${centsNum(proposal.legs[0]?.limit_price ?? null, 2)}¢`}
+          </span>
         </div>
         <div className="stat">
           <span className="stat-label">size</span>
-          <span className="stat-value">{proposal.contracts}</span>
+          <span className="stat-value">{proposal.legs[0]?.contracts ?? "—"}</span>
         </div>
         <div className="stat">
           <span className="stat-label">fee</span>
@@ -156,6 +180,28 @@ export default function ApprovalCard({
         </div>
       </div>
 
+      {proposal.leg_count > 1 && (
+        <div className="legs">
+          <div className="legs-head">
+            every leg is placed together, or the set is not a hedge
+          </div>
+          <table className="table">
+            <tbody>
+              {proposal.legs.map((leg) => (
+                <tr key={leg.seq}>
+                  <td className="mono">{leg.ticker}</td>
+                  <td className={leg.action === "buy" ? "up" : "down"}>
+                    {leg.action} {leg.side}
+                  </td>
+                  <td className="num">{centsNum(leg.limit_price, 2)}¢</td>
+                  <td className="num">{leg.contracts}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       {proposal.rationale && <p className="approval-why">{proposal.rationale}</p>}
 
       {error && <p className="error">{error}</p>}
@@ -189,6 +235,17 @@ export default function ApprovalCard({
                   ? "simulated"
                   : "demo-exchange"}</strong>{" "}
                 order — no real money. Confirm to proceed.
+                {proposal.leg_count > 1 && (
+                  <>
+                    {" "}
+                    <strong>
+                      {proposal.leg_count} legs go out together with IOC, but the
+                      exchange has no atomic multi-order primitive
+                    </strong>{" "}
+                    — if some fill and others do not, you are left with a
+                    directional position and the card will say so.
+                  </>
+                )}
               </>
             )}
           </p>
@@ -198,7 +255,7 @@ export default function ApprovalCard({
               className="input"
               value={phrase}
               autoFocus
-              placeholder={proposal.ticker}
+              placeholder={confirmTarget}
               onChange={(e) => setPhrase(e.target.value)}
             />
           )}

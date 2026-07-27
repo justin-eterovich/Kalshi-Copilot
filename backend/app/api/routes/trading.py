@@ -281,7 +281,12 @@ async def create_proposal(
     # Commit before responding: the caller reloads the queue as soon as this
     # returns, and the dependency's commit runs after the response is sent.
     await session.commit()
-    return {"proposal": prop.proposal_view(proposal), "quote": quote.as_dict()}
+    return {
+        "proposal": prop.proposal_view(
+            proposal, await prop.legs_of(session, proposal.id)
+        ),
+        "quote": quote.as_dict(),
+    }
 
 
 @router.get("/proposals")
@@ -310,7 +315,10 @@ async def list_proposals(
     # expire_stale above mutated rows; land it now rather than at teardown.
     await session.commit()
 
-    views = [prop.proposal_view(p) for p in rows]
+    views = [
+        prop.proposal_view(p, await prop.legs_of(session, p.id))
+        for p in rows
+    ]
     views.sort(key=lambda v: (v["status"] != "pending", v["created_at"] or ""))
     return {"proposals": views}
 
@@ -346,23 +354,41 @@ async def approve_proposal(
     except InterlockError as exc:
         raise _interlock_error(exc) from exc
     except ExecutionError as exc:
-        # The order row and audit trail already record the failure; surface
-        # it rather than pretending the approval did not happen.
+        # Commit the failure before surfacing it. The executor deliberately
+        # writes the Order rows *before* placing, so that an ambiguous
+        # failure — a timeout that may still have reached the matching
+        # engine — leaves a client order ID to reconcile against. The
+        # session dependency rolls back on exception, which would erase
+        # precisely that record and defeat the whole design. Observed live:
+        # a rejected batch left zero order rows and a proposal still marked
+        # pending, as if nothing had been attempted.
+        await session.commit()
         raise HTTPException(
             502, detail={"error": exc.code, "message": str(exc)}
         ) from exc
 
     fills = (
-        await session.execute(select(Fill).where(Fill.order_id == order.id))
+        await session.execute(
+            select(Fill).join(Order, Order.id == Fill.order_id).where(
+                Order.proposal_id == proposal.id
+            )
+        )
     ).scalars().all()
 
     # The order, its fills and the position all have to be durable before the
     # operator is told the trade went through.
     await session.commit()
 
+    orders = (
+        await session.execute(select(Order).where(Order.proposal_id == proposal.id))
+    ).scalars().all()
+
     return {
-        "proposal": prop.proposal_view(proposal),
+        "proposal": prop.proposal_view(
+            proposal, await prop.legs_of(session, proposal.id)
+        ),
         "order": order_view(order),
+        "orders": [order_view(o) for o in orders],
         "fills": [fill_view(f) for f in fills],
     }
 
@@ -383,7 +409,11 @@ async def reject_proposal(
         ) from exc
 
     await session.commit()
-    return {"proposal": prop.proposal_view(proposal)}
+    return {
+        "proposal": prop.proposal_view(
+            proposal, await prop.legs_of(session, proposal.id)
+        )
+    }
 
 
 # ---------------------------------------------------------------------------

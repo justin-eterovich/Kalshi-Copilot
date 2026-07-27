@@ -903,3 +903,29 @@ a {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Legs of a multi-leg proposal. Shown in full because approving a set
+   without seeing what it trades is approving blind. */
+.legs {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  margin-bottom: 8px;
+}
+
+.legs-head {
+  padding: 5px 8px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--warn);
+  border-bottom: 1px solid var(--border);
+}
+
+.legs .table td {
+  padding: 3px 8px;
+}
+
+.chip.warn {
+  color: var(--warn);
+  border-color: var(--warn);
+}

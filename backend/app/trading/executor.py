@@ -45,6 +45,7 @@ from app.db.models import (
     Fill,
     Order,
     OrderStatus,
+    ProposalLeg,
     ProposalStatus,
     ProposedTrade,
     Side,
@@ -184,15 +185,13 @@ class Executor:
             payload={
                 "proposal_id": proposal.id,
                 "route": route.value,
-                "limit_price": str(proposal.limit_price),
-                "contracts": str(proposal.contracts),
-                "side": proposal.side.value,
-                "action": proposal.action,
+                "event_ticker": proposal.event_ticker,
+                "leg_count": proposal.leg_count,
             },
         )
 
         try:
-            order = await self._place(session, proposal, route, actor=actor)
+            orders = await self._place_legs(session, proposal, route, actor=actor)
         except ExecutionError:
             # The proposal was already marked APPROVED above. Leaving it there
             # would strand it: approved, no working order, and invisible to
@@ -203,9 +202,43 @@ class Executor:
             await proposals.publish(proposal, event=ProposalStatus.FAILED.value)
             raise
 
-        proposal.status = ProposalStatus.EXECUTED
+        proposal.status = self._outcome(orders)
+        if proposal.status is ProposalStatus.PARTIAL:
+            # Real, and it needs a person: the legs no longer hedge each other.
+            filled = [o.ticker for o in orders if (o.filled_contracts or 0) > 0]
+            proposal.decision_reason = (
+                f"UNBALANCED: {len(filled)} of {len(orders)} legs executed "
+                f"({', '.join(filled)}). The remaining legs did not, so this "
+                f"is now a directional position, not a hedge."
+            )
+            log.error(
+                "proposal %s is unbalanced: %d/%d legs executed",
+                proposal.id, len(filled), len(orders),
+            )
         await proposals.publish(proposal, event=proposal.status.value)
-        return order
+        return orders[0]
+
+    @staticmethod
+    def _outcome(orders: list[Order]) -> ProposalStatus:
+        """EXECUTED, PARTIAL or FAILED, judged across every leg.
+
+        A single-leg proposal can only be executed or failed. A multi-leg one
+        has a third outcome that matters more than either: some legs on, some
+        off. The exchange has no atomic multi-order primitive, so that is a
+        genuine state rather than an error to swallow.
+        """
+        if not orders:
+            return ProposalStatus.FAILED
+        if all(o.status is OrderStatus.REJECTED for o in orders):
+            return ProposalStatus.FAILED
+        if len(orders) == 1:
+            return ProposalStatus.EXECUTED
+
+        filled = [(o.filled_contracts or Decimal(0)) > 0 for o in orders]
+        if all(filled) or not any(filled):
+            # All legs on, or none — either way the set is balanced.
+            return ProposalStatus.EXECUTED
+        return ProposalStatus.PARTIAL
 
     async def _live_order_for(
         self, session: AsyncSession, proposal: ProposedTrade
@@ -224,81 +257,116 @@ class Executor:
 
     # -- placement -------------------------------------------------------
 
-    async def _place(
+    async def _place_legs(
         self,
         session: AsyncSession,
         proposal: ProposedTrade,
         route: ExecutionRoute,
         *,
         actor: str,
-    ) -> Order:
-        tif = self._config.trading.order.time_in_force
+    ) -> list[Order]:
+        """Place every leg of the proposal.
 
-        order = Order(
-            proposal_id=proposal.id,
-            # The idempotency key. Generated and persisted before anything
-            # leaves the process, so a crash mid-flight is recoverable.
-            client_order_id=str(uuid.uuid4()),
-            ticker=proposal.ticker,
-            side=proposal.side,
-            action=proposal.action,
-            limit_price=proposal.limit_price,
-            contracts=proposal.contracts,
-            filled_contracts=Decimal(0),
-            time_in_force=tif,
-            status=OrderStatus.PENDING,
-            is_paper=route.is_paper,
-            route=route.value,
-        )
-        session.add(order)
+        Multi-leg proposals go out in **one batch request with IOC**. That is
+        the strongest guarantee available: the exchange has no atomic
+        multi-order primitive, so the batch endpoint only collapses N round
+        trips into one, and IOC stops any leg resting half-done. Leg risk is
+        reduced, not removed, and an imbalance is reported rather than hidden.
+        """
+        legs = (
+            await session.execute(
+                select(ProposalLeg)
+                .where(ProposalLeg.proposal_id == proposal.id)
+                .order_by(ProposalLeg.seq)
+            )
+        ).scalars().all()
+        if not legs:
+            raise ExecutionError("no_legs", f"proposal {proposal.id} has no legs")
+
+        multi = len(legs) > 1
+        # A resting leg of an arb is an unhedged option written for free.
+        tif = "ioc" if multi else self._config.trading.order.time_in_force
+
+        orders: list[Order] = []
+        for leg in legs:
+            order = Order(
+                proposal_id=proposal.id,
+                leg_id=leg.id,
+                # The idempotency key. Generated and persisted before anything
+                # leaves the process, so a crash mid-flight is recoverable.
+                client_order_id=str(uuid.uuid4()),
+                ticker=leg.ticker,
+                side=leg.side,
+                action=leg.action,
+                limit_price=leg.limit_price,
+                contracts=leg.contracts,
+                filled_contracts=Decimal(0),
+                time_in_force=tif,
+                status=OrderStatus.PENDING,
+                is_paper=route.is_paper,
+                route=route.value,
+            )
+            session.add(order)
+            orders.append(order)
         await session.flush()
 
         await proposals.audit(
             session,
             kind="order.submitted",
-            ticker=order.ticker,
+            ticker=proposal.ticker,
             actor=actor,
             payload={
-                "order_id": order.id,
-                "client_order_id": order.client_order_id,
+                "proposal_id": proposal.id,
                 "route": route.value,
-                "wire": {
-                    "book_side": book_side(order.side, order.action),
-                    "yes_price": str(to_yes_price(order.side, order.limit_price)),
-                    "count": str(order.contracts),
-                    "time_in_force": tif,
-                },
+                "leg_count": len(orders),
+                "atomic": False,
+                "time_in_force": tif,
+                "legs": [
+                    {
+                        "order_id": o.id,
+                        "client_order_id": o.client_order_id,
+                        "ticker": o.ticker,
+                        "book_side": book_side(o.side, o.action),
+                        "yes_price": wire_price(to_yes_price(o.side, o.limit_price)),
+                        "count": str(o.contracts),
+                    }
+                    for o in orders
+                ],
             },
         )
 
         try:
             if route is ExecutionRoute.SIMULATED:
-                await self._fill_simulated(session, order, proposal)
+                for order in orders:
+                    await self._fill_simulated(session, order)
+            elif multi:
+                await self._fill_exchange_batch(session, orders, tif)
             else:
-                await self._fill_exchange(session, order)
+                await self._fill_exchange(session, orders[0], tif)
         except InterlockError:
             raise
         except Exception as exc:  # noqa: BLE001 - recorded, then re-raised
-            order.status = OrderStatus.REJECTED
-            order.error = str(exc)[:2000]
+            for order in orders:
+                if order.status is OrderStatus.PENDING:
+                    order.status = OrderStatus.REJECTED
+                    order.error = str(exc)[:2000]
             await proposals.audit(
                 session,
                 kind="order.failed",
-                ticker=order.ticker,
+                ticker=proposal.ticker,
                 actor="system",
-                payload={"order_id": order.id, "error": order.error},
+                payload={"proposal_id": proposal.id, "error": str(exc)[:500]},
             )
-            log.exception("order %s failed: %s", order.id, exc)
+            log.exception("proposal %s placement failed: %s", proposal.id, exc)
             raise ExecutionError("placement_failed", str(exc)) from exc
 
-        await self._publish_order(order)
-        return order
+        for order in orders:
+            await self._publish_order(order)
+        return orders
 
     # -- simulated fills -------------------------------------------------
 
-    async def _fill_simulated(
-        self, session: AsyncSession, order: Order, proposal: ProposedTrade
-    ) -> None:
+    async def _fill_simulated(self, session: AsyncSession, order: Order) -> None:
         """Fill against the live book locally. No API call is made."""
         book = await self._current_book(order.ticker)
 
@@ -353,32 +421,76 @@ class Executor:
 
     # -- exchange fills --------------------------------------------------
 
-    async def _fill_exchange(self, session: AsyncSession, order: Order) -> None:
-        """Place a real order on the demo or live exchange."""
+    def _wire_order(self, order: Order, tif: str) -> dict[str, Any]:
+        """One order in the shape the V2 API wants."""
+        return {
+            "ticker": order.ticker,
+            "book_side": book_side(order.side, order.action),
+            # The wire always speaks YES prices, whichever side we take.
+            "price_dollars": wire_price(to_yes_price(order.side, order.limit_price)),
+            "count": format_count(order.contracts),
+            "client_order_id": order.client_order_id,
+            "time_in_force": _TIF_WIRE.get(tif, TIF_GTC),
+        }
+
+    async def _fill_exchange(
+        self, session: AsyncSession, order: Order, tif: str
+    ) -> None:
+        """Place a single real order on the demo or live exchange."""
         if self._rest is None:
             raise ExecutionError(
                 "no_client", "no Kalshi REST client is configured in this process"
             )
 
-        wire_side = book_side(order.side, order.action)
-        # The wire always speaks YES prices, whichever side we are taking.
-        price_yes = to_yes_price(order.side, order.limit_price)
+        wire = self._wire_order(order, tif)
+        log.warning(
+            "placing %s order: %s %s %s @ %s (wire: %s @ %s)",
+            order.route, order.action, order.contracts, order.side.value,
+            order.limit_price, wire["book_side"], wire["price_dollars"],
+        )
+        response = await self._rest.create_order(**wire)
+        await self._apply_response(session, order, response)
+
+    async def _fill_exchange_batch(
+        self, session: AsyncSession, orders: list[Order], tif: str
+    ) -> None:
+        """Place every leg in one request.
+
+        Not atomic — see ``create_orders_batch``. Responses are matched back
+        by client order ID rather than by position, because nothing promises
+        the array comes back in the order it went out.
+        """
+        if self._rest is None:
+            raise ExecutionError(
+                "no_client", "no Kalshi REST client is configured in this process"
+            )
 
         log.warning(
-            "placing %s order: %s %s %s @ %s (wire: %s @ %s) route=%s",
-            order.route, order.action, order.contracts, order.side.value,
-            order.limit_price, wire_side, wire_price(price_yes), order.route,
+            "placing %d-leg %s order batch (IOC, NOT atomic): %s",
+            len(orders), orders[0].route, ", ".join(o.ticker for o in orders),
         )
-
-        response = await self._rest.create_order(
-            ticker=order.ticker,
-            book_side=wire_side,
-            price_dollars=wire_price(price_yes),
-            count=format_count(order.contracts),
-            client_order_id=order.client_order_id,
-            time_in_force=_TIF_WIRE.get(order.time_in_force, TIF_GTC),
+        results = await self._rest.create_orders_batch(
+            [self._wire_order(o, tif) for o in orders]
         )
+        by_client = {
+            r.get("client_order_id"): r for r in results if r.get("client_order_id")
+        }
 
+        for order in orders:
+            response = by_client.get(order.client_order_id)
+            if response is None:
+                # No result for this leg: it did not go on. Say so rather
+                # than leaving it PENDING and letting the sweep guess.
+                order.status = OrderStatus.REJECTED
+                order.error = "no result returned for this leg in the batch"
+                log.error("batch: no result for leg %s", order.ticker)
+                continue
+            await self._apply_response(session, order, response)
+
+    async def _apply_response(
+        self, session: AsyncSession, order: Order, response: dict[str, Any]
+    ) -> None:
+        """Record whatever the exchange said happened to one order."""
         order.exchange_order_id = response.get("order_id")
 
         filled = parse_count(response.get("fill_count") or "0", "fill_count")
@@ -460,12 +572,24 @@ class Executor:
 
         The exchange's own status enum has only resting/canceled/executed, so
         "partially filled" is something we work out rather than read.
+
+        An **IOC order that did not fill is CANCELED, not RESTING** — the
+        exchange killed it on arrival and it is not sitting on any book.
+        Calling it resting was observed live on an unfilled arb leg: the UI
+        showed a working order that did not exist and the auto-cancel sweep
+        would have gone looking for a ghost.
         """
         filled = order.filled_contracts or Decimal(0)
         if filled >= order.contracts:
             order.status = OrderStatus.FILLED
         elif filled > 0:
-            order.status = OrderStatus.PARTIALLY_FILLED
+            order.status = (
+                OrderStatus.CANCELED
+                if order.time_in_force == "ioc"
+                else OrderStatus.PARTIALLY_FILLED
+            )
+        elif order.time_in_force == "ioc":
+            order.status = OrderStatus.CANCELED
         else:
             order.status = OrderStatus.RESTING
 

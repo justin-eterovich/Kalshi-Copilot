@@ -17,7 +17,6 @@ from app.ingest.streams import CandleBuilder
 from app.kalshi.auth import KalshiSigner, SigningError
 from app.kalshi.ratelimit import DEFAULT_TOKEN_COST, Bucket, RateLimiter
 
-
 # ---------------------------------------------------------------------------
 # Rate limiting
 # ---------------------------------------------------------------------------

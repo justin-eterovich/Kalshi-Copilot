@@ -50,12 +50,17 @@ outcome nobody listed.
 | Worker scan loop | `app/worker/main.py` |
 | Watchlist (65 markets, 22 events) | `config.yaml` |
 
-Detectors emit **signals only**. Nothing in the worker can create a proposal,
-let alone an order — that separation is the architecture:
+Detectors emit **signals**. The worker turns a multi-leg finding into a
+single *pending* proposal, which is the documented flow:
 
 ```
 detectors -> signals -> risk/sizing -> proposed_trades -> human -> orders
 ```
+
+Nothing in that chain places an order. A proposal is a request for a
+decision; it reaches an exchange only after a human approves that specific
+one, and the interlocks are re-checked at that point rather than trusted
+from whatever created it.
 
 ---
 
@@ -91,27 +96,61 @@ Other properties confirmed by test:
 
 ---
 
-## The open design question
+## Multi-leg proposals
 
-**A set arb is one decision but many orders.** The proposal and order schema
-is single-leg: one ticker, one side, one price. Approving 3 legs of a 5-leg
-arb leaves an uncovered position in those 3 — the exact opposite of riskless.
+A set arb is one decision that needs several orders, so a proposal now
+carries **legs**. `proposal_legs` holds ticker/side/action/price/size; the
+`proposed_trades` row holds only the aggregate economics and the decision
+state. A manual ticket has one leg; a set arb has one per market. They are
+approved together or not at all.
 
-So the detector deliberately stops at signals. Turning a set-arb signal into
-something executable needs one of:
+**Execution is not atomic, and nothing can make it so.** Kalshi's batch
+endpoint returns a separate result per order and promises nothing about
+all-or-nothing — it is a rate-limit convenience, not a transaction. So the
+design does what is actually available:
 
-1. **Multi-leg proposals** — a proposal that carries N legs and is approved
-   as a unit, with the executor placing all N or none. This is the honest
-   model and it is a real schema and executor change.
-2. **Manual execution** — the operator reads the signal and places each leg
-   through the existing ticket, accepting leg risk themselves.
-3. **Nothing** — treat set arb as a research feed only.
+- all legs go out in **one batch request**, collapsing the window between
+  them from N round trips to one;
+- multi-leg proposals force **IOC**, so no leg can rest half-done;
+- a partial outcome becomes `ProposalStatus.PARTIAL` with an explicit
+  `UNBALANCED: n of m legs executed` reason, because that is a directional
+  position nobody chose and it needs a person.
 
-I have not chosen. (1) is the right answer if set arb is meant to trade, and
-it is a decision about the shape of the approval queue, so it needs your
-call before I build it.
+Leg risk is reduced. It is not removed, and the UI says so on the
+confirmation step rather than implying a guarantee that does not exist.
+
+**Verified on the demo exchange — and it hit the unbalanced case on the
+first live run.** A 2-leg NFL set went out as one IOC batch; `SEA` filled
+10/10 at 0.47, `DAL` did not fill at all. The proposal came back `partial`
+with the unbalanced reason, both order rows persisted, and the unfilled leg
+was recorded `canceled` (IOC kills it at the exchange) rather than left as a
+phantom working order.
 
 ---
+
+## Bugs this surfaced
+
+Four, all found by running it rather than by tests:
+
+1. **The batch path built its own order body** and omitted
+   `self_trade_prevention_type`, which the API requires — so every multi-leg
+   order was rejected while single orders worked. Both paths now go through
+   one `build_order_body`, so they cannot drift again.
+2. **A failed placement was rolled back.** The executor deliberately writes
+   Order rows *before* placing, so an ambiguous failure leaves a client order
+   ID to reconcile against. The API's session dependency rolls back on
+   exception and erased exactly that — a rejected batch left zero order rows
+   and a proposal still marked pending, as if nothing had been attempted.
+   Failures are now committed before being surfaced.
+3. **A new enum label 500'd at runtime.** `create_all` never alters an
+   existing Postgres enum, so adding `PARTIAL` to `proposal_status` failed on
+   first *write*, mid-trade, rather than at boot. `bootstrap` now syncs
+   missing enum labels at start-up and logs each one. Not a substitute for
+   migrations — it closes the gap that bites hardest while there are none.
+4. **An unfilled IOC order was recorded as `resting`.** IOC means the
+   exchange killed it on arrival; it is not on any book. The dashboard showed
+   a working order that did not exist and the auto-cancel sweep would have
+   gone looking for a ghost.
 
 ## Not started in M4
 

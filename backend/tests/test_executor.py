@@ -29,6 +29,7 @@ from app.db.models import (
     Market,
     Order,
     OrderStatus,
+    ProposalLeg,
     ProposalStatus,
     ProposedTrade,
     Side,
@@ -86,9 +87,16 @@ class FakeSession:
     async def get(self, model: type, key: Any) -> Any:
         return self.objects.get((model, key))
 
-    async def execute(self, _stmt: Any) -> FakeResult:
-        # The only SELECT the executor makes is "is there a live order for
-        # this proposal"; the fixture decides the answer.
+    #: Legs the executor will find for the proposal under test.
+    legs: list[Any] = []
+
+    async def execute(self, stmt: Any) -> FakeResult:
+        # Two SELECTs reach here: "is there a live order for this proposal"
+        # and "what are its legs". Distinguish by the compiled text rather
+        # than by call order, which would be brittle.
+        text = str(stmt).lower()
+        if "proposal_legs" in text:
+            return FakeResult(self.legs)
         return FakeResult(self._existing)
 
     def of_type(self, model: type) -> list[Any]:
@@ -104,6 +112,10 @@ class FakeRest:
         book: dict[str, Any] | None = None,
         create_response: dict[str, Any] | None = None,
         create_error: Exception | None = None,
+        batch_fill: str = "0.00",
+        batch_reversed: bool = False,
+        batch_drop_second: bool = False,
+        batch_fill_first_only: bool = False,
     ) -> None:
         self.book = book or {"yes_dollars": [], "no_dollars": []}
         self.create_response = create_response or {
@@ -113,7 +125,12 @@ class FakeRest:
         }
         self.create_error = create_error
         self.create_calls: list[dict[str, Any]] = []
+        self.batch_calls: list[list[dict[str, Any]]] = []
         self.cancel_calls: list[str] = []
+        self.batch_fill = batch_fill
+        self.batch_reversed = batch_reversed
+        self.batch_drop_second = batch_drop_second
+        self.batch_fill_first_only = batch_fill_first_only
 
     @property
     def authenticated(self) -> bool:
@@ -127,6 +144,35 @@ class FakeRest:
         if self.create_error is not None:
             raise self.create_error
         return self.create_response
+
+    async def create_orders_batch(
+        self, orders: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        self.batch_calls.append(orders)
+        if self.create_error is not None:
+            raise self.create_error
+        results = []
+        for i, order in enumerate(orders):
+            fill = (
+                "10.00" if (self.batch_fill_first_only and i == 0)
+                else "0.00" if self.batch_fill_first_only
+                else self.batch_fill
+            )
+            entry: dict[str, Any] = {
+                "order_id": f"exch-{i}",
+                "client_order_id": order["client_order_id"],
+                "fill_count": fill,
+                "remaining_count": "0.00",
+            }
+            if fill != "0.00":
+                entry["average_fill_price"] = "0.5000"
+                entry["average_fee_paid"] = "0.0175"
+            results.append(entry)
+        if self.batch_drop_second and len(results) > 1:
+            results = results[:1]
+        if self.batch_reversed:
+            results.reverse()
+        return results
 
     async def cancel_order(
         self, order_id: str, *, market_ticker: str | None = None
@@ -177,10 +223,7 @@ def make_proposal(**overrides: object) -> ProposedTrade:
     proposal = ProposedTrade(
         source="manual",
         ticker="TEST-MKT",
-        side=Side.YES,
-        action="buy",
-        limit_price=Decimal("0.50"),
-        contracts=Decimal(10),
+        leg_count=1,
         status=ProposalStatus.PENDING,
         expires_at=datetime.now(UTC) + timedelta(seconds=60),
     )
@@ -190,10 +233,22 @@ def make_proposal(**overrides: object) -> ProposedTrade:
     return proposal
 
 
-def session_with_market(**kwargs: Any) -> FakeSession:
+def make_leg(**overrides: Any) -> ProposalLeg:
+    leg = ProposalLeg(
+        proposal_id=1, seq=0, ticker="TEST-MKT", side=Side.YES, action="buy",
+        limit_price=Decimal("0.50"), contracts=Decimal(10),
+    )
+    leg.id = 1
+    for key, value in overrides.items():
+        setattr(leg, key, value)
+    return leg
+
+
+def session_with_market(legs: list[ProposalLeg] | None = None, **kwargs: Any):
     session = FakeSession(**kwargs)
     market = Market(ticker="TEST-MKT", category="Sports", status="active")
     session.objects[(Market, "TEST-MKT")] = market
+    session.legs = legs if legs is not None else [make_leg()]
     return session
 
 
@@ -329,15 +384,13 @@ class TestIdempotency:
 
 class TestWireTranslation:
     async def test_buy_yes_is_sent_as_a_bid(self, key_file: Path) -> None:
-        session = session_with_market()
+        session = session_with_market(
+            [make_leg(side=Side.YES, action="buy", limit_price=Decimal("0.56"))]
+        )
         rest = FakeRest()
         executor = Executor(rest, demo_settings(key_file), make_config())
 
-        await executor.approve_and_execute(
-            session,
-            make_proposal(side=Side.YES, action="buy", limit_price=Decimal("0.56")),
-            confirmed=True,
-        )
+        await executor.approve_and_execute(session, make_proposal(), confirmed=True)
 
         sent = rest.create_calls[0]
         assert sent["book_side"] == "bid"
@@ -347,15 +400,13 @@ class TestWireTranslation:
         self, key_file: Path
     ) -> None:
         """The operator approved 'buy NO at 30c'; the exchange gets ask@0.70."""
-        session = session_with_market()
+        session = session_with_market(
+            [make_leg(side=Side.NO, action="buy", limit_price=Decimal("0.30"))]
+        )
         rest = FakeRest()
         executor = Executor(rest, demo_settings(key_file), make_config())
 
-        await executor.approve_and_execute(
-            session,
-            make_proposal(side=Side.NO, action="buy", limit_price=Decimal("0.30")),
-            confirmed=True,
-        )
+        await executor.approve_and_execute(session, make_proposal(), confirmed=True)
 
         sent = rest.create_calls[0]
         assert sent["book_side"] == "ask"
@@ -366,15 +417,11 @@ class TestWireTranslation:
     ) -> None:
         """Rounding to cents would send a price the operator did not approve,
         and might not even be on a valid tick."""
-        session = session_with_market()
+        session = session_with_market([make_leg(limit_price=Decimal("0.505"))])
         rest = FakeRest()
         executor = Executor(rest, demo_settings(key_file), make_config())
 
-        await executor.approve_and_execute(
-            session,
-            make_proposal(limit_price=Decimal("0.505")),
-            confirmed=True,
-        )
+        await executor.approve_and_execute(session, make_proposal(), confirmed=True)
 
         assert Decimal(rest.create_calls[0]["price_dollars"]) == Decimal("0.505")
 
@@ -388,13 +435,11 @@ class TestWireTranslation:
         market with ``invalid dollar precision: -6`` even though the value is
         exactly 25c. Padding is not the same as precision.
         """
-        session = session_with_market()
+        session = session_with_market([make_leg(limit_price=Decimal("0.25"))])
         rest = FakeRest()
         executor = Executor(rest, demo_settings(key_file), make_config())
 
-        await executor.approve_and_execute(
-            session, make_proposal(limit_price=Decimal("0.25")), confirmed=True
-        )
+        await executor.approve_and_execute(session, make_proposal(), confirmed=True)
 
         assert rest.create_calls[0]["price_dollars"] == "0.25"
 
@@ -501,11 +546,10 @@ class TestExchangeFills:
         )
         executor = Executor(rest, demo_settings(key_file), make_config())
 
-        await executor.approve_and_execute(
-            session,
-            make_proposal(side=Side.NO, action="buy", limit_price=Decimal("0.30")),
-            confirmed=True,
-        )
+        session.legs = [
+            make_leg(side=Side.NO, action="buy", limit_price=Decimal("0.30"))
+        ]
+        await executor.approve_and_execute(session, make_proposal(), confirmed=True)
 
         fill = session.of_type(Fill)[0]
         assert fill.price == Decimal("0.30")
@@ -603,8 +647,9 @@ class TestSimulatedFills:
         )
         executor = Executor(rest, sim_settings(), make_config())
 
+        session.legs = [make_leg(limit_price=Decimal("0.10"))]
         order = await executor.approve_and_execute(
-            session, make_proposal(limit_price=Decimal("0.10")), confirmed=True
+            session, make_proposal(), confirmed=True
         )
 
         assert order.status is OrderStatus.RESTING
@@ -680,3 +725,302 @@ class TestOrderView:
         view = order_view(order)
         assert view["is_paper"] is True
         assert view["route"] == "demo_exchange"
+
+
+# ---------------------------------------------------------------------------
+# Multi-leg proposals
+# ---------------------------------------------------------------------------
+
+
+class TestMultiLeg:
+    """A set arbitrage is one decision that needs several orders.
+
+    The exchange has no atomic multi-order primitive — the batch endpoint
+    returns a separate result per order and promises nothing. So the design
+    reduces leg risk (one round trip, IOC) and reports what it cannot remove
+    (an imbalance), rather than claiming a guarantee it does not have.
+    """
+
+    @staticmethod
+    def _legs() -> list[ProposalLeg]:
+        legs = []
+        for i, (ticker, price) in enumerate(
+            (("KXEV-26-A", "0.55"), ("KXEV-26-B", "0.52"))
+        ):
+            leg = make_leg(
+                seq=i, ticker=ticker, side=Side.YES, action="sell",
+                limit_price=Decimal(price), contracts=Decimal(10),
+            )
+            leg.id = i + 1
+            legs.append(leg)
+        return legs
+
+    @staticmethod
+    def _proposal() -> ProposedTrade:
+        return make_proposal(leg_count=2, event_ticker="KXEV-26")
+
+    async def test_every_leg_becomes_an_order(self, key_file: Path) -> None:
+        session = session_with_market(self._legs())
+        rest = FakeRest()
+        executor = Executor(rest, demo_settings(key_file), make_config())
+
+        await executor.approve_and_execute(session, self._proposal(), confirmed=True)
+
+        orders = session.of_type(Order)
+        assert [o.ticker for o in orders] == ["KXEV-26-A", "KXEV-26-B"]
+
+    async def test_legs_go_out_in_one_batch(self, key_file: Path) -> None:
+        """One round trip, not N — the only mitigation available for the gap
+        between legs."""
+        session = session_with_market(self._legs())
+        rest = FakeRest()
+        executor = Executor(rest, demo_settings(key_file), make_config())
+
+        await executor.approve_and_execute(session, self._proposal(), confirmed=True)
+
+        assert len(rest.batch_calls) == 1
+        assert len(rest.batch_calls[0]) == 2
+        assert rest.create_calls == []  # not placed one at a time
+
+    async def test_multi_leg_forces_ioc(self, key_file: Path) -> None:
+        """A resting leg of an arb is an unhedged option written for free."""
+        session = session_with_market(self._legs())
+        rest = FakeRest()
+        executor = Executor(
+            rest, demo_settings(key_file),
+            make_config(order={"time_in_force": "gtc"}),
+        )
+
+        await executor.approve_and_execute(session, self._proposal(), confirmed=True)
+
+        assert all(
+            o["time_in_force"] == "immediate_or_cancel" for o in rest.batch_calls[0]
+        )
+
+    async def test_results_are_matched_by_client_order_id(
+        self, key_file: Path
+    ) -> None:
+        """Nothing promises the batch comes back in the order it went out."""
+        session = session_with_market(self._legs())
+        rest = FakeRest(batch_reversed=True, batch_fill="10.00")
+        executor = Executor(rest, demo_settings(key_file), make_config())
+
+        await executor.approve_and_execute(session, self._proposal(), confirmed=True)
+
+        orders = session.of_type(Order)
+        assert all(o.status is OrderStatus.FILLED for o in orders)
+
+    async def test_all_legs_filling_is_executed(self, key_file: Path) -> None:
+        session = session_with_market(self._legs())
+        proposal = self._proposal()
+        executor = Executor(
+            FakeRest(batch_fill="10.00"), demo_settings(key_file), make_config()
+        )
+
+        await executor.approve_and_execute(session, proposal, confirmed=True)
+
+        assert proposal.status is ProposalStatus.EXECUTED
+
+    async def test_no_legs_filling_is_still_balanced(self, key_file: Path) -> None:
+        """Nothing on is as balanced as everything on."""
+        session = session_with_market(self._legs())
+        proposal = self._proposal()
+        executor = Executor(
+            FakeRest(batch_fill="0.00"), demo_settings(key_file), make_config()
+        )
+
+        await executor.approve_and_execute(session, proposal, confirmed=True)
+
+        assert proposal.status is ProposalStatus.EXECUTED
+
+    async def test_a_partial_set_is_flagged_unbalanced(self, key_file: Path) -> None:
+        """The outcome the exchange cannot rule out, and the operator must see.
+
+        One leg on and one off is not a hedge — it is a directional position
+        nobody chose.
+        """
+        session = session_with_market(self._legs())
+        proposal = self._proposal()
+        executor = Executor(
+            FakeRest(batch_fill_first_only=True), demo_settings(key_file),
+            make_config(),
+        )
+
+        await executor.approve_and_execute(session, proposal, confirmed=True)
+
+        assert proposal.status is ProposalStatus.PARTIAL
+        assert "UNBALANCED" in (proposal.decision_reason or "")
+
+    async def test_a_missing_batch_result_rejects_that_leg(
+        self, key_file: Path
+    ) -> None:
+        """Silence about a leg means it did not go on. Say so."""
+        session = session_with_market(self._legs())
+        executor = Executor(
+            FakeRest(batch_drop_second=True), demo_settings(key_file), make_config()
+        )
+
+        await executor.approve_and_execute(session, self._proposal(), confirmed=True)
+
+        orders = session.of_type(Order)
+        assert orders[1].status is OrderStatus.REJECTED
+        assert "no result" in (orders[1].error or "")
+
+    async def test_a_single_leg_proposal_still_uses_the_plain_endpoint(
+        self, key_file: Path
+    ) -> None:
+        session = session_with_market()
+        rest = FakeRest()
+        executor = Executor(rest, demo_settings(key_file), make_config())
+
+        await executor.approve_and_execute(session, make_proposal(), confirmed=True)
+
+        assert len(rest.create_calls) == 1
+        assert rest.batch_calls == []
+
+
+class TestOrderBodyParity:
+    """Single and batch placement must build identical bodies.
+
+    Regression: the batch path once assembled its own dict and omitted
+    `self_trade_prevention_type`, which the API requires. Every multi-leg
+    order was rejected while single orders worked — the two paths had
+    silently diverged.
+    """
+
+    def test_the_body_always_carries_self_trade_prevention(self) -> None:
+        from app.kalshi.rest import build_order_body
+
+        body = build_order_body(
+            ticker="T", book_side="bid", price_dollars="0.25", count="2.00",
+            client_order_id="c1",
+        )
+        assert body["self_trade_prevention_type"] == "taker_at_cross"
+
+    def test_both_paths_use_the_same_builder(self) -> None:
+        """Asserted structurally: one function, so they cannot drift."""
+        import inspect
+
+        from app.kalshi import rest
+
+        single = inspect.getsource(rest.KalshiRestClient.create_order)
+        batch = inspect.getsource(rest.KalshiRestClient.create_orders_batch)
+        assert "build_order_body" in single
+        assert "build_order_body" in batch
+
+    def test_an_invalid_book_side_is_rejected(self) -> None:
+        from app.kalshi.rest import build_order_body
+
+        with pytest.raises(ValueError, match="book_side"):
+            build_order_body(
+                ticker="T", book_side="buy", price_dollars="0.25",
+                count="1", client_order_id="c1",
+            )
+
+    def test_an_invalid_time_in_force_is_rejected(self) -> None:
+        from app.kalshi.rest import build_order_body
+
+        with pytest.raises(ValueError, match="time_in_force"):
+            build_order_body(
+                ticker="T", book_side="bid", price_dollars="0.25",
+                count="1", client_order_id="c1", time_in_force="gtt",
+            )
+
+
+class TestFailureIsRecorded:
+    """A failed placement must leave evidence, not vanish.
+
+    The executor writes Order rows before placing so that an ambiguous
+    failure — a timeout that may still have reached the matching engine —
+    leaves a client order ID to reconcile against. Anything that rolls those
+    rows back defeats the entire recovery design. Observed live: a rejected
+    batch left zero order rows and the proposal still pending, as if nothing
+    had been attempted.
+    """
+
+    async def test_rejected_orders_are_still_written(self, key_file: Path) -> None:
+        session = session_with_market()
+        executor = Executor(
+            FakeRest(create_error=RuntimeError("exchange said no")),
+            demo_settings(key_file),
+            make_config(),
+        )
+
+        with pytest.raises(ExecutionError):
+            await executor.approve_and_execute(
+                session, make_proposal(), confirmed=True
+            )
+
+        orders = session.of_type(Order)
+        assert len(orders) == 1
+        assert orders[0].client_order_id  # the reconciliation key survives
+        assert orders[0].status is OrderStatus.REJECTED
+
+    async def test_every_leg_of_a_failed_batch_is_written(
+        self, key_file: Path
+    ) -> None:
+        legs = TestMultiLeg._legs()
+        session = session_with_market(legs)
+        executor = Executor(
+            FakeRest(create_error=RuntimeError("batch rejected")),
+            demo_settings(key_file),
+            make_config(),
+        )
+
+        with pytest.raises(ExecutionError):
+            await executor.approve_and_execute(
+                session, TestMultiLeg._proposal(), confirmed=True
+            )
+
+        orders = session.of_type(Order)
+        assert len(orders) == 2
+        assert all(o.status is OrderStatus.REJECTED for o in orders)
+        assert len({o.client_order_id for o in orders}) == 2
+
+
+class TestIocStatus:
+    """An IOC order that did not fill is dead, not resting.
+
+    Observed live on an unfilled arbitrage leg: the order was recorded as
+    RESTING, so the dashboard showed a working order that did not exist and
+    the auto-cancel sweep would have tried to cancel a ghost.
+    """
+
+    async def test_an_unfilled_ioc_leg_is_canceled_not_resting(
+        self, key_file: Path
+    ) -> None:
+        session = session_with_market(TestMultiLeg._legs())
+        executor = Executor(
+            FakeRest(batch_fill="0.00"), demo_settings(key_file), make_config()
+        )
+
+        await executor.approve_and_execute(
+            session, TestMultiLeg._proposal(), confirmed=True
+        )
+
+        orders = session.of_type(Order)
+        assert all(o.time_in_force == "ioc" for o in orders)
+        assert all(o.status is OrderStatus.CANCELED for o in orders)
+
+    async def test_a_partially_filled_ioc_leg_is_also_canceled(
+        self, key_file: Path
+    ) -> None:
+        """IOC cancels the remainder, so nothing is left working."""
+        order = Order(
+            client_order_id="c1", ticker="T", side=Side.YES, action="buy",
+            limit_price=Decimal("0.5"), contracts=Decimal(10),
+            filled_contracts=Decimal(4), time_in_force="ioc",
+            status=OrderStatus.PENDING, route="demo_exchange",
+        )
+        Executor._settle_status(order)
+        assert order.status is OrderStatus.CANCELED
+
+    async def test_an_unfilled_gtc_order_still_rests(self, key_file: Path) -> None:
+        order = Order(
+            client_order_id="c1", ticker="T", side=Side.YES, action="buy",
+            limit_price=Decimal("0.5"), contracts=Decimal(10),
+            filled_contracts=Decimal(0), time_in_force="gtc",
+            status=OrderStatus.PENDING, route="demo_exchange",
+        )
+        Executor._settle_status(order)
+        assert order.status is OrderStatus.RESTING

@@ -194,16 +194,26 @@ export interface TicketQuote {
   fair_price: string | null;
 }
 
-export interface Proposal {
-  id: number;
-  signal_id: number | null;
-  source: string;
+export interface ProposalLeg {
+  seq: number;
   ticker: string;
   side: string;
   action: string;
   limit_price: string;
   contracts: string;
   fair_price: string | null;
+  est_fee_cents: string | null;
+}
+
+export interface Proposal {
+  id: number;
+  signal_id: number | null;
+  source: string;
+  /** First leg's market, denormalised for listing. Legs decide what trades. */
+  ticker: string;
+  event_ticker: string | null;
+  leg_count: number;
+  legs: ProposalLeg[];
   net_edge_cents: string | null;
   est_fee_cents: string | null;
   pct_of_bankroll: number | null;

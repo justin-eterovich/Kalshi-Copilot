@@ -31,7 +31,7 @@ from app.db.models import Side, Signal
 
 log = get_logger(__name__)
 
-__all__ = ["Finding", "Detector", "record", "publish_signal"]
+__all__ = ["Finding", "Detector", "record", "publish_signal", "propose_finding"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,3 +109,57 @@ async def publish_signal(finding: Finding, signal_id: int | None = None) -> None
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("could not publish signal for %s: %s", finding.ticker, exc)
+
+
+async def propose_finding(
+    session: AsyncSession,
+    config: Config,
+    finding: Finding,
+    signal: Signal,
+) -> Any:
+    """Turn a multi-leg finding into one proposal the operator decides once.
+
+    Only findings that carry ``evidence["legs"]`` become proposals here — a
+    set arbitrage is several orders but one decision, and splitting it into
+    independent proposals would let three legs of five be approved, leaving a
+    directional position where the operator thought they had a hedge.
+
+    Still nothing automatic: this creates a *pending* proposal. It reaches an
+    exchange only after a human approves it.
+    """
+    from app.trading.proposals import create_multi_leg_proposal
+
+    legs = finding.evidence.get("legs") or []
+    if len(legs) < 2:
+        return None
+
+    direction = finding.evidence.get("direction", "sell")
+    return await create_multi_leg_proposal(
+        session,
+        config,
+        event_ticker=str(finding.evidence.get("event_ticker") or ""),
+        legs=[
+            {
+                "ticker": leg["ticker"],
+                # The set is priced in YES terms on both sides; selling the
+                # set is selling YES on every leg.
+                "side": "yes",
+                "action": "sell" if direction == "sell" else "buy",
+                "limit_price": leg["avg_price"],
+                "contracts": leg["contracts"],
+                "est_fee_cents": leg.get("fee_cents"),
+            }
+            for leg in legs
+        ],
+        source=finding.detector,
+        net_edge_cents=finding.net_edge_cents,
+        est_fee_cents=(
+            Decimal(str(finding.evidence["total_fee_cents"]))
+            if "total_fee_cents" in finding.evidence
+            else None
+        ),
+        rationale=finding.rationale,
+        ttl_sec=finding.ttl_sec,
+        signal_id=signal.id,
+        actor=finding.detector,
+    )

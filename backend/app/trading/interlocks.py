@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ExecutionRoute",
+    "confirmation_target",
     "InterlockError",
     "resolve_route",
     "check_execution",
@@ -165,14 +166,16 @@ def check_execution(
     route = resolve_route(settings, config)
 
     # The third interlock. Typing the ticker is the difference between
-    # "I clicked something" and "I meant this market".
+    # "I clicked something" and "I meant this market". For a multi-leg
+    # proposal the event ticker is what identifies the trade, since no single
+    # market does.
+    expected = confirmation_target(proposal)
     if route is ExecutionRoute.LIVE_EXCHANGE and (
         confirmation_phrase or ""
-    ).strip().upper() != proposal.ticker.upper():
+    ).strip().upper() != expected.upper():
         raise InterlockError(
             "confirmation_phrase_mismatch",
-            "live trading requires typing the market ticker to confirm. "
-            f"Expected {proposal.ticker!r}.",
+            f"live trading requires typing {expected!r} to confirm.",
         )
 
     if route.hits_exchange and not settings.credentials_present():
@@ -183,6 +186,17 @@ def check_execution(
         )
 
     return route
+
+
+def confirmation_target(proposal: ProposedTrade) -> str:
+    """What the operator must type to confirm a live trade.
+
+    The event ticker for a multi-leg proposal — a set arbitrage is one
+    decision about an event, and no single market names it.
+    """
+    if (proposal.leg_count or 1) > 1 and proposal.event_ticker:
+        return proposal.event_ticker
+    return proposal.ticker
 
 
 def posture(settings: Settings, config: Config) -> dict[str, object]:

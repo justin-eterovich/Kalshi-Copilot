@@ -27,7 +27,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Config
 from app.core.logging import get_logger
 from app.core.redis import CH_PROPOSALS, get_redis
-from app.db.models import AuditLog, Market, ProposalStatus, ProposedTrade, Side
+from app.db.models import (
+    AuditLog,
+    Market,
+    ProposalLeg,
+    ProposalStatus,
+    ProposedTrade,
+    Side,
+)
 from app.trading.pricing import TicketQuote, price_ticket
 
 log = get_logger(__name__)
@@ -35,6 +42,9 @@ log = get_logger(__name__)
 __all__ = [
     "ProposalError",
     "create_proposal",
+    "create_multi_leg_proposal",
+    "legs_of",
+    "leg_view",
     "quote_for",
     "expire_stale",
     "reject",
@@ -147,11 +157,7 @@ async def create_proposal(
         signal_id=signal_id,
         source=source,
         ticker=ticker,
-        side=Side(side),
-        action=action,
-        limit_price=quote.limit_price,
-        contracts=quote.contracts,
-        fair_price=quote.fair_price,
+        leg_count=1,
         net_edge_cents=quote.net_edge_cents,
         est_fee_cents=quote.est_fee_cents,
         pct_of_bankroll=_pct_of_bankroll(quote, config),
@@ -160,6 +166,21 @@ async def create_proposal(
         expires_at=now + timedelta(seconds=ttl),
     )
     session.add(proposal)
+    await session.flush()
+
+    session.add(
+        ProposalLeg(
+            proposal_id=proposal.id,
+            seq=0,
+            ticker=ticker,
+            side=Side(side),
+            action=action,
+            limit_price=quote.limit_price,
+            contracts=quote.contracts,
+            fair_price=quote.fair_price,
+            est_fee_cents=quote.est_fee_cents,
+        )
+    )
     await session.flush()
 
     await audit(
@@ -265,8 +286,14 @@ async def reject(
 # ---------------------------------------------------------------------------
 
 
-def proposal_view(proposal: ProposedTrade) -> dict[str, Any]:
-    """Serialise for the API. Money is a string; the browser must not compute."""
+def proposal_view(
+    proposal: ProposedTrade, legs: list[ProposalLeg] | None = None
+) -> dict[str, Any]:
+    """Serialise for the API. Money is a string; the browser must not compute.
+
+    ``legs`` is where the tradeable detail lives. A manual ticket has one; a
+    set arbitrage has one per market and they are approved together.
+    """
     now = datetime.now(UTC)
     expires_in = None
     if proposal.expires_at is not None:
@@ -277,13 +304,9 @@ def proposal_view(proposal: ProposedTrade) -> dict[str, Any]:
         "signal_id": proposal.signal_id,
         "source": proposal.source,
         "ticker": proposal.ticker,
-        "side": proposal.side.value,
-        "action": proposal.action,
-        "limit_price": str(proposal.limit_price),
-        "contracts": str(proposal.contracts),
-        "fair_price": (
-            None if proposal.fair_price is None else str(proposal.fair_price)
-        ),
+        "event_ticker": proposal.event_ticker,
+        "leg_count": proposal.leg_count,
+        "legs": [leg_view(leg) for leg in (legs or [])],
         # Always net of fees and slippage. There is no gross figure to show.
         "net_edge_cents": (
             None if proposal.net_edge_cents is None else str(proposal.net_edge_cents)
@@ -305,6 +328,122 @@ def proposal_view(proposal: ProposedTrade) -> dict[str, Any]:
         "decision_reason": proposal.decision_reason,
         "created_at": proposal.created_at.isoformat() if proposal.created_at else None,
     }
+
+
+def leg_view(leg: ProposalLeg) -> dict[str, Any]:
+    return {
+        "seq": leg.seq,
+        "ticker": leg.ticker,
+        "side": leg.side.value,
+        "action": leg.action,
+        "limit_price": str(leg.limit_price),
+        "contracts": str(leg.contracts),
+        "fair_price": None if leg.fair_price is None else str(leg.fair_price),
+        "est_fee_cents": (
+            None if leg.est_fee_cents is None else str(leg.est_fee_cents)
+        ),
+    }
+
+
+async def legs_of(session: AsyncSession, proposal_id: int) -> list[ProposalLeg]:
+    return list(
+        (
+            await session.execute(
+                select(ProposalLeg)
+                .where(ProposalLeg.proposal_id == proposal_id)
+                .order_by(ProposalLeg.seq)
+            )
+        ).scalars().all()
+    )
+
+
+async def create_multi_leg_proposal(
+    session: AsyncSession,
+    config: Config,
+    *,
+    event_ticker: str,
+    legs: list[dict[str, Any]],
+    source: str,
+    net_edge_cents: Decimal | None = None,
+    est_fee_cents: Decimal | None = None,
+    rationale: str | None = None,
+    ttl_sec: int | None = None,
+    signal_id: int | None = None,
+    actor: str = "system",
+) -> ProposedTrade:
+    """Create one proposal covering several markets, approved as a unit.
+
+    This exists because a set arbitrage is a single decision that happens to
+    need several orders. Splitting it into independent proposals would let a
+    human approve three legs of five and end up with a directional position
+    where they thought they had a hedge.
+
+    It does **not** make execution atomic — nothing can, on this exchange.
+    The legs go out in one batch with IOC and any imbalance is reported.
+    """
+    if len(legs) < 2:
+        raise ProposalError(
+            "not_multi_leg",
+            "create_multi_leg_proposal needs at least two legs; use "
+            "create_proposal for a single-market ticket.",
+        )
+
+    now = datetime.now(UTC)
+    ttl = ttl_sec if ttl_sec is not None else config.trading.default_proposal_ttl_sec
+
+    proposal = ProposedTrade(
+        signal_id=signal_id,
+        source=source,
+        event_ticker=event_ticker,
+        ticker=str(legs[0]["ticker"]),
+        leg_count=len(legs),
+        net_edge_cents=net_edge_cents,
+        est_fee_cents=est_fee_cents,
+        rationale=rationale,
+        status=ProposalStatus.PENDING,
+        expires_at=now + timedelta(seconds=ttl),
+    )
+    session.add(proposal)
+    await session.flush()
+
+    for seq, leg in enumerate(legs):
+        session.add(
+            ProposalLeg(
+                proposal_id=proposal.id,
+                seq=seq,
+                ticker=str(leg["ticker"]),
+                side=Side(leg["side"]),
+                action=str(leg.get("action", "buy")),
+                limit_price=Decimal(str(leg["limit_price"])),
+                contracts=Decimal(str(leg["contracts"])),
+                fair_price=(
+                    None if leg.get("fair_price") is None
+                    else Decimal(str(leg["fair_price"]))
+                ),
+                est_fee_cents=(
+                    None if leg.get("est_fee_cents") is None
+                    else Decimal(str(leg["est_fee_cents"]))
+                ),
+            )
+        )
+    await session.flush()
+
+    await audit(
+        session,
+        kind="proposal.created",
+        ticker=proposal.ticker,
+        actor=actor,
+        payload={
+            "proposal_id": proposal.id,
+            "source": source,
+            "event_ticker": event_ticker,
+            "leg_count": len(legs),
+            "net_edge_cents": None if net_edge_cents is None else str(net_edge_cents),
+            "legs": legs,
+        },
+    )
+    await publish(proposal, event="created")
+    return proposal
 
 
 async def audit(

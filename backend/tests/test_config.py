@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from app.config import Config, DetectorsConfig, load_config
 
+
 def _find_shipped_config() -> Path:
     """Locate config.yaml from either the repo checkout or inside the image.
 
