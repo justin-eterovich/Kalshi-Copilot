@@ -1006,3 +1006,13 @@ td.ok {
 td.bad {
   color: var(--bad);
 }
+
+/* Sub-heading inside a panel that groups two related tables. */
+h3.sub {
+  margin: 14px 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+}

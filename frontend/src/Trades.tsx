@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import ApprovalCard from "./ApprovalCard";
+import EnginePanel from "./EnginePanel";
 import RiskPanel from "./RiskPanel";
 import {
   api,
@@ -23,6 +24,7 @@ import {
   type OrderRow,
   type PositionRow,
   type Proposal,
+  type EngineState,
   type RiskResponse,
   type SettlementRow,
   type SignalRow,
@@ -47,6 +49,7 @@ export default function Trades() {
   const [signals, setSignals] = useState<SignalRow[]>([]);
   const [risk, setRisk] = useState<RiskResponse | null>(null);
   const [settlements, setSettlements] = useState<SettlementRow[]>([]);
+  const [engine, setEngine] = useState<EngineState | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Null until the first poll lands — an empty set here would be read as "the
@@ -55,7 +58,7 @@ export default function Trades() {
 
   const load = useCallback(async () => {
     try {
-      const [s, p, o, pos, f, a, sig, r, settled] = await Promise.all([
+      const [s, p, o, pos, f, a, sig, r, settled, eng] = await Promise.all([
         api.tradingState(),
         api.proposals(),
         api.orders(),
@@ -65,6 +68,7 @@ export default function Trades() {
         api.signals(),
         api.risk(),
         api.settlements(),
+        api.engine(),
       ]);
       setState(s);
       setProposals(p.proposals);
@@ -75,6 +79,7 @@ export default function Trades() {
       setSignals(sig.signals);
       setRisk(r);
       setSettlements(settled.settlements);
+      setEngine(eng);
       setError(null);
 
       // A proposal lives about two minutes. If the tab is in the background
@@ -483,10 +488,18 @@ export default function Trades() {
                       {sg.created_at ? asClock(sg.created_at) : "—"}
                     </td>
                     <td className="mono">{sg.detector}</td>
+                    {/* Not every signal is about a market. The calibration
+                        screen reports on a price *band* and names itself
+                        BUCKET-5C, which has no market page to link to — a
+                        link there is a guaranteed 404. */}
                     <td className="mono">
-                      <Link to={`/market/${encodeURIComponent(sg.ticker)}`}>
-                        {sg.ticker}
-                      </Link>
+                      {sg.ticker.startsWith("BUCKET-") ? (
+                        <span className="muted">{sg.ticker}</span>
+                      ) : (
+                        <Link to={`/market/${encodeURIComponent(sg.ticker)}`}>
+                          {sg.ticker}
+                        </Link>
+                      )}
                     </td>
                     <td className={sg.side === "yes" ? "up" : "down"}>{sg.side}</td>
                     <td
@@ -507,6 +520,8 @@ export default function Trades() {
           </div>
         )}
       </section>
+
+      <EnginePanel engine={engine} />
 
       <section className="panel" style={{ marginTop: 12 }}>
         <h2>Audit trail</h2>

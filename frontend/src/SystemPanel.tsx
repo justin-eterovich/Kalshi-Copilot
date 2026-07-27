@@ -6,8 +6,10 @@ const MILESTONES: [string, string, boolean][] = [
   ["M2", "Dashboard core", true],
   ["M3", "HITL approval + execution rail", true],
   ["M4", "Detectors wave 1", true],
-  ["M5", "Risk layer + PWA notifications", false],
-  ["M6", "BTC engine + detectors wave 2", false],
+  // "in-tab alerts", not "PWA notifications": Web Push needs a secure
+  // context and the dashboard is plain HTTP on a LAN address by design.
+  ["M5", "Risk layer + in-tab alerts", true],
+  ["M6", "BTC vol engine + detectors wave 2", true],
   ["M7", "Weather engine", false],
   ["M8", "News + catalyst engine", false],
   ["M9", "Backtester + hardening", false],

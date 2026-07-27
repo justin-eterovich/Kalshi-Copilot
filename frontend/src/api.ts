@@ -306,6 +306,38 @@ export interface RiskResponse {
   limits: RiskLimits;
 }
 
+/**
+ * A spot feed the BTC-style detectors price against.
+ *
+ * `fresh` already accounts for staleness — a stale reference counts as absent,
+ * because comparing one to a live market invents an edge in whichever
+ * direction the market has already moved.
+ */
+export interface ReferenceFeed {
+  symbol: string;
+  price: string | null;
+  source: string | null;
+  age_sec: number | null;
+  fresh: boolean;
+}
+
+export interface CalibrationBucket {
+  cents: number;
+  settled: number;
+  ready: boolean;
+}
+
+export interface EngineState {
+  reference_feeds: ReferenceFeed[];
+  bitcoin_enabled: boolean;
+  calibration: {
+    observations: number;
+    settled: number;
+    min_samples: number;
+    buckets: CalibrationBucket[];
+  };
+}
+
 /** A market that resolved while we held a position in it. */
 export interface SettlementRow {
   ticker: string;
@@ -518,6 +550,8 @@ export const api = {
     getJson<{ entries: AuditEntry[] }>(`/api/audit?${qs({ kind, limit: 100 })}`),
 
   risk: () => getJson<RiskResponse>("/api/risk"),
+
+  engine: () => getJson<EngineState>("/api/engine"),
 
   settlements: () =>
     getJson<{ settlements: SettlementRow[] }>("/api/settlements?limit=50"),

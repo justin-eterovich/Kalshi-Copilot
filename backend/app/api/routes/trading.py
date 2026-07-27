@@ -32,7 +32,7 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Config, get_config
@@ -41,6 +41,8 @@ from app.core.logging import get_logger
 from app.db.base import session_scope
 from app.db.models import (
     AuditLog,
+    CalibrationLog,
+    ExternalPrice,
     Fill,
     Market,
     Order,
@@ -52,6 +54,7 @@ from app.db.models import (
     Settlement,
     Signal,
 )
+from app.detectors.stale_quote import REFERENCE_PREFIXES
 from app.kalshi.rest import KalshiApiError, KalshiRestClient
 from app.settings import Settings, get_settings
 from app.trading import proposals as prop
@@ -577,6 +580,88 @@ async def recent_settlements(
         )
     ).scalars().all()
     return {"settlements": [settlement_view(row) for row in rows]}
+
+
+@router.get("/engine")
+async def engine_state(session: SessionDep, config: ConfigDep) -> dict[str, Any]:
+    """Reference feeds and calibration coverage — the two things M6 gates on.
+
+    Both answer a question the dashboard could not otherwise answer: *why is a
+    detector silent?* A missing spot feed and an unmet sample floor are the
+    normal reasons, and they look identical to a broken detector unless the
+    state is shown.
+    """
+    now = datetime.now(UTC)
+    max_age = float(
+        getattr(config.detectors.stale_quote, "reference_max_age_sec", 5)
+    )
+
+    feeds: list[dict[str, Any]] = []
+    for symbol in sorted(set(REFERENCE_PREFIXES.values())):
+        row = (
+            await session.execute(
+                select(ExternalPrice)
+                .where(ExternalPrice.symbol == symbol)
+                .order_by(desc(ExternalPrice.ts))
+                .limit(1)
+            )
+        ).scalars().first()
+        age = None if row is None else (now - row.ts).total_seconds()
+        feeds.append(
+            {
+                "symbol": symbol,
+                "price": None if row is None else str(row.price),
+                "source": None if row is None else row.source,
+                "age_sec": age,
+                # Stale counts as absent. A stale reference against a live
+                # market invents an edge in whichever direction the market
+                # already moved.
+                "fresh": age is not None and age <= max_age,
+            }
+        )
+
+    total, settled = (
+        await session.execute(
+            select(
+                func.count(CalibrationLog.id),
+                func.count(CalibrationLog.settled_yes),
+            )
+        )
+    ).one()
+
+    buckets = (
+        await session.execute(
+            select(
+                CalibrationLog.price_bucket_cents,
+                func.count(CalibrationLog.id),
+            )
+            .where(CalibrationLog.settled_yes.isnot(None))
+            .group_by(CalibrationLog.price_bucket_cents)
+            .order_by(CalibrationLog.price_bucket_cents)
+        )
+    ).all()
+
+    floor = int(
+        getattr(
+            config.detectors.longshot_calibration,
+            "min_samples_before_signalling",
+            500,
+        )
+    )
+
+    return {
+        "reference_feeds": feeds,
+        "bitcoin_enabled": config.bitcoin.enabled,
+        "calibration": {
+            "observations": int(total or 0),
+            "settled": int(settled or 0),
+            "min_samples": floor,
+            "buckets": [
+                {"cents": int(b), "settled": int(n), "ready": int(n) >= floor}
+                for b, n in buckets
+            ],
+        },
+    }
 
 
 @router.get("/signals")
