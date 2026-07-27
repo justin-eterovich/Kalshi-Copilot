@@ -243,7 +243,11 @@ footer {
   padding: 10px 12px;
 }
 
+/* Both are spans, so they need to be blocks to stack — without this the
+   label and value render on one line as "ROUTEsimulated" and the
+   margin-top below silently does nothing. */
 .stat-label {
+  display: block;
   font-size: 10px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -251,6 +255,7 @@ footer {
 }
 
 .stat-value {
+  display: block;
   font-size: 18px;
   color: var(--text);
   margin-top: 2px;
