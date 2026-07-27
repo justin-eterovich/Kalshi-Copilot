@@ -14,13 +14,18 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
+from typing import Any
 
 from app.config import get_config
 from app.core.logging import configure_logging, get_logger
 from app.core.redis import beat, close_redis, get_redis
 from app.db.base import dispose_engine, get_session_factory
 from app.detectors.base import propose_finding, record
-from app.detectors.runner import SetArbitrageDetector
+from app.detectors.runner import (
+    ResolutionSniperDetector,
+    SetArbitrageDetector,
+    StaleQuoteDetector,
+)
 from app.kalshi.client import build_rest_client
 from app.settings import get_settings
 from app.trading.executor import Executor
@@ -77,9 +82,7 @@ async def _order_sweep_loop(executor: Executor, stop: asyncio.Event) -> None:
             await asyncio.wait_for(stop.wait(), timeout=ORDER_SWEEP_SEC)
 
 
-async def _detector_loop(
-    detectors: list[SetArbitrageDetector], stop: asyncio.Event
-) -> None:
+async def _detector_loop(detectors: list[Any], stop: asyncio.Event) -> None:
     """Scan with every enabled detector and record what they find.
 
     Detectors emit signals only. Nothing in this loop can create a proposal,
@@ -142,7 +145,11 @@ async def run() -> None:
 
     client = build_rest_client()
     executor = Executor(client, settings, config)
-    detectors = [SetArbitrageDetector(client)]
+    detectors: list[Any] = [
+        SetArbitrageDetector(client),
+        StaleQuoteDetector(client),
+        ResolutionSniperDetector(),
+    ]
     log.info("order maintenance ready (authenticated=%s)", client.authenticated)
     log.info(
         "detectors registered: %s",

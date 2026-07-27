@@ -49,6 +49,7 @@ from app.db.models import (
     Position,
     ProposalStatus,
     ProposedTrade,
+    Signal,
 )
 from app.kalshi.rest import KalshiApiError, KalshiRestClient
 from app.settings import Settings, get_settings
@@ -517,6 +518,46 @@ async def daily_pnl(
                 "realized_pnl_cents": str(row.realized_pnl_cents or Decimal(0)),
                 "fees_paid_cents": str(row.fees_paid_cents or Decimal(0)),
                 "trades": row.trades or 0,
+            }
+            for row in rows
+        ]
+    }
+
+
+@router.get("/signals")
+async def list_signals(
+    session: SessionDep,
+    detector: str | None = None,
+    limit: int = Query(50, ge=1, le=500),
+) -> dict[str, Any]:
+    """What the detectors have noticed.
+
+    A signal is not a recommendation and not all of them become proposals —
+    the resolution sniper deliberately emits research notes it will never act
+    on. ``net_edge_cents`` is always net of fees; a zero means the detector
+    declined to claim an edge rather than that it found one of zero.
+    """
+    stmt = select(Signal).order_by(desc(Signal.created_at)).limit(limit)
+    if detector:
+        stmt = stmt.where(Signal.detector == detector)
+    rows = (await session.execute(stmt)).scalars().all()
+
+    return {
+        "signals": [
+            {
+                "id": row.id,
+                "detector": row.detector,
+                "ticker": row.ticker,
+                "side": row.side.value,
+                "fair_price": str(row.fair_price),
+                "net_edge_cents": str(row.net_edge_cents),
+                "confidence": row.confidence,
+                "size_hint": None if row.size_hint is None else str(row.size_hint),
+                "rationale": row.rationale,
+                "evidence": row.evidence,
+                "created_at": (
+                    row.created_at.isoformat() if row.created_at else None
+                ),
             }
             for row in rows
         ]

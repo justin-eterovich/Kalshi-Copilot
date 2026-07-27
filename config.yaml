@@ -185,12 +185,41 @@ detectors:
   stale_quote:
     enabled: false
     min_net_edge_cents: 2.0
+    # A reference older than this is not used at all. Comparing a live market
+    # to a stale spot invents an edge in whichever direction the market has
+    # already moved — the very failure this detector hunts, pointed backwards.
     reference_max_age_sec: 5
+
+    # How far past its strike spot must sit before the outcome is treated as
+    # near-decided, and how close to close the market must be.
+    #
+    # This is a HEURISTIC, not a probability. There is no volatility model
+    # behind it yet (that is M6), and Bitcoin moves percent in minutes — so a
+    # margin that looks decisive over five minutes is not over thirty. Fair
+    # value is also capped below certainty, so the last cents of edge are
+    # never manufactured from an assumption of settlement.
+    decisive_margin_pct: 1.0
+    max_minutes_to_close: 30
+    size_hint: 10
 
   resolution_sniper:
     enabled: false
+    # Thresholds apply to the price you would actually PAY — the ask when
+    # buying YES — not the mid. A market quoted 96/99 is not a 97c chance.
     yes_threshold_cents: 97
     no_threshold_cents: 3
+
+    # RESEARCH ONLY until a settlement source exists.
+    #
+    # This detector finds markets past their close time that are still
+    # trading at an extreme. That is real settlement lag, and it is NOT an
+    # edge on its own: 98c is the crowd's opinion, and buying it because it
+    # is high is a 49:1 bet. Being wrong 3% of the time loses money steadily
+    # after fees.
+    #
+    # Signals stay non-actionable until an independent source confirms the
+    # outcome. Nothing wires one in yet — reading `settlement_sources` is
+    # M7/M8 work — so this emits notes to look at, never proposals.
     min_source_confidence: 0.95
 
   undervalued_screener:

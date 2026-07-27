@@ -26,6 +26,7 @@ from app.core.logging import configure_logging, get_logger
 from app.core.redis import beat, close_redis, get_redis
 from app.db.base import dispose_engine, get_session_factory
 from app.ingest.catalog import CatalogSync
+from app.ingest.spot import fetch_spot, record_spot
 from app.ingest.streams import StreamProcessor
 from app.kalshi.client import build_rest_client, build_websocket
 from app.kalshi.rest import KalshiRestClient
@@ -37,6 +38,9 @@ HEARTBEAT_INTERVAL_SEC = 15
 SERVICE = "ingest"
 #: Kalshi caps markets per subscription; keep full-depth sets modest.
 MAX_FULL_DEPTH_MARKETS = 100
+#: Spot is only useful to a detector while it is fresh, and the
+#: stale-quote detector's default tolerance is seconds.
+SPOT_POLL_SEC = 3
 
 
 async def _heartbeat_loop(stop: asyncio.Event) -> None:
@@ -164,6 +168,34 @@ async def _report_stats(processor: StreamProcessor, stop: asyncio.Event) -> None
         )
 
 
+async def _spot_loop(stop: asyncio.Event) -> None:
+    """Poll BTC spot into external_prices.
+
+    Only runs when the bitcoin engine is switched on. Detectors check the
+    *age* of the newest row rather than trusting it, so a poller that stalls
+    degrades to "no signals" instead of "signals against a stale price".
+    """
+    config = get_config()
+    if not config.bitcoin.enabled:
+        log.info("bitcoin spot feed disabled (bitcoin.enabled=false)")
+        return
+
+    sessions = get_session_factory()
+    source = config.bitcoin.spot_source
+    log.info("bitcoin spot feed: %s", source)
+
+    while not stop.is_set():
+        try:
+            price = await fetch_spot(source)
+            async with sessions() as session:
+                session.add(record_spot(source, price))
+                await session.commit()
+        except Exception as exc:  # noqa: BLE001 - never kill the loop
+            log.warning("spot fetch from %s failed: %s", source, exc)
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=SPOT_POLL_SEC)
+
+
 async def run() -> None:
     settings = get_settings()
     configure_logging(settings.log_level, settings.log_format)
@@ -191,6 +223,7 @@ async def run() -> None:
         asyncio.create_task(_heartbeat_loop(stop), name="heartbeat"),
         asyncio.create_task(_catalog_loop(client, stop), name="catalog"),
         asyncio.create_task(_stream_loop(stop), name="stream"),
+        asyncio.create_task(_spot_loop(stop), name="spot"),
     ]
 
     try:

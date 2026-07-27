@@ -1,8 +1,7 @@
-# M4 — detectors, wave 1 (in progress)
+# M4 — detectors, wave 1
 
-Set arbitrage is built and running against live books. The other two
-detectors in this milestone (resolution sniper, BTC stale-quote) are not
-started.
+All three detectors are built and have been run against live data: set
+arbitrage, BTC stale-quote, and the resolution sniper. All ship disabled.
 
 ---
 
@@ -152,13 +151,73 @@ Four, all found by running it rather than by tests:
    a working order that did not exist and the auto-cancel sweep would have
    gone looking for a ghost.
 
-## Not started in M4
+## Stale quote
 
-- **Resolution sniper.** Needs settlement-source monitoring.
-- **BTC stale-quote.** Needs an external spot feed (`bitcoin.spot_source`);
-  the full BTC engine is M6, but stale-quote needs at least spot.
-- **Signals in the UI.** They are recorded and published to
-  `copilot:signals`, but nothing renders them yet.
+Kalshi's crypto markets are strikes on a reference price, so this compares a
+**fresh, independent** BTC spot quote against the strike. `app/ingest/spot.py`
+polls Coinbase (public, no auth) into `external_prices` every 3s, and the
+detector checks the *age* of the newest row rather than trusting it — a stale
+reference against a live market manufactures an edge in whichever direction
+the market already moved, which is this detector's own failure mode pointed
+backwards.
+
+**It is a heuristic and the code says so.** "Decisively past the strike" is a
+fixed percentage from config, not a probability from a volatility model —
+that is M6. Two guards follow: both a minimum margin *and* a maximum time to
+close must hold, and fair value is capped at 0.98 rather than 1.00, so the
+last cents of edge are never manufactured from an assumption of settlement.
+`custom` strike types are refused outright; their rules live in prose and
+guessing is not an option.
+
+**Live result, and it is the interesting part.** With BTC at $65,244 and
+2,139 crypto markets closing within 30 minutes, **1,860 strikes were
+decisively past spot — and not one had a genuine two-sided quote.** Market
+makers pull their quotes once the outcome is determined. The free money is
+absent because the market is absent, which is exactly what you would hope to
+find and exactly what a naive version of this detector would have missed by
+reading a one-sided book as a price.
+
+## Resolution sniper
+
+Finds markets whose close time has passed but which are still trading at an
+extreme. 18 such markets existed during testing, so the structural lag is
+real.
+
+**It deliberately refuses to call that an edge.** A market at 98c is the
+crowd's opinion, and buying it because it is high is a 49:1 bet — being wrong
+3% of the time loses money steadily after fees. That is the shape of every
+blown-up longshot book. So the detector separates two things the original
+config conflated:
+
+1. *structural lag* — close has passed and the market is still active, an
+   observable fact;
+2. *knowing the outcome* — which needs a settlement source, not a price.
+
+Without (2) it emits research signals at capped confidence (≤0.35) and
+`net_edge_cents = 0`, and `LagCandidate.actionable` is False. No amount of
+waiting raises it; only a confirmed source would, and nothing wires one in
+yet — reading `settlement_sources` is M7/M8 work.
+
+Its thresholds also apply to the price you would actually **pay** (the ask
+when buying YES), not the mid. A market quoted 96/99 is not a 97c chance.
+
+## Signals in the UI
+
+`GET /api/signals` and a panel on the trades page. Signals are labelled as
+observations rather than recommendations, and a `net_edge_cents` of zero
+renders as `—` rather than `+0.00¢`, because it means the detector declined
+to claim an edge — not that it found one worth nothing.
+
+## Not finished
+
+- **No detector has ever produced a signal against live data.** All three
+  correctly found nothing, which is the right answer on liquid two-sided
+  books, but it means the signal → proposal → approval path has only been
+  exercised with a hand-built proposal. The first real signal is still ahead.
+- **The resolution sniper cannot act at all** until a settlement source
+  exists. It is a research feed by construction.
+- **No volatility model**, so stale-quote's margin threshold is a guess with
+  a safety factor rather than a probability. M6.
 
 ---
 

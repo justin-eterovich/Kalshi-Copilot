@@ -13,6 +13,7 @@ import {
   api,
   asClock,
   asDollars,
+  asSignedCents,
   centsNum,
   routeLabel,
   type AuditEntry,
@@ -20,6 +21,7 @@ import {
   type OrderRow,
   type PositionRow,
   type Proposal,
+  type SignalRow,
   type TradingState,
 } from "./api";
 import { useLiveFeed } from "./useLiveFeed";
@@ -37,17 +39,19 @@ export default function Trades() {
   const [positions, setPositions] = useState<PositionRow[]>([]);
   const [fills, setFills] = useState<FillRow[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
+  const [signals, setSignals] = useState<SignalRow[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const [s, p, o, pos, f, a] = await Promise.all([
+      const [s, p, o, pos, f, a, sig] = await Promise.all([
         api.tradingState(),
         api.proposals(),
         api.orders(),
         api.positions(),
         api.fills(),
         api.audit(),
+        api.signals(),
       ]);
       setState(s);
       setProposals(p.proposals);
@@ -55,6 +59,7 @@ export default function Trades() {
       setPositions(pos.positions);
       setFills(f.fills);
       setAudit(a.entries);
+      setSignals(sig.signals);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -342,6 +347,64 @@ export default function Trades() {
           )}
         </section>
       </div>
+
+      <section className="panel" style={{ marginTop: 12 }}>
+        <div className="panel-head">
+          <h2>Detector signals</h2>
+          <span className="muted">
+            observations, not recommendations — some never become proposals
+          </span>
+        </div>
+        {signals.length === 0 ? (
+          <Empty>
+            Nothing yet. Detectors ship disabled; enable one at a time in{" "}
+            <code>config.yaml</code> and let the report card earn your trust.
+          </Empty>
+        ) : (
+          <div className="table-scroll">
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>time</th>
+                  <th>detector</th>
+                  <th>ticker</th>
+                  <th>side</th>
+                  <th className="num">net edge</th>
+                  <th className="num">conf</th>
+                  <th>why</th>
+                </tr>
+              </thead>
+              <tbody>
+                {signals.map((sg) => (
+                  <tr key={sg.id}>
+                    <td className="muted">
+                      {sg.created_at ? asClock(sg.created_at) : "—"}
+                    </td>
+                    <td className="mono">{sg.detector}</td>
+                    <td className="mono">
+                      <Link to={`/market/${encodeURIComponent(sg.ticker)}`}>
+                        {sg.ticker}
+                      </Link>
+                    </td>
+                    <td className={sg.side === "yes" ? "up" : "down"}>{sg.side}</td>
+                    <td
+                      className={
+                        Number(sg.net_edge_cents) > 0 ? "num up" : "num"
+                      }
+                    >
+                      {Number(sg.net_edge_cents) === 0
+                        ? "—"
+                        : asSignedCents(sg.net_edge_cents)}
+                    </td>
+                    <td className="num">{(sg.confidence * 100).toFixed(0)}%</td>
+                    <td className="audit-detail">{sg.rationale}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
 
       <section className="panel" style={{ marginTop: 12 }}>
         <h2>Audit trail</h2>

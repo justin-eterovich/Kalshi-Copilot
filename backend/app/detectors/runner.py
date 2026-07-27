@@ -1,4 +1,9 @@
-"""The set-arbitrage detector: scanning live events for costed set trades.
+"""The live detectors: set arbitrage, stale quote, resolution sniper.
+
+Each wraps pure math with what it needs from the world, and each is
+written to refuse rather than guess when the world does not supply it.
+
+Set arbitrage: scanning live events for costed set trades.
 
 Wraps the pure math in :mod:`app.detectors.set_arbitrage` with everything it
 needs from the world — which events are exclusive, what their books look like
@@ -35,7 +40,11 @@ from app.kalshi.rest import KalshiApiError, KalshiRestClient
 
 log = get_logger(__name__)
 
-__all__ = ["SetArbitrageDetector"]
+__all__ = [
+    "SetArbitrageDetector",
+    "StaleQuoteDetector",
+    "ResolutionSniperDetector",
+]
 
 #: Set sizes to price, largest first. A bigger set walks deeper into the book
 #: and earns less per contract, so the best size is rarely the biggest.
@@ -236,3 +245,215 @@ class SetArbitrageDetector:
                 )
             )
         return books
+
+
+class StaleQuoteDetector:
+    """Crypto strikes the spot price has decisively cleared.
+
+    Needs a *fresh* independent spot quote. Without one it emits nothing —
+    comparing a live market to a stale reference invents an edge in whichever
+    direction the market already moved.
+    """
+
+    name = "stale_quote"
+
+    def __init__(self, rest: KalshiRestClient | None) -> None:
+        self._rest = rest
+
+    def enabled(self, config: Config) -> bool:
+        return bool(getattr(config.detectors.stale_quote, "enabled", False))
+
+    async def scan(self, session: AsyncSession, config: Config) -> list[Finding]:
+        from datetime import UTC, datetime, timedelta
+
+        from sqlalchemy import desc
+
+        from app.core.fees import net_edge_cents
+        from app.db.models import ExternalPrice
+        from app.detectors.stale_quote import (
+            decisive_fair_price,
+            reference_is_fresh,
+            resolve_strike,
+        )
+
+        cfg = config.detectors.stale_quote
+        max_age = float(getattr(cfg, "reference_max_age_sec", 5))
+        min_margin = Decimal(str(getattr(cfg, "decisive_margin_pct", 1.0)))
+        max_minutes = float(getattr(cfg, "max_minutes_to_close", 30))
+        min_edge = Decimal(str(getattr(cfg, "min_net_edge_cents", 2.0)))
+
+        latest = (
+            await session.execute(
+                select(ExternalPrice)
+                .where(ExternalPrice.symbol == "BTC-USD")
+                .order_by(desc(ExternalPrice.ts))
+                .limit(1)
+            )
+        ).scalars().first()
+
+        if latest is None or not reference_is_fresh(latest.ts, max_age_sec=max_age):
+            log.debug("stale_quote: no fresh BTC reference; emitting nothing")
+            return []
+
+        spot = latest.price
+        horizon = datetime.now(UTC) + timedelta(minutes=max_minutes)
+        markets = (
+            await session.execute(
+                select(Market).where(
+                    Market.status == "active",
+                    Market.category == "Crypto",
+                    Market.close_time.isnot(None),
+                    Market.close_time <= horizon,
+                    Market.close_time > datetime.now(UTC),
+                    Market.yes_ask.isnot(None),
+                )
+            )
+        ).scalars().all()
+
+        schedule = load_fee_schedule()
+        slippage = Decimal(str(config.costs.slippage_buffer_cents))
+        findings: list[Finding] = []
+
+        for market in markets:
+            verdict = resolve_strike(
+                strike_type=market.strike_type,
+                floor_strike=market.floor_strike,
+                cap_strike=market.cap_strike,
+                spot=spot,
+            )
+            if verdict is None:
+                continue
+            fair = decisive_fair_price(verdict, min_margin_pct=min_margin)
+            if fair is None:
+                continue
+
+            # Buy the side the spot says is right, at what it actually costs.
+            if verdict.yes:
+                side, price = Side.YES, market.yes_ask
+            else:
+                side, price = Side.NO, (
+                    None if market.yes_bid is None else Decimal(1) - market.yes_bid
+                )
+                fair = Decimal(1) - fair
+            if price is None or not (Decimal(0) < price < Decimal(1)):
+                continue
+
+            mins_left = (
+                market.close_time - datetime.now(UTC)
+            ).total_seconds() / 60
+            size = Decimal(str(getattr(cfg, "size_hint", 10)))
+            edge = net_edge_cents(
+                fair, price, size, series_of(market.ticker),
+                slippage_cents=slippage, schedule=schedule,
+            )
+            if edge < min_edge:
+                continue
+
+            findings.append(
+                Finding(
+                    detector=self.name,
+                    ticker=market.ticker,
+                    side=side,
+                    fair_price=fair,
+                    net_edge_cents=edge,
+                    # Bounded well below certainty: this is a fixed-margin
+                    # heuristic, not a probability from a vol model. That
+                    # arrives in M6.
+                    confidence=min(0.75, 0.4 + float(verdict.margin_pct) / 20.0),
+                    size_hint=size,
+                    rationale=(
+                        f"spot {spot} is {verdict.margin_pct:.2f}% past the "
+                        f"{market.strike_type} strike with "
+                        f"{mins_left:.0f}m left; {side.value} quoted at {price}"
+                    ),
+                    evidence={
+                        "spot": str(spot),
+                        "spot_source": latest.source,
+                        "spot_ts": latest.ts.isoformat() if latest.ts else None,
+                        "strike_type": market.strike_type,
+                        "floor_strike": str(market.floor_strike),
+                        "cap_strike": str(market.cap_strike),
+                        "margin_pct": str(verdict.margin_pct),
+                        "fair_price": str(fair),
+                        "price": str(price),
+                        "heuristic": "fixed margin, not a volatility model",
+                    },
+                )
+            )
+
+        return findings
+
+
+class ResolutionSniperDetector:
+    """Markets past close and still trading at an extreme.
+
+    Emits research signals only. Turning one into a proposal needs a
+    settlement source confirming the outcome, and nothing wires one in yet —
+    a price of 98c is the crowd's opinion, and buying it because it is high
+    is a 49:1 bet rather than an arbitrage.
+    """
+
+    name = "resolution_sniper"
+
+    def enabled(self, config: Config) -> bool:
+        return bool(getattr(config.detectors.resolution_sniper, "enabled", False))
+
+    async def scan(self, session: AsyncSession, config: Config) -> list[Finding]:
+        from datetime import UTC, datetime
+
+        from app.detectors.resolution_sniper import assess
+
+        cfg = config.detectors.resolution_sniper
+        yes_threshold = Decimal(str(getattr(cfg, "yes_threshold_cents", 97)))
+        no_threshold = Decimal(str(getattr(cfg, "no_threshold_cents", 3)))
+
+        markets = (
+            await session.execute(
+                select(Market).where(
+                    Market.status == "active",
+                    Market.close_time.isnot(None),
+                    Market.close_time < datetime.now(UTC),
+                )
+            )
+        ).scalars().all()
+
+        findings: list[Finding] = []
+        for market in markets:
+            candidate = assess(
+                ticker=market.ticker,
+                yes_bid=market.yes_bid,
+                yes_ask=market.yes_ask,
+                close_time=market.close_time,
+                yes_threshold_cents=yes_threshold,
+                no_threshold_cents=no_threshold,
+            )
+            if candidate is None:
+                continue
+
+            findings.append(
+                Finding(
+                    detector=self.name,
+                    ticker=candidate.ticker,
+                    side=Side.YES if candidate.side == "yes" else Side.NO,
+                    fair_price=candidate.price,
+                    # No settlement source, so no edge is claimed. Reporting a
+                    # number here would be inventing one from the price.
+                    net_edge_cents=Decimal(0),
+                    confidence=candidate.confidence,
+                    rationale=(
+                        f"past close by {candidate.minutes_past_close:.0f}m and "
+                        f"still quoted at {candidate.price} on the "
+                        f"{candidate.side} side. RESEARCH ONLY — no settlement "
+                        f"source confirms the outcome, and price is not proof."
+                    ),
+                    evidence={
+                        "minutes_past_close": candidate.minutes_past_close,
+                        "side": candidate.side,
+                        "price": str(candidate.price),
+                        "source_confirmed": candidate.source_confirmed,
+                        "actionable": candidate.actionable,
+                    },
+                )
+            )
+
+        return findings

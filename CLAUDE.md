@@ -194,8 +194,10 @@ backend/app/
     backfill.py      REST read-through for the market page
   detectors/
     set_arbitrage.py ⭐ pure set-arb math; sell side is safe, buy side is not
-    base.py          Detector protocol; detectors emit signals, never orders
-    runner.py        the live set-arb detector + exhaustiveness gate
+    stale_quote.py   spot-vs-strike; heuristic margin, no vol model yet
+    resolution_sniper.py  settlement lag; research only without a source
+    base.py          Detector protocol + signal recording
+    runner.py        the live detectors, each with its refusal rules
   trading/
     direction.py     ⭐ (side, action) <-> bid/ask. Never inline this.
     interlocks.py    execution routing + every safety check
@@ -247,7 +249,7 @@ a liquidity score of −450 on a 0–100 scale, fractional sizes rendering as
 | M1 ingest + storage | done |
 | M2 dashboard core | done |
 | M3 HITL approval/execution rail | done |
-| M4 detectors wave 1 | set-arb done; sniper + BTC pending |
+| M4 detectors wave 1 | done (all three; none has signalled live yet) |
 | M5 risk layer + PWA notifications | pending |
 | M6 BTC engine + detectors wave 2 | pending |
 | M7 weather engine | pending |

@@ -276,6 +276,21 @@ export interface PositionRow {
   updated_at: string | null;
 }
 
+export interface SignalRow {
+  id: number;
+  detector: string;
+  ticker: string;
+  side: string;
+  fair_price: string;
+  /** Always net of fees. Zero means the detector declined to claim an edge. */
+  net_edge_cents: string;
+  confidence: number;
+  size_hint: string | null;
+  rationale: string | null;
+  evidence: Record<string, unknown> | null;
+  created_at: string | null;
+}
+
 export interface AuditEntry {
   id: number;
   ts: string | null;
@@ -433,6 +448,9 @@ export const api = {
     getJson<{ fills: FillRow[] }>(`/api/fills?${qs({ ticker, limit: 100 })}`),
 
   positions: () => getJson<{ positions: PositionRow[] }>("/api/positions"),
+
+  signals: (detector?: string) =>
+    getJson<{ signals: SignalRow[] }>(`/api/signals?${qs({ detector, limit: 50 })}`),
 
   audit: (kind?: string) =>
     getJson<{ entries: AuditEntry[] }>(`/api/audit?${qs({ kind, limit: 100 })}`),
