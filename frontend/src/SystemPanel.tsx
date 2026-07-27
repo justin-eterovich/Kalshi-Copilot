@@ -5,7 +5,7 @@ const MILESTONES: [string, string, boolean][] = [
   ["M1", "Ingest + storage", true],
   ["M2", "Dashboard core", true],
   ["M3", "HITL approval + execution rail", true],
-  ["M4", "Detectors wave 1", false],
+  ["M4", "Detectors wave 1", true],
   ["M5", "Risk layer + PWA notifications", false],
   ["M6", "BTC engine + detectors wave 2", false],
   ["M7", "Weather engine", false],

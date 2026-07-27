@@ -260,17 +260,26 @@ Branch: `claude/kalshi-copilot-build-bgyv2d`
 
 ### Open items for the operator
 
-- **M3 ran against a live stack** (portable Postgres + Redis, real ingest
-  against the Kalshi demo REST API, 125k markets). That found four bugs the
-  test suite had passed — see `docs/m3-demo-notes.md`. Two gaps remain: **no
-  demo order has ever been placed** (no credentials on the build machine, so
-  only the `simulated` route was exercised) and **no UI screenshots** (no
-  browser). Do both on the test VM before trusting M3.
-- `data/fee_schedule.yaml` has `crypto: null` → ~5,900 Crypto markets are
-  excluded from proposals until verified against the official PDF. Blocks the
-  BTC detector in M4. It also means **Crypto markets cannot be proposed at
-  all** — the trade ticket refuses them with a visible banner, which is a
-  good way to see the fail-closed path working.
+- **No detector has ever produced a signal against live data.** All three
+  were run and all three correctly found nothing — the right answer on
+  liquid two-sided books — but it means the signal → proposal → approval
+  path has only been exercised with a hand-built proposal. Watch the first
+  real one closely.
+- **Risk limits are displayed but not enforced.** `max_pct_per_market`,
+  `max_total_exposure_pct` and `daily_loss_limit_pct` do nothing yet; the
+  approval card shows `pct_of_bankroll` and that is the only brake besides
+  your own judgement. This matters more now that detectors can generate
+  proposals. It is M5.
+- **The watchlist goes stale.** Set arbitrage only considers events where
+  *every* active leg is in `ingest.watchlist`, so as events settle the
+  coverage decays. Regenerate from the top mutually-exclusive events by 24h
+  volume; the cap is 100 markets.
+- **No migrations.** `create_all` plus a boot-time enum-label sync. Schema
+  changes still need tables dropped by hand, and the trading tables have
+  changed shape several times.
+- `bitcoin.enabled: true` is what starts the spot poller. Without it the
+  stale-quote detector has no reference and emits nothing.
+
 - Notifications are **first-party only** (PWA Web Push, audio, favicon
   badge). The original spec mentioned ntfy/Telegram once in a milestone list;
   that contradicts two more detailed sections and was resolved as a drafting

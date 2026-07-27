@@ -23,8 +23,8 @@ model-driven fair value.
 | **M1** | Ingest + storage | ✅ done |
 | **M2** | Dashboard core (screener, market page, charts) | ✅ done |
 | **M3** | HITL approval + execution rail | ✅ done |
-| M4 | Detectors wave 1 (set-arb, resolution sniper, BTC stale-quote) | pending |
-| M5 | Risk layer + PWA notifications | pending |
+| **M4** | Detectors wave 1 (set-arb, resolution sniper, BTC stale-quote) | ✅ done |
+| M5 | Risk layer + PWA notifications | **next** |
 | M6 | BTC engine + detectors wave 2 | pending |
 | M7 | Weather engine | pending |
 | M8 | News + catalyst engine | pending |
@@ -196,6 +196,82 @@ money gets deployed.
 
 ---
 
+## Detectors
+
+**All ship disabled.** Enable one at a time in `config.yaml` and let the
+report card earn your trust before it earns your money.
+
+```yaml
+detectors:
+  set_arbitrage:
+    enabled: true
+```
+
+then `docker compose restart worker`.
+
+A detector emits **signals**, visible on the trades page and at
+`GET /api/signals`. A signal is an observation, not a recommendation, and not
+all of them can become trades. Every `net_edge_cents` is net of fees; a zero
+means the detector *declined* to claim an edge, not that it found one worth
+nothing.
+
+### Set arbitrage
+
+Prices whole mutually-exclusive events against their live books.
+
+Kalshi's `mutually_exclusive` flag means **at most one leg resolves YES** —
+not exactly one. That asymmetry is the whole design:
+
+- **Selling every leg** collects `Σ bids` and pays out at most $1, so it is
+  riskless on exclusivity alone. Enabled.
+- **Buying every leg** returns $1 only if *some* leg wins, which needs the
+  set to be **exhaustive** — and nothing in the API says that. `KXNEWPOPE-70`
+  is exclusive, lists 7 candidates, and their asks sum to $4.12. Buying that
+  set for 99¢ would lose everything if an eighth won.
+
+So the buy side runs only for series you name in `exhaustive_series`, which
+ships empty. Each entry is a claim about the world the exchange never made.
+
+A set arb is one decision needing several orders, so it produces a
+**multi-leg proposal** — approved as a unit, placed in one batch with IOC.
+Kalshi has no atomic multi-order primitive, so a partial outcome is possible;
+it becomes `PARTIAL` with an explicit `UNBALANCED: n of m legs executed`,
+because that is a directional position nobody chose.
+
+It needs full depth on **every** leg, so `ingest.watchlist` must cover the
+whole event. A set priced from partial coverage is not a set.
+
+### BTC stale quote
+
+Compares a fresh independent spot price against a crypto strike. Spot is
+polled from Coinbase into `external_prices` (set `bitcoin.enabled: true`),
+and the detector checks the *age* of the newest observation rather than
+trusting it — a stale reference against a live market invents an edge in
+whichever direction the market already moved.
+
+This is a **heuristic, not a probability**. "Decisively past the strike" is a
+fixed percentage (`decisive_margin_pct`), not output from a volatility model;
+that arrives in M6. So it requires both a margin *and* a short time to close,
+and caps fair value at 0.98 rather than 1.00. `custom` strike types are
+refused — their rules live in prose.
+
+### Resolution sniper
+
+Finds markets past their close time that are still trading at an extreme.
+That structural lag is real. **It is not an edge on its own**, and this
+detector refuses to pretend otherwise: 98¢ is the crowd's opinion, and buying
+it because it is high is a 49:1 bet — being wrong 3% of the time loses money
+steadily after fees.
+
+Signals are **research only**, capped at 0.35 confidence with no edge
+claimed, until an independent settlement source confirms the outcome. Nothing
+wires one in yet (that is M7/M8), so today it never produces a proposal.
+
+Its thresholds apply to the price you would actually **pay** — the ask when
+buying YES — not the mid. A market quoted 96/99 is not a 97¢ chance.
+
+---
+
 ## Going live
 
 Live trading is deliberately awkward to enable. All three must be true:
@@ -270,10 +346,17 @@ backend/app/
     orderbook.py     local book reconstruction, gap detection
     client.py        factories wiring settings -> clients
   ingest/
-    main.py          service entrypoint (catalog + stream + flush loops)
+    main.py          service entrypoint (catalog + stream + spot + flush loops)
+    spot.py          external BTC spot reference (public endpoints)
     catalog.py       series/events/markets sync, category backfill
     normalize.py     API payloads -> ORM rows
     streams.py       tape, candles, book snapshots
+  detectors/
+    set_arbitrage.py ⭐ set-arb math; sell side safe, buy side needs exhaustive
+    stale_quote.py   spot vs strike; heuristic margin, no vol model yet
+    resolution_sniper.py  settlement lag; research only without a source
+    base.py          detector protocol + signal recording
+    runner.py        the live detectors and their refusal rules
   trading/
     direction.py     ⭐ (side, action) <-> Kalshi's single bid/ask book
     interlocks.py    execution routing + every safety check
@@ -526,6 +609,7 @@ python -m pytest tests/ -v
 | Paper never hits prod | Paper mode routes to the simulator on a prod environment rather than trading it. |
 | Live never degrades | `mode: live` without the env interlocks refuses, rather than silently trading on paper. |
 | Proposal TTL | A proposal expires (120s default) and cannot then be approved. Checked at approval, not just by the sweep. |
+| Multi-leg all-or-none | A set arb is one proposal. Execution is *not* atomic — Kalshi has no such primitive — so legs go out in one IOC batch and any imbalance is reported as `PARTIAL`, never hidden. |
 | No write retries | A timed-out order POST may have been accepted, so it raises instead of retrying. Recovery is reconciliation by client order ID. |
 | Kill switch | Halts all proposals and cancels resting orders. |
 | Detector flags | Each detector independently enabled; all off by default. |
