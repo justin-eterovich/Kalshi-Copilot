@@ -92,6 +92,28 @@ class KalshiWebSocket:
 
     # -- public API ------------------------------------------------------
 
+    async def force_reconnect(self, reason: str) -> None:
+        """Drop the socket so the stream loop reconnects and resubscribes.
+
+        The only way to get a fresh ``orderbook_snapshot`` for a market whose
+        local book has gone stale. Kalshi sends one on subscribe, so a
+        reconnect is a resubscribe is a snapshot — and it is a path this
+        client already exercises on every disconnect, rather than a
+        per-subscription resubscribe command guessed at from the outside.
+
+        It invalidates *every* book for a moment. That is the cost, and it is
+        much smaller than the alternative: a book that goes stale and stays
+        stale answers nothing for the rest of the process's life, and it stops
+        being recorded at all — which is how this deployment ended up with 28
+        of its watched markets writing no snapshots.
+        """
+        conn = self._connection
+        if conn is None:
+            return
+        log.warning("forcing websocket reconnect: %s", reason)
+        with contextlib.suppress(Exception):
+            await conn.close()
+
     def subscribe(self, channels: list[str], tickers: list[str] | None = None) -> None:
         """Register a subscription. Takes effect on the next (re)connect."""
         self.subscriptions.append(

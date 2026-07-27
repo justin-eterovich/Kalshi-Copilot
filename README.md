@@ -28,7 +28,7 @@ model-driven fair value.
 | **M6** | BTC volatility engine + detectors wave 2 | ✅ done |
 | **M7** | Weather engine (NWS forecast + measured error) | ✅ done |
 | **M8** | News + catalyst engine | ✅ done |
-| M9 | Backtester, report card, hardening | **next** |
+| **M9** | Backtester, report card, hardening | ✅ done |
 
 ---
 
@@ -401,6 +401,75 @@ the client sends no `units` parameter at all.
 
 ---
 
+## The backtester and the report card
+
+Two ways to ask "does this actually work?", and both are built to answer *no*
+when the honest answer is "we cannot tell yet".
+
+### The report card
+
+`GET /api/report-card`, and a panel on the trades page. Per detector, per
+route: signals emitted, proposals created, what the operator decided, fills,
+and realised P&L net of fees — beside the edge the detector *claimed*. The gap
+between the two is the interesting column.
+
+No verdict is reported below `backtest.report_card_min_trades` closed
+decisions, whatever the mean looks like, and no verdict reads as an edge
+unless the confidence interval excludes zero.
+
+Three things make the numbers deliberately worse:
+
+- **One approval is one observation**, however many legs it had. A five-leg
+  arbitrage is one thesis with one outcome; counting the legs would narrow
+  the interval by √5 on perfectly correlated results.
+- **Routes are never summed.** A simulated fill and a demo-exchange fill are
+  different evidence.
+- **Ambiguous outcomes are dropped, not split.** When two detectors have
+  traded the same market on the same route there is no defensible way to
+  divide the settlement between them.
+
+The interval is a seeded percentile bootstrap rather than the usual normal
+approximation, because a binary trade's P&L is a two-point distribution and
+badly skewed away from 50c — which is exactly the regime a twenty-trade report
+card lives in. On a real-shaped sample of 29 wins at +9.98c and one loss at
+−90.02c, the normal interval claims an edge and the bootstrap refuses.
+
+### The backtester
+
+```bash
+docker compose run --rm --no-deps api python scripts/backtest.py --days 30
+```
+
+Replays stored orderbook snapshots through a strategy, fills against
+`app/trading/paper.py` — the same pessimistic simulator live paper trading
+uses, deliberately not a friendlier one — and settles from the market's own
+`result`, which is the only field in this system that is not a forecast.
+
+**It will usually refuse.** Kalshi publishes no historical orderbook, so the
+only book data that will ever exist for a past moment is the snapshot ingest
+happened to take. The coverage audit runs *before* the replay and names each
+measured number against its threshold — 79 markets against a floor of 200, a
+9.8-hour span against 30 days — because "insufficient data" does not tell you
+whether to wait a week or change the config.
+
+It refuses on more than volume. `survivorship` fires when *every* market in
+the sample settled, which sounds like a good thing and is not: it means the
+sample was drawn from markets that resolved inside the window, i.e. the
+short-dated ones. `gaps_too_large` fires when the typical sampling interval is
+far from the expected one, because a replay across a hole assumes the book did
+not move — the same failure the orderbook sequence-gap guard exists to catch.
+
+`--ignore-coverage` replays anyway, which is a reasonable thing to want while
+writing a strategy. The refusals stay attached to the result, and the result
+is not evidence.
+
+Look-ahead is blocked structurally rather than by care: the observation stream
+must be sorted and is verified, settlement outcomes live in a mapping the
+strategy is never handed, and acting on a market after it settled raises
+rather than producing a number.
+
+---
+
 ## Going live
 
 Live trading is deliberately awkward to enable. All three must be true:
@@ -494,10 +563,18 @@ backend/app/
     executor.py      ⭐ the only module that can cause an order to exist
     paper.py         pessimistic fill simulator
     positions.py     signed position + realised P&L accounting
+    settlements.py   ⭐ held-to-resolution P&L; two books, two sources
+  backtest/
+    coverage.py      ⭐ refuses a backtest whose data cannot support one
+    replay.py        pure event replay; look-ahead blocked structurally
+    stats.py         expectancy + bootstrap CI, Brier, drawdown, verdict
+    engine.py        the only part of the backtester that runs SQL
+    report.py        per-detector report card over real fills and settlements
   api/routes/        HTTP endpoints
   worker/
     main.py          worker service entrypoint
     maintenance.py   proposal expiry, order auto-cancel, reconciliation
+    calibration.py   price-vs-outcome observations for the longshot screen
 backend/tests/       pytest suite
 frontend/            React + Vite + TS dashboard
 data/                fee_schedule.yaml

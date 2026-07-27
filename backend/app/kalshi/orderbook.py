@@ -81,6 +81,15 @@ class OrderBook:
         price = parse_dollars(msg["price_dollars"], "price_dollars")
         delta = parse_count(msg["delta_fp"], "delta_fp")
         side = str(msg.get("side", "")).lower()
+        if side not in ("yes", "no"):
+            # An `else: self.no` fallthrough applied the delta to the NO book,
+            # advanced the sequence, and left `stale` False — so the book went
+            # on reporting itself trustworthy while carrying levels that were
+            # never quoted. The gap machinery cannot catch that, because no
+            # sequence was skipped. Kalshi's asyncapi constrains this field to
+            # yes/no today; this refuses if that ever stops being true.
+            self.mark_stale(f"unknown book side {side!r}")
+            return False
 
         book = self.yes if side == "yes" else self.no
         new_size = book.get(price, Decimal(0)) + delta

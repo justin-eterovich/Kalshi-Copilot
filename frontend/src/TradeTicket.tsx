@@ -47,10 +47,12 @@ function suggestedPrice(market: MarketDetail, side: Side, action: Action): strin
   }
   const price = action === "buy" ? market.no_ask : market.no_bid;
   if (price) return price;
-  // NO quotes can be absent even when YES ones are not; derive rather than
-  // leave the operator with an empty field.
-  const source = action === "buy" ? yesBid : yesAsk;
-  if (source) return (1 - Number(source)).toFixed(4);
+  // No fallback derivation here on purpose. This used to compute
+  // `(1 - Number(source)).toFixed(4)` — a float round trip whose result went
+  // straight into `limit_price`, and a truncation to 4dp on an API that
+  // carries 6. The API now derives the NO side exactly in Decimal and sends
+  // it as a string, so an absent quote here means the YES side was absent
+  // too and there is genuinely nothing to suggest.
   return "0.50";
 }
 

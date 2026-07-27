@@ -18,7 +18,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, literal_column, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -51,8 +51,6 @@ class CatalogSync:
         max_pages: int | None = None,
     ) -> tuple[int, int]:
         """Upsert markets. Returns ``(seen, newly_listed)``."""
-        known = await self._known_tickers(session)
-
         batch: list[dict[str, Any]] = []
         seen = 0
         new_tickers: list[str] = []
@@ -70,19 +68,16 @@ class CatalogSync:
                 continue
 
             seen += 1
-            if row["ticker"] not in known:
-                new_tickers.append(row["ticker"])
-
             batch.append(row)
             if len(batch) >= BATCH_SIZE:
-                await self._upsert_markets(session, batch)
+                new_tickers.extend(await self._upsert_markets(session, batch))
                 # Commit per batch: a full sync walks tens of thousands of
                 # markets, and an interrupted run should keep what it got.
                 await session.commit()
                 batch.clear()
 
         if batch:
-            await self._upsert_markets(session, batch)
+            new_tickers.extend(await self._upsert_markets(session, batch))
 
         await session.commit()
 
@@ -97,15 +92,24 @@ class CatalogSync:
         )
         return seen, len(new_tickers)
 
-    async def _known_tickers(self, session: AsyncSession) -> set[str]:
-        result = await session.execute(select(Market.ticker))
-        return set(result.scalars().all())
-
     async def _upsert_markets(
         self, session: AsyncSession, rows: list[dict[str, Any]]
-    ) -> None:
+    ) -> list[str]:
+        """Upsert a batch and return the tickers that were genuinely new.
+
+        The previous version answered "is this new?" by loading **every
+        ticker in the catalog** into a Python set on each sync — 217,258 rows
+        every 300 seconds, growing with the catalog forever, to detect a
+        handful of listings. The upsert already knows: Postgres exposes
+        ``xmax = 0`` on a ``RETURNING`` row when that row was inserted rather
+        than updated, so the answer comes back with the write for free.
+
+        ``xmax`` is a system column and this is Postgres-specific. That is
+        fine — the whole stack is Postgres/TimescaleDB — but it is the reason
+        this is written out rather than left to look like ordinary SQL.
+        """
         if not rows:
-            return
+            return []
         stmt = insert(Market).values(rows)
         # first_seen_at is deliberately excluded: it must survive updates so
         # the "new listing" signal stays meaningful.
@@ -114,9 +118,12 @@ class CatalogSync:
             for c in Market.__table__.columns
             if c.name not in ("ticker", "first_seen_at")
         }
-        await session.execute(
-            stmt.on_conflict_do_update(index_elements=[Market.ticker], set_=update_cols)
+        result = await session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[Market.ticker], set_=update_cols
+            ).returning(Market.ticker, literal_column("(xmax = 0)").label("inserted"))
         )
+        return [ticker for ticker, inserted in result.all() if inserted]
 
     async def _announce_new_listings(self, tickers: list[str]) -> None:
         try:
@@ -204,13 +211,19 @@ class CatalogSync:
     async def backfill_categories(session: AsyncSession) -> int:
         """Copy each event's category onto its markets.
 
-        This is not cosmetic. The ``/markets`` payload carries no category at
-        all — it lives on the parent event — and ``fees.py`` selects the fee
-        multiplier *by category*. Without this step every market silently
-        resolves to the ``default`` multiplier, so a Crypto market would be
-        priced at the standard rate and the fail-closed guard on unverified
-        categories would never fire. That is precisely the failure the guard
-        exists to prevent, so the join has to happen on ingest.
+        The ``/markets`` payload carries no category at all — it lives on the
+        parent event — so without this step markets have none and the
+        dashboard's filters, the screener's grouping and the stale-quote
+        pre-filter all have nothing to work with.
+
+        **Category does not price anything.** An earlier version of this
+        docstring claimed ``fees.py`` selects the fee multiplier by category;
+        it does not, and the design that did is the one that excluded ~50,000
+        Crypto markets from proposals over a multiplier that does not exist.
+        The fee schedule has no category dimension: it is keyed by **series
+        ticker**, and ``fees.py`` calls ``series_of(ticker)``. The claim is
+        recorded here as wrong because this function is the natural place
+        someone would try to "restore" the behaviour.
         """
         result = await session.execute(
             text(

@@ -43,6 +43,28 @@ def _s(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
 
 
+def _complement(quoted: Decimal | None, other_side: Decimal | None) -> Decimal | None:
+    """A NO quote, derived from the YES side when the exchange omits it.
+
+    Kalshi quotes one book. A NO bid is the complement of the YES ask and a NO
+    ask the complement of the YES bid, exactly — they are the same resting
+    order described from the other side, not an approximation.
+
+    This belongs here rather than in the browser because the browser has no
+    exact arithmetic. The ticket used to derive it as ``(1 - Number(price))``
+    and feed the result to ``limit_price``, which is the one place a price
+    must not have passed through a float: ``toFixed(4)`` also truncated the
+    two extra decimals the API supports, so a market quoting sub-cent ticks
+    would have had its limit silently rounded. Deriving in ``Decimal`` and
+    sending a string keeps the whole round trip exact.
+    """
+    if quoted is not None:
+        return quoted
+    if other_side is None:
+        return None
+    return Decimal(1) - other_side
+
+
 def _get_backfiller(request: Request) -> Backfiller | None:
     return getattr(request.app.state, "backfiller", None)
 
@@ -101,8 +123,8 @@ def _market_row(m: Market) -> dict[str, Any]:
         "status": m.status,
         "yes_bid": _s(m.yes_bid),
         "yes_ask": _s(m.yes_ask),
-        "no_bid": _s(m.no_bid),
-        "no_ask": _s(m.no_ask),
+        "no_bid": _s(_complement(m.no_bid, m.yes_ask)),
+        "no_ask": _s(_complement(m.no_ask, m.yes_bid)),
         "last_price": _s(m.last_price),
         "previous_price": _s(m.previous_price),
         "spread": _s(spread),

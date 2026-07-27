@@ -49,10 +49,17 @@ striking result here is a reason to go look at the sample, not a finding.
 
 from __future__ import annotations
 
-import math
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
+
+from app.core.statistics import wilson_interval
+
+# `wilson_interval` used to be defined here and is re-exported so that
+# `from app.detectors.longshot_calibration import wilson_interval` keeps
+# working. It moved to app/core/statistics.py when the backtest report card
+# needed it too: two copies of an interval formula is two answers to the same
+# question, and the second one is always the one nobody notices is stale.
 
 __all__ = [
     "BucketStat",
@@ -126,33 +133,6 @@ def bucket_for(
         if lo <= price_cents <= hi:
             return price_cents
     return None
-
-
-def wilson_interval(
-    successes: int, n: int, *, z: float = 1.96
-) -> tuple[float, float] | None:
-    """Wilson score interval for a binomial proportion.
-
-    Returns ``None`` for a sample that cannot be interpreted: no trials, a
-    negative count, or more successes than trials. Those are upstream bugs and
-    guessing at what was meant would launder the bug into a number.
-
-    Wilson rather than the normal approximation because every bucket this
-    module cares about has p near 0 or 1, where Wald's interval is skewed,
-    under-covers, and can leave [0, 1] entirely. Wilson cannot: at 0-for-n the
-    lower bound is exactly 0 and at n-for-n the upper bound is exactly 1.
-    """
-    if n <= 0 or successes < 0 or successes > n:
-        return None
-
-    p = successes / n
-    z2 = z * z
-    denom = 1.0 + z2 / n
-    center = (p + z2 / (2 * n)) / denom
-    half = z * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n)) / denom
-    # Wilson is analytically inside [0, 1]; the clamp is only against floating
-    # point drift at the endpoints, where center and half are nearly equal.
-    return (max(0.0, center - half), min(1.0, center + half))
 
 
 def calibrate(observations: Sequence[Observation]) -> list[BucketStat]:

@@ -9,8 +9,11 @@ Design notes:
   write thousands of rows a second for no analytical gain; the detectors care
   about the book *now* (held in memory) and a periodic record for backtests.
 - **A sequence gap invalidates the book.** The consumer marks it stale and
-  requests a fresh snapshot instead of applying deltas to a book it can no
-  longer trust.
+  puts the ticker in ``resync_needed`` instead of applying deltas to a book it
+  can no longer trust. Clearing that set is `_book_heal_loop`'s job in
+  ``ingest/main.py`` — for three milestones nothing read it at all, and a
+  book that went stale stayed stale for the life of the process, silently
+  writing no snapshots.
 
 Writes are batched and flushed on a timer so a busy market cannot turn every
 message into its own transaction.

@@ -31,7 +31,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -45,6 +45,25 @@ log = get_logger(__name__)
 __all__ = ["record_observations", "backfill_outcomes", "sweep_calibration"]
 
 HUNDRED = Decimal(100)
+
+#: Ceiling on markets examined per sweep.
+#:
+#: This loop is the direct descendant of the incident CLAUDE.md records: an
+#: unprojected ``select(Market)`` over 122,887 rows, each carrying the full
+#: ``raw`` JSONB payload, killed the worker with no traceback. The version of
+#: *this* query before it was fixed matched **152,263 rows carrying 201 MB of
+#: JSONB**, and it ran every 300 seconds whether or not the detector was
+#: enabled — larger than the query that already caused the outage, on a loop
+#: nothing switched off.
+#:
+#: The band and anti-join filters below now do the real work; this cap is the
+#: backstop for the case where they stop being selective.
+MAX_CANDIDATES = 5_000
+
+#: Ceiling on observations whose outcome is resolved per sweep. Unlike the
+#: above this one genuinely defers work — a row not backfilled today is
+#: backfilled tomorrow — so it is set high enough that the backlog drains.
+MAX_BACKFILL = 5_000
 
 
 def _bands(config: Config) -> tuple[tuple[int, int], tuple[int, int]]:
@@ -79,26 +98,57 @@ async def record_observations(session: AsyncSession, config: Config) -> int:
     low, high = _bands(config)
     now = datetime.now(UTC)
 
-    seen = set(
-        (await session.execute(select(CalibrationLog.ticker))).scalars().all()
-    )
+    midpoint = (Market.yes_bid + Market.yes_ask) / 2
 
     candidates = (
         await session.execute(
-            select(Market).where(
+            select(
+                Market.ticker,
+                Market.yes_bid,
+                Market.yes_ask,
+                Market.close_time,
+            )
+            .where(
                 Market.status == "active",
                 Market.yes_bid.isnot(None),
                 Market.yes_ask.isnot(None),
+                # A one-sided or crossed book has no midpoint; midpoint_cents
+                # refuses these anyway, but there is no reason to carry them
+                # across the wire to be dropped in Python.
+                Market.yes_bid > 0,
+                Market.yes_ask < 1,
+                Market.yes_bid <= Market.yes_ask,
+                Market.close_time > now,
+                # Only the tails are ever bucketed, so only the tails need
+                # fetching. Widened by a cent on each side because the
+                # authoritative midpoint is computed in Python with Decimal
+                # rounding and this filter is not — a SQL band narrower than
+                # the Python one would silently drop boundary observations
+                # and the loss would be invisible.
+                or_(
+                    midpoint.between(
+                        Decimal(low[0] - 1) / HUNDRED, Decimal(low[1] + 1) / HUNDRED
+                    ),
+                    midpoint.between(
+                        Decimal(high[0] - 1) / HUNDRED, Decimal(high[1] + 1) / HUNDRED
+                    ),
+                ),
+                # Already logged. An anti-join rather than a Python `set` of
+                # every ticker ever recorded: the set grows without bound and
+                # the rows it filters were fetched to be thrown away.
+                ~select(CalibrationLog.id)
+                .where(CalibrationLog.ticker == Market.ticker)
+                .exists(),
             )
+            # Each market is recorded once ever, so a cap only defers the
+            # remainder to the next sweep 300s later — it never loses one.
+            .limit(MAX_CANDIDATES)
         )
-    ).scalars().all()
+    ).all()
 
     added = 0
-    for market in candidates:
-        if market.ticker in seen:
-            continue
-
-        cents = midpoint_cents(market.yes_bid, market.yes_ask)
+    for ticker, yes_bid, yes_ask, close_time in candidates:
+        cents = midpoint_cents(yes_bid, yes_ask)
         if cents is None:
             continue
         bucket = bucket_for(cents, low_band=low, high_band=high)
@@ -106,8 +156,8 @@ async def record_observations(session: AsyncSession, config: Config) -> int:
             continue
 
         hours_left: float | None = None
-        if market.close_time is not None:
-            close = market.close_time
+        if close_time is not None:
+            close = close_time
             if close.tzinfo is None:
                 close = close.replace(tzinfo=UTC)
             hours_left = (close - now).total_seconds() / 3600.0
@@ -118,14 +168,13 @@ async def record_observations(session: AsyncSession, config: Config) -> int:
 
         session.add(
             CalibrationLog(
-                ticker=market.ticker,
+                ticker=ticker,
                 observed_at=now,
                 price=Decimal(cents) / HUNDRED,
                 price_bucket_cents=bucket,
                 hours_to_close=hours_left,
             )
         )
-        seen.add(market.ticker)
         added += 1
 
     if added:
@@ -141,16 +190,24 @@ async def record_observations(session: AsyncSession, config: Config) -> int:
 
 
 async def backfill_outcomes(session: AsyncSession) -> int:
-    """Fill in ``settled_yes`` for observations whose market has resolved."""
+    """Fill in ``settled_yes`` for observations whose market has resolved.
+
+    Projected and capped like everything else that touches ``markets``: the
+    pending set only shrinks when markets settle, so on a catalog that is
+    mostly open it is the *older* of the two unbounded queries here.
+    """
     pending = (
         await session.execute(
-            select(CalibrationLog).where(CalibrationLog.settled_yes.is_(None))
+            select(CalibrationLog.id, CalibrationLog.ticker)
+            .where(CalibrationLog.settled_yes.is_(None))
+            .order_by(CalibrationLog.id)
+            .limit(MAX_BACKFILL)
         )
-    ).scalars().all()
+    ).all()
     if not pending:
         return 0
 
-    tickers = [row.ticker for row in pending]
+    tickers = [ticker for _, ticker in pending]
     results = dict(
         (
             await session.execute(
@@ -159,22 +216,31 @@ async def backfill_outcomes(session: AsyncSession) -> int:
         ).all()
     )
 
-    filled = 0
-    for row in pending:
-        result = (results.get(row.ticker) or "").strip().lower()
+    now = datetime.now(UTC)
+    settled_yes: list[int] = []
+    settled_no: list[int] = []
+    for row_id, ticker in pending:
+        result = (results.get(ticker) or "").strip().lower()
         if result == "yes":
-            row.settled_yes = True
+            settled_yes.append(row_id)
         elif result == "no":
-            row.settled_yes = False
-        else:
-            # Unsettled, voided, or a scalar payout. A void is not a "no" —
-            # the stake came back — and folding one in would bias the observed
-            # rate downwards in exactly the low band the screen cares about.
-            continue
-        row.settled_at = datetime.now(UTC)
-        filled += 1
+            settled_no.append(row_id)
+        # Anything else is unsettled, voided, or a scalar payout. A void is
+        # not a "no" — the stake came back — and folding one in would bias the
+        # observed rate downwards in exactly the low band the screen is about.
 
-    return filled
+    for ids, outcome in ((settled_yes, True), (settled_no, False)):
+        if not ids:
+            continue
+        # Two bulk updates rather than one per row: the rows were fetched as
+        # tuples, not entities, so there is nothing to mutate in the session.
+        await session.execute(
+            update(CalibrationLog)
+            .where(CalibrationLog.id.in_(ids))
+            .values(settled_yes=outcome, settled_at=now)
+        )
+
+    return len(settled_yes) + len(settled_no)
 
 
 async def sweep_calibration(

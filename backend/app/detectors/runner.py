@@ -65,6 +65,17 @@ CANDIDATE_SIZES = (Decimal(200), Decimal(100), Decimal(50), Decimal(20), Decimal
 #: says is true of any watchlist-shaped input.
 MAX_SCREENER_ROWS = 20_000
 
+#: Ceiling on rows any other detector will pull in one scan.
+#:
+#: Every detector here was originally bounded by a *filter* — a close-time
+#: horizon, a lookback window, a series list — rather than by a cap. Those are
+#: bounds on today's data, not on the query: `max_minutes_to_close` is an
+#: operator-editable number sitting in front of 78,616 active Crypto markets,
+#: and "active but past close" is small only while settlement keeps up. The
+#: screener already learned this the expensive way; this is the same lesson
+#: applied to its neighbours before they get the chance to teach it again.
+MAX_DETECTOR_ROWS = 20_000
+
 
 class SetArbitrageDetector:
     """Prices every watched mutually-exclusive event, both directions."""
@@ -218,7 +229,25 @@ class SetArbitrageDetector:
 
         Every leg matters: an event whose watchlist coverage is partial cannot
         be arbitraged from the legs we happen to see.
+
+        That "every" is why the *whole* leg set of a candidate event has to be
+        fetched, but it is not a reason to fetch every exclusive market on the
+        exchange. The earlier version did — 64,286 rows every 20 seconds — and
+        then discarded all but a handful in Python. The narrowing subquery
+        below reduces the candidates to events with at least one watched leg
+        first; the all-legs-watched rule is still applied afterwards, now over
+        a set roughly the size of the watchlist.
         """
+        if not watchlist:
+            return {}
+
+        candidate_events = (
+            select(Market.event_ticker)
+            .where(Market.ticker.in_(watchlist), Market.event_ticker.isnot(None))
+            .distinct()
+            .scalar_subquery()
+        )
+
         rows = (
             await session.execute(
                 select(Market.event_ticker, Market.ticker)
@@ -226,7 +255,9 @@ class SetArbitrageDetector:
                 .where(
                     Event.mutually_exclusive.is_(True),
                     Market.status == "active",
+                    Market.event_ticker.in_(candidate_events),
                 )
+                .limit(MAX_DETECTOR_ROWS)
             )
         ).all()
 
@@ -329,9 +360,24 @@ class StaleQuoteDetector:
             return []
 
         horizon = datetime.now(UTC) + timedelta(minutes=max_minutes)
+        # Projected and capped. The unprojected form is bounded only by
+        # `max_minutes_to_close`, an operator-editable number with nothing
+        # behind it: there are 78,616 active Crypto markets, so raising that
+        # config value scales this query linearly until the worker dies the
+        # way it did at 122,887 rows carrying full `raw` payloads.
         markets = (
             await session.execute(
-                select(Market).where(
+                select(
+                    Market.ticker,
+                    Market.strike_type,
+                    Market.floor_strike,
+                    Market.cap_strike,
+                    Market.close_time,
+                    Market.yes_bid,
+                    Market.yes_ask,
+                    Market.yes_ask_size,
+                )
+                .where(
                     Market.status == "active",
                     Market.category == "Crypto",
                     Market.close_time.isnot(None),
@@ -339,8 +385,9 @@ class StaleQuoteDetector:
                     Market.close_time > datetime.now(UTC),
                     Market.yes_ask.isnot(None),
                 )
+                .limit(MAX_DETECTOR_ROWS)
             )
-        ).scalars().all()
+        ).all()
 
         schedule = load_fee_schedule()
         slippage = Decimal(str(config.costs.slippage_buffer_cents))
@@ -531,15 +578,25 @@ class ResolutionSniperDetector:
         yes_threshold = Decimal(str(getattr(cfg, "yes_threshold_cents", 97)))
         no_threshold = Decimal(str(getattr(cfg, "no_threshold_cents", 3)))
 
+        # Small today (18 rows) only because settlement keeps up. When it does
+        # not — an exchange-side backlog, or a sync that stalled overnight —
+        # "active but past close" is exactly the set that grows without bound.
         markets = (
             await session.execute(
-                select(Market).where(
+                select(
+                    Market.ticker,
+                    Market.close_time,
+                    Market.yes_bid,
+                    Market.yes_ask,
+                )
+                .where(
                     Market.status == "active",
                     Market.close_time.isnot(None),
                     Market.close_time < datetime.now(UTC),
                 )
+                .limit(MAX_DETECTOR_ROWS)
             )
-        ).scalars().all()
+        ).all()
 
         findings: list[Finding] = []
         for market in markets:
@@ -722,11 +779,16 @@ class WhaleFlowDetector:
         lookback = int(getattr(cfg, "lookback_minutes", 30))
 
         since = datetime.now(UTC) - timedelta(minutes=lookback)
+        # Tape is a hypertable and grows with both watchlist size and trade
+        # rate, so `lookback_minutes` alone is not a bound on the row count.
         rows = (
             await session.execute(
-                select(Tape).where(Tape.ts >= since).order_by(Tape.ts)
+                select(Tape.ticker, Tape.ts, Tape.yes_price, Tape.count, Tape.taker_side)
+                .where(Tape.ts >= since)
+                .order_by(Tape.ts)
+                .limit(MAX_DETECTOR_ROWS)
             )
-        ).scalars().all()
+        ).all()
 
         by_ticker: dict[str, list[Trade]] = {}
         for row in rows:
@@ -943,9 +1005,24 @@ class WeatherDetector:
         min_samples = int(cfg.min_calibration_samples)
         now = datetime.now(UTC)
 
+        # Well bounded by the series filter — there are 21 weather series —
+        # but projected and capped for the same reason as its neighbours: the
+        # bound is a property of today's data, not of the query.
         markets = (
             await session.execute(
-                select(Market).where(
+                select(
+                    Market.ticker,
+                    Market.series_ticker,
+                    Market.strike_type,
+                    Market.floor_strike,
+                    Market.cap_strike,
+                    Market.rules_primary,
+                    Market.yes_bid,
+                    Market.yes_ask,
+                    Market.yes_bid_size,
+                    Market.yes_ask_size,
+                )
+                .where(
                     Market.status == "active",
                     Market.series_ticker.in_(list(SERIES_STATIONS)),
                     Market.close_time.isnot(None),
@@ -954,8 +1031,9 @@ class WeatherDetector:
                     Market.yes_bid.isnot(None),
                     Market.yes_ask.isnot(None),
                 )
+                .limit(MAX_DETECTOR_ROWS)
             )
-        ).scalars().all()
+        ).all()
         if not markets:
             return []
 

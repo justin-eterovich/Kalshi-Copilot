@@ -224,6 +224,15 @@ did exactly that (`--mark-verified` split on `"categories:"`, which also
 matches inside `maker_free_categories:`) and happily marked an unverified
 schedule as verified. Parse structured data; do not slice strings.
 
+The same shape shows up in **tri-state fields**. `Market.result` is `''` for
+an open market, not NULL — 153,808 rows — so `is not None` calls every open
+market settled. And a `settled: bool | None` field is a trap in the other
+direction: `if m.settled:` drops every NO-resolved market, halving the
+outcome sample and biasing what is left toward YES. Name the value
+(`resolved_outcome`) and ask a separate question for "is it known".
+
+The backtester refuses too, and that is its main job — see below.
+
 ---
 
 ## Layout
@@ -278,6 +287,12 @@ backend/app/
     paper.py         pessimistic fill simulator
     positions.py     signed position + realised P&L accounting
     settlements.py   ⭐ held-to-resolution P&L; two books, two sources
+  backtest/
+    coverage.py      ⭐ the gate: refuses a backtest whose data cannot support one
+    replay.py        pure event replay; look-ahead blocked structurally
+    stats.py         expectancy + bootstrap CI, Brier, drawdown, verdict
+    engine.py        the only part of the backtester that runs SQL
+    report.py        per-detector report card over real fills and settlements
   worker/
     maintenance.py   proposal expiry, order auto-cancel, reconciliation
   api/routes/        HTTP endpoints
@@ -308,7 +323,18 @@ docker compose run --rm --no-deps api mypy app/core app/config.py app/settings.p
 
 # maintenance container: only service with write access to data/
 docker compose run --rm tools python scripts/refresh_fee_schedule.py
+
+# backtester: refuses on thin data and says which threshold it missed
+docker compose run --rm --no-deps api python scripts/backtest.py --days 30
 ```
+
+**`compose run api pytest` tests the image, not your working tree.** Only
+`config.yaml`, `data/` and `secrets/` are bind-mounted; `app/` and `tests/`
+are baked in at build time. Without the `--build` above, a green suite is
+green for the code you last built — it silently ran 1,292 tests against the
+previous milestone while 1,547 existed on disk. Either build first, or bind-
+mount the source (`-v ./backend:/app` plus `config.yaml`, `data/`, `scripts/`,
+since those live above `backend/`).
 
 **Actually run the stack and look at the result.** Every milestone so far has
 surfaced bugs that passed tests and lint: hypertables silently not created,
@@ -331,7 +357,7 @@ a liquidity score of −450 on a 0–100 scale, fractional sizes rendering as
 | M6 BTC engine + detectors wave 2 | done (leaderboard has no API; not built) |
 | M7 weather engine | done (needs ~30d of history before it prices) |
 | M8 news/catalyst engine | done (LLM tier guarded, not built — no key) |
-| M9 backtester + hardening | pending |
+| M9 backtester + hardening | done (refuses on today's data — by design) |
 
 Branch: `claude/kalshi-copilot-build-bgyv2d`
 
@@ -352,6 +378,17 @@ Branch: `claude/kalshi-copilot-build-bgyv2d`
   that died and restarted. It had worked an hour earlier at a smaller catalog:
   an unbounded query arms itself as the data grows. Project the columns, push
   the filter into SQL, cap the rows.
+
+  **This recurred, bigger, and went unnoticed for three milestones.** The M9
+  audit found the same pattern in `worker/calibration.py` matching **152,263
+  rows / 201 MB of JSONB every 300 seconds**, on a loop that starts
+  unconditionally whether or not the detector is enabled. Projecting and
+  pushing an anti-join into SQL took it to **97 rows**. A filter is not a cap:
+  every one of these queries *was* bounded, by a close-time horizon or a
+  lookback window or a series list — bounds on today's data, not on the query.
+  `ingest/catalog.py` had a third instance, loading all 217,258 tickers into a
+  Python set every sync to detect new listings; Postgres reports that for free
+  via `RETURNING (xmax = 0)`.
 - **No detector has signalled on a genuine edge yet.** The full path was
   exercised by dropping `min_net_edge_cents` negative so set-arb would
   propose regardless — 42 multi-leg proposals from live books, one approved
@@ -379,6 +416,37 @@ Branch: `claude/kalshi-copilot-build-bgyv2d`
 - `bitcoin.enabled: true` is what starts the spot poller. Without it the
   stale-quote detector has no reference and emits nothing.
 
+- **The backtester refuses on this deployment's data, and that is the
+  feature.** Kalshi has no historical orderbook endpoint, so the only book
+  data that will ever exist for a past moment is the snapshot ingest happened
+  to take: 1,938 rows over 79 markets across 9.8 hours. `coverage.py` names
+  each measured number against its threshold rather than saying "insufficient
+  data", because the operator needs to know whether to wait a week or change
+  the config. `--ignore-coverage` runs it anyway and keeps the refusals
+  attached; the result is not evidence.
+- **Book snapshots are written far less often than configured.**
+  `orderbook_snapshot_throttle_ms` is 1000, but the measured median gap
+  between snapshots of the same market is **84.8 minutes**. Whatever throttles
+  it is not that setting. This is the binding constraint on ever having a
+  usable backtest.
+- **The report card's unit is a decision, not a fill.** A five-leg set
+  arbitrage settles as five rows; counting them as five trades inflates `n`
+  fivefold and shrinks the confidence interval by √5 on perfectly correlated
+  outcomes. The interval is what decides whether a detector sees real money,
+  so this is the most dangerous arithmetic error available. Group by proposal.
+  Where attribution is genuinely ambiguous — two detectors, one market, one
+  route — the event is **dropped, not apportioned**.
+- **Use the bootstrap interval, not Wald.** A binary trade's P&L is a
+  two-point distribution and heavily skewed away from 50c, which is the regime
+  a 20-trade report card lives in. Measured: on 29 wins at +9.98c and one loss
+  at −90.02c, Wald claims an edge (`[+0.11, +13.18]`) and the bootstrap
+  refuses (`[−0.02, +9.98]`). Wald also returns lower bounds below the
+  worst average that can physically occur. Note the bootstrap is *not*
+  generally wider — over 175 samples it was narrower in 128; the property that
+  holds is asymmetry.
+- **An equity curve for `max_drawdown` must start at zero**, before the first
+  trade. Otherwise the first trade's result *is* the opening peak and an
+  opening loss reports no drawdown at all — an error that only ever flatters.
 - Notifications are **first-party only** (PWA Web Push, audio, favicon
   badge). The original spec mentioned ntfy/Telegram once in a milestone list;
   that contradicts two more detailed sections and was resolved as a drafting

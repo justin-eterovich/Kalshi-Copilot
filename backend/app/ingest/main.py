@@ -32,6 +32,7 @@ from app.ingest.streams import StreamProcessor
 from app.ingest.weather import backfill_actuals, sweep_weather, tracked_stations
 from app.kalshi.client import build_rest_client, build_websocket
 from app.kalshi.rest import KalshiRestClient
+from app.kalshi.ws import KalshiWebSocket
 from app.news.client import FeedClient
 from app.settings import get_settings
 from app.weather.client import NwsClient
@@ -42,6 +43,13 @@ HEARTBEAT_INTERVAL_SEC = 15
 SERVICE = "ingest"
 #: Kalshi caps markets per subscription; keep full-depth sets modest.
 MAX_FULL_DEPTH_MARKETS = 100
+#: How often to check whether stale books have accumulated. Long, because the
+#: remedy is a reconnect that briefly invalidates every book: healing five
+#: markets is not worth costing the other seventy-five a snapshot interval.
+BOOK_HEAL_INTERVAL_SEC = 300
+#: How many books must be waiting before a reconnect is worth it. A handful of
+#: stale markets is normal churn; a fifth of the watchlist is a leak.
+BOOK_HEAL_MIN_STALE = 10
 #: Spot is only useful to a detector while it is fresh, and the
 #: stale-quote detector's default tolerance is seconds.
 SPOT_POLL_SEC = 3
@@ -139,18 +147,56 @@ async def _stream_loop(stop: asyncio.Event) -> None:
 
     flusher = asyncio.create_task(processor.run_flusher(stop))
     reporter = asyncio.create_task(_report_stats(processor, stop))
+    healer = asyncio.create_task(_book_heal_loop(ws, processor, stop))
 
     try:
         async for message in ws.stream(stop):
             await processor.handle(message)
     finally:
-        flusher.cancel()
-        reporter.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await flusher
-        with contextlib.suppress(asyncio.CancelledError):
-            await reporter
+        for task in (flusher, reporter, healer):
+            task.cancel()
+        for task in (flusher, reporter, healer):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         await processor.flush(final=True)
+
+
+async def _book_heal_loop(
+    ws: KalshiWebSocket, processor: StreamProcessor, stop: asyncio.Event
+) -> None:
+    """Reconnect when too many books have been stale for too long.
+
+    A sequence gap marks a book stale, and `_maybe_record_book` then refuses
+    to persist it — correctly, since a book that guesses across a gap looks
+    plausible and is wrong. But nothing ever *cleared* the stale flag: the
+    ticker went into `resync_needed` and stayed there, because the only thing
+    that reads that set is the stats line. The module docstring claimed the
+    consumer "requests a fresh snapshot"; it did not.
+
+    Observed live: 28 of ~79 watched markets in this state, permanently, each
+    contributing no orderbook snapshots at all. That is the direct cause of
+    the backtester having 9.8 hours of data across 79 markets with an 85
+    minute median sampling gap — the ingest was quietly recording a shrinking
+    fraction of the watchlist.
+
+    Healing is a reconnect rather than a per-market resubscribe because
+    Kalshi sends a fresh snapshot on subscribe and the reconnect path is
+    already exercised on every disconnect. A per-subscription resubscribe
+    command would be a guess at a protocol we would not have verified.
+    """
+    while not stop.is_set():
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=BOOK_HEAL_INTERVAL_SEC)
+        if stop.is_set():
+            return
+
+        pending = len(processor.resync_needed)
+        if pending < BOOK_HEAL_MIN_STALE:
+            continue
+
+        # Rate-limited by the interval above, so a market that Kalshi simply
+        # never snapshots cannot turn this into a reconnect loop.
+        await ws.force_reconnect(f"{pending} book(s) awaiting a fresh snapshot")
 
 
 async def _report_stats(processor: StreamProcessor, stop: asyncio.Event) -> None:

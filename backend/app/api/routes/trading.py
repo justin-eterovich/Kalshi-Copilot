@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.backtest import report
 from app.config import Config, get_config
 from app.core.fees import UnknownSeries, UnverifiedFeeSchedule
 from app.core.logging import get_logger
@@ -151,18 +152,27 @@ async def trading_state(
     config: ConfigDep,
 ) -> dict[str, Any]:
     """Safety posture plus the queue depth, for the header and the badge."""
+    # Counted in SQL, not by materialising rows and calling len(). Both sets
+    # are small today — the pending queue is capped at `max_pending_proposals`
+    # — but this endpoint backs the dashboard header and is polled
+    # continuously, and the working-order set has no cap at all if
+    # reconciliation ever wedges.
     pending = (
         await session.execute(
-            select(ProposedTrade).where(
+            select(func.count())
+            .select_from(ProposedTrade)
+            .where(
                 ProposedTrade.status == ProposalStatus.PENDING,
                 ProposedTrade.expires_at > datetime.now(UTC),
             )
         )
-    ).scalars().all()
+    ).scalar_one()
 
     working = (
         await session.execute(
-            select(Order).where(
+            select(func.count())
+            .select_from(Order)
+            .where(
                 Order.status.in_(
                     (
                         OrderStatus.PENDING,
@@ -172,12 +182,12 @@ async def trading_state(
                 )
             )
         )
-    ).scalars().all()
+    ).scalar_one()
 
     state: dict[str, Any] = {
         **posture(settings, config),
-        "pending_proposals": len(pending),
-        "working_orders": len(working),
+        "pending_proposals": pending,
+        "working_orders": working,
     }
 
     # Balance is a live call and entirely optional; the page must render
@@ -492,17 +502,26 @@ async def list_positions(session: SessionDep) -> dict[str, Any]:
         )
     ).scalars().all()
 
+    # One query for every mark rather than one per position: the loop was an
+    # N+1 that grows with the book, on an endpoint the dashboard polls.
+    tickers = [p.ticker for p in rows]
+    quotes = (
+        await session.execute(
+            select(Market.ticker, Market.yes_bid, Market.yes_ask, Market.last_price)
+            .where(Market.ticker.in_(tickers))
+        )
+    ).all() if tickers else []
+
     marks: dict[str, Decimal | None] = {}
-    for position in rows:
-        market = await session.get(Market, position.ticker)
+    for ticker, yes_bid, yes_ask, last_price in quotes:
         # Mark at the midpoint: the last trade can be stale in a thin market,
         # and marking at the bid or the ask flatters one direction.
-        if market and market.yes_bid is not None and market.yes_ask is not None:
-            marks[position.ticker] = (market.yes_bid + market.yes_ask) / Decimal(2)
-        elif market and market.last_price is not None:
-            marks[position.ticker] = market.last_price
+        if yes_bid is not None and yes_ask is not None:
+            marks[ticker] = (yes_bid + yes_ask) / Decimal(2)
+        elif last_price is not None:
+            marks[ticker] = last_price
         else:
-            marks[position.ticker] = None
+            marks[ticker] = None
 
     views = [position_view(p, marks.get(p.ticker)) for p in rows]
     return {"positions": views}
@@ -830,6 +849,39 @@ async def list_signals(
             }
             for row in rows
         ]
+    }
+
+
+@router.get("/report-card")
+async def report_card(
+    session: SessionDep,
+    config: ConfigDep,
+    days: int = Query(365, ge=1, le=3650),
+) -> dict[str, Any]:
+    """Per-detector evidence: what each one claimed, and what it delivered.
+
+    The README sends the operator here before enabling live trading, so this
+    endpoint's job is to be *unpersuadable*. Below
+    ``backtest.report_card_min_trades`` every detector reports
+    ``insufficient_evidence`` regardless of how good its mean looks, because
+    a flattering average over four trades is the most dangerous number this
+    system can produce.
+
+    Figures are per ``(detector, route)`` and never summed across routes — a
+    simulated fill and a demo-exchange fill are different kinds of evidence.
+    """
+    now = datetime.now(UTC)
+    reports = await report.detector_reports(
+        session,
+        min_trades=config.backtest.report_card_min_trades,
+        since=now - timedelta(days=days),
+        now=now,
+    )
+    return {
+        "min_trades": config.backtest.report_card_min_trades,
+        "window_days": days,
+        "generated_at": now.isoformat(),
+        "detectors": [r.to_dict() for r in reports],
     }
 
 

@@ -391,6 +391,60 @@ export interface NewsState {
   feeds_configured: number;
 }
 
+/** Where a detector's signals went. Available long before any P&L is. */
+export interface ReportFunnel {
+  signals: number;
+  observations: number;
+  proposals: number;
+  approved: number;
+  executed: number;
+  partial: number;
+  rejected: number;
+  expired: number;
+  pending: number;
+  failed: number;
+  orders: number;
+  fills: number;
+  decided: number;
+}
+
+/**
+ * One detector's evidence, on one route.
+ *
+ * Never merged across routes: a simulated fill and a demo-exchange fill are
+ * different kinds of evidence and only one of them happened at an exchange.
+ */
+export interface DetectorReport {
+  detector: string;
+  route: string;
+  funnel: ReportFunnel;
+  /** The edge it claimed, averaged over its signals. */
+  avg_claimed_edge_cents: string | null;
+  /** Decisions closed — not fills, and not legs. */
+  trades: number;
+  total_pnl_cents: string;
+  mean_pnl_cents: string;
+  ci_low_cents: string | null;
+  ci_high_cents: string | null;
+  ci_method: string;
+  fees_paid_cents: string;
+  max_drawdown_cents: string;
+  verdict:
+    | "insufficient_evidence"
+    | "no_edge_shown"
+    | "edge_shown"
+    | "losing";
+  headline: string;
+  unattributed: number;
+}
+
+export interface ReportCardResponse {
+  min_trades: number;
+  window_days: number;
+  generated_at: string;
+  detectors: DetectorReport[];
+}
+
 /** A market that resolved while we held a position in it. */
 export interface SettlementRow {
   ticker: string;
@@ -611,6 +665,8 @@ export const api = {
   engine: () => getJson<EngineState>("/api/engine"),
 
   news: () => getJson<NewsState>("/api/news"),
+
+  reportCard: () => getJson<ReportCardResponse>("/api/report-card"),
 
   settlements: () =>
     getJson<{ settlements: SettlementRow[] }>("/api/settlements?limit=50"),

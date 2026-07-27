@@ -11,6 +11,7 @@ import { Link } from "react-router-dom";
 import ApprovalCard from "./ApprovalCard";
 import EnginePanel from "./EnginePanel";
 import NewsPanel from "./NewsPanel";
+import ReportCard from "./ReportCard";
 import RiskPanel from "./RiskPanel";
 import {
   api,
@@ -538,6 +539,8 @@ export default function Trades() {
           </div>
         )}
       </section>
+
+      <ReportCard />
 
       <NewsPanel news={news} />
 
