@@ -122,8 +122,19 @@ class Event(Base):
     title: Mapped[str | None] = mapped_column(Text)
     sub_title: Mapped[str | None] = mapped_column(Text)
     category: Mapped[str | None] = mapped_column(String(64), index=True)
-    # True when the event's markets form an exhaustive mutually-exclusive set,
-    # which is precisely the condition the set-arbitrage detector needs.
+    #: API: "If true, only one market in this event can resolve to 'yes'."
+    #:
+    #: Read that carefully — it says **at most one**, not exactly one. It does
+    #: NOT imply the set is exhaustive, and in practice many are not:
+    #: KXNEWPOPE-70 carries 7 legs whose asks sum to 4.12, because there are
+    #: obviously more than 7 possible popes.
+    #:
+    #: That asymmetry decides what set-arbitrage may signal. Selling every leg
+    #: is safe on exclusivity alone (at most one pays out, so collecting more
+    #: than $1 is riskless). Buying every leg is only an arb if some leg is
+    #: guaranteed to win — which needs exhaustiveness, and nothing in the API
+    #: tells us that. An earlier comment here claimed this flag meant
+    #: "exhaustive"; it does not.
     mutually_exclusive: Mapped[bool | None] = mapped_column(Boolean)
     strike_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     raw: Mapped[dict | None] = mapped_column(JSONB)

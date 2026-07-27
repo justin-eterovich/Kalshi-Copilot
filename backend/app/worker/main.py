@@ -19,6 +19,8 @@ from app.config import get_config
 from app.core.logging import configure_logging, get_logger
 from app.core.redis import beat, close_redis, get_redis
 from app.db.base import dispose_engine, get_session_factory
+from app.detectors.base import record
+from app.detectors.runner import SetArbitrageDetector
 from app.kalshi.client import build_rest_client
 from app.settings import get_settings
 from app.trading.executor import Executor
@@ -35,6 +37,9 @@ PROPOSAL_SWEEP_SEC = 5
 #: Order upkeep talks to the exchange, so it runs slower and on the write
 #: budget's terms.
 ORDER_SWEEP_SEC = 10
+#: Detector scans read books over REST for every leg of every watched
+#: event, so they are the heaviest loop here.
+DETECTOR_SCAN_SEC = 20
 
 
 async def _heartbeat_loop(stop: asyncio.Event) -> None:
@@ -72,6 +77,39 @@ async def _order_sweep_loop(executor: Executor, stop: asyncio.Event) -> None:
             await asyncio.wait_for(stop.wait(), timeout=ORDER_SWEEP_SEC)
 
 
+async def _detector_loop(
+    detectors: list[SetArbitrageDetector], stop: asyncio.Event
+) -> None:
+    """Scan with every enabled detector and record what they find.
+
+    Detectors emit signals only. Nothing in this loop can create a proposal,
+    let alone an order — that gap is the safety model, not an oversight.
+    """
+    sessions = get_session_factory()
+    while not stop.is_set():
+        config = get_config()
+        active = [d for d in detectors if d.enabled(config)]
+        if active and not config.risk.kill_switch:
+            for detector in active:
+                try:
+                    async with sessions() as session:
+                        findings = await detector.scan(session, config)
+                        for finding in findings:
+                            await record(session, finding)
+                        await session.commit()
+                    if findings:
+                        log.info(
+                            "%s: %d signal(s), best %.2fc/contract",
+                            detector.name,
+                            len(findings),
+                            max(float(f.net_edge_cents) for f in findings),
+                        )
+                except Exception as exc:  # noqa: BLE001 - never kill the loop
+                    log.exception("%s scan failed: %s", detector.name, exc)
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=DETECTOR_SCAN_SEC)
+
+
 async def run() -> None:
     settings = get_settings()
     configure_logging(settings.log_level, settings.log_format)
@@ -101,8 +139,12 @@ async def run() -> None:
 
     client = build_rest_client()
     executor = Executor(client, settings, config)
+    detectors = [SetArbitrageDetector(client)]
     log.info("order maintenance ready (authenticated=%s)", client.authenticated)
-    log.info("detector engine arrives in M4")
+    log.info(
+        "detectors registered: %s",
+        ", ".join(d.name for d in detectors) or "none",
+    )
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -114,6 +156,7 @@ async def run() -> None:
         asyncio.create_task(_heartbeat_loop(stop), name="heartbeat"),
         asyncio.create_task(_proposal_sweep_loop(stop), name="proposal-sweep"),
         asyncio.create_task(_order_sweep_loop(executor, stop), name="order-sweep"),
+        asyncio.create_task(_detector_loop(detectors, stop), name="detectors"),
     ]
 
     try:

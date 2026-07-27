@@ -118,6 +118,12 @@ API's own signed `position_fp`.
 - **The WebSocket requires auth even for public market-data channels.** REST
   public market data does not. This is why the market page reads through to
   REST: it works with no key at all.
+- **`mutually_exclusive` means AT MOST one leg resolves YES**, not exactly
+  one. It does not imply the set is exhaustive, and many are not:
+  `KXNEWPOPE-70` is exclusive with 7 legs whose asks sum to $4.12. So
+  *selling* every leg of an exclusive set is riskless (at most $1 pays out)
+  but *buying* every leg is not — that needs some leg to be certain to win,
+  which the API never tells you. See `app/detectors/set_arbitrage.py`.
 - **Fees are keyed by SERIES, not category.** The schedule has no category
   dimension at all. It lists ~85 "Non-Standard Fees" *series tickers*; every
   series not listed takes the documented defaults of **taker M=1** and
@@ -186,6 +192,10 @@ backend/app/
     normalize.py     API payloads -> ORM rows
     streams.py       tape, candles, book snapshots
     backfill.py      REST read-through for the market page
+  detectors/
+    set_arbitrage.py ⭐ pure set-arb math; sell side is safe, buy side is not
+    base.py          Detector protocol; detectors emit signals, never orders
+    runner.py        the live set-arb detector + exhaustiveness gate
   trading/
     direction.py     ⭐ (side, action) <-> bid/ask. Never inline this.
     interlocks.py    execution routing + every safety check
@@ -237,7 +247,7 @@ a liquidity score of −450 on a 0–100 scale, fractional sizes rendering as
 | M1 ingest + storage | done |
 | M2 dashboard core | done |
 | M3 HITL approval/execution rail | done |
-| M4 detectors wave 1 | **next** |
+| M4 detectors wave 1 | set-arb done; sniper + BTC pending |
 | M5 risk layer + PWA notifications | pending |
 | M6 BTC engine + detectors wave 2 | pending |
 | M7 weather engine | pending |

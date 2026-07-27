@@ -71,7 +71,81 @@ costs:
 # ---------------------------------------------------------------------------
 ingest:
   # Full depth: orderbook deltas + public tape + ticker.
-  watchlist: []
+  #
+  # These are every leg of the most liquid mutually-exclusive events, which
+  # is exactly what the set-arbitrage detector needs: it prices a whole
+  # exhaustive set at once, so a partial set is useless to it. Capped at
+  # MAX_FULL_DEPTH_MARKETS (100) in app/ingest/main.py — Kalshi limits
+  # markets per subscription.
+  #
+  # Regenerate by picking the top mutually-exclusive events by 24h volume
+  # where every leg is quoted. Currently 65 markets.
+  watchlist:
+    - KXATPCHALLENGERMATCH-26JUL26MCKFIL-FIL
+    - KXATPCHALLENGERMATCH-26JUL26MCKFIL-MCK
+    - KXF1CONSTRUCTORS-26-ALP
+    - KXF1CONSTRUCTORS-26-AST
+    - KXF1CONSTRUCTORS-26-AUD
+    - KXF1CONSTRUCTORS-26-CAD
+    - KXF1CONSTRUCTORS-26-FER
+    - KXF1CONSTRUCTORS-26-HAA
+    - KXF1CONSTRUCTORS-26-MCL
+    - KXF1CONSTRUCTORS-26-MER
+    - KXF1CONSTRUCTORS-26-RAC
+    - KXF1CONSTRUCTORS-26-RED
+    - KXF1CONSTRUCTORS-26-WIL
+    - KXGOVAK-26-ACRU
+    - KXGOVAK-26-BWIL
+    - KXGOVAK-26-CBIS
+    - KXGOVAK-26-EDEV
+    - KXGOVAK-26-MPEL
+    - KXGOVAK-26-NDAH
+    - KXGOVAK-26-TBEG
+    - KXGOVAK-26-TTAY
+    - KXNEWPOPE-70-AARB
+    - KXNEWPOPE-70-FAMB
+    - KXNEWPOPE-70-LANT
+    - KXNEWPOPE-70-MZUP
+    - KXNEWPOPE-70-PERD
+    - KXNEWPOPE-70-PPAR
+    - KXNEWPOPE-70-PPIZ
+    - KXNFLGAME-26AUG13ARILV-ARI
+    - KXNFLGAME-26AUG13ARILV-LV
+    - KXNFLGAME-26AUG13INDNE-IND
+    - KXNFLGAME-26AUG13INDNE-NE
+    - KXNFLGAME-26AUG13LACHOU-HOU
+    - KXNFLGAME-26AUG13LACHOU-LAC
+    - KXNFLGAME-26AUG14DENATL-ATL
+    - KXNFLGAME-26AUG14DENATL-DEN
+    - KXNFLGAME-26AUG15CARBUF-BUF
+    - KXNFLGAME-26AUG15CARBUF-CAR
+    - KXNFLGAME-26AUG15DALSEA-DAL
+    - KXNFLGAME-26AUG15DALSEA-SEA
+    - KXNFLGAME-26AUG15PHIBAL-BAL
+    - KXNFLGAME-26AUG15PHIBAL-PHI
+    - KXNFLGAME-26SEP09NESEA-NE
+    - KXNFLGAME-26SEP09NESEA-SEA
+    - KXNFLGAME-26SEP10SFLAR-LAR
+    - KXNFLGAME-26SEP10SFLAR-SF
+    - KXNFLGAME-26SEP13ARILAC-ARI
+    - KXNFLGAME-26SEP13ARILAC-LAC
+    - KXNFLGAME-26SEP13CLEJAC-CLE
+    - KXNFLGAME-26SEP13CLEJAC-JAC
+    - KXNFLGAME-26SEP13TBCIN-CIN
+    - KXNFLGAME-26SEP13TBCIN-TB
+    - KXTESTMATCH-26JUL251100PAKWI-PAK
+    - KXTESTMATCH-26JUL251100PAKWI-TIE
+    - KXTESTMATCH-26JUL251100PAKWI-WI
+    - KXUFCFIGHT-26AUG01KLEMUS-KLE
+    - KXUFCFIGHT-26AUG01KLEMUS-MUS
+    - KXUFCFIGHT-26AUG01MEDROD-MED
+    - KXUFCFIGHT-26AUG01MEDROD-ROD
+    - KXUFCFIGHT-26AUG01REBPRE-PRE
+    - KXUFCFIGHT-26AUG01REBPRE-REB
+    - KXUFCFIGHT-26AUG01TODVAL-TOD
+    - KXUFCFIGHT-26AUG01TODVAL-VAL
+    - SENATEIA-26-D
+    - SENATEIA-26-R
   # Wider universe gets ticker-level coverage only.
   scanner:
     enabled: true
@@ -92,6 +166,21 @@ detectors:
     enabled: false
     min_net_edge_cents: 1.0
     require_full_depth: true       # only signal if every leg fills at quote
+
+    # Series whose markets are collectively EXHAUSTIVE — some leg is certain
+    # to resolve YES. Only these get buy-side signals.
+    #
+    # Kalshi's `mutually_exclusive` flag means "at most one leg resolves YES".
+    # That makes SELLING every leg riskless on its own: you collect the sum of
+    # the bids and pay out at most $1. It does NOT make BUYING riskless, which
+    # needs at least one leg to win — and nothing in the API says that.
+    # KXNEWPOPE-70 is exclusive, lists 7 candidates, and their asks sum to
+    # $4.12; there are more than 7 possible popes. Buying that set for 99c
+    # would lose everything if an eighth won.
+    #
+    # So this list ships EMPTY and each entry is a claim you are making about
+    # the world, not something the exchange told us. Series ticker, no suffix.
+    exhaustive_series: []
 
   stale_quote:
     enabled: false
