@@ -18,20 +18,28 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol
 
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import Config
+from app.config import Config, get_config
 from app.core.logging import get_logger
 from app.core.redis import CH_SIGNALS, get_redis
 from app.db.models import Side, Signal
 
 log = get_logger(__name__)
 
-__all__ = ["Finding", "Detector", "record", "publish_signal", "propose_finding"]
+__all__ = [
+    "Finding",
+    "Detector",
+    "record",
+    "publish_signal",
+    "propose_finding",
+    "is_material_change",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,8 +75,79 @@ class Detector(Protocol):
     async def scan(self, session: AsyncSession, config: Config) -> list[Finding]: ...
 
 
+def is_material_change(
+    previous: Decimal | None, current: Decimal, *, threshold_cents: Decimal
+) -> bool:
+    """Whether an edge has moved enough to be a new observation.
+
+    The judgement this whole guard rests on. A detector re-derives the same
+    opportunity on every scan, so without a threshold every signal is "new"
+    and the table fills with duplicates; with too coarse a threshold an edge
+    that grows from 1c to 8c is silently folded into the row that reported
+    1c, and the operator never learns it moved.
+
+    The comparison is inclusive, so ``threshold_cents=0`` is always satisfied
+    and disables folding entirely — the second way to turn the guard off,
+    alongside ``dedupe_window_sec: 0``.
+    """
+    if previous is None:
+        return True
+    return abs(current - previous) >= threshold_cents
+
+
 async def record(session: AsyncSession, finding: Finding) -> Signal:
-    """Persist a finding as a Signal and push it to the dashboard."""
+    """Persist a finding as a Signal and push it to the dashboard.
+
+    Repeats are folded rather than appended. A detector that scans every 20
+    seconds re-derives the same observation every time — the undervalued
+    screener wrote 180 near-identical rows in nine passes — and a signal
+    table nobody reads is the same failure as an approval queue nobody
+    reads, one step earlier in the pipeline.
+
+    A repeat is the *same* observation only while its edge has not moved
+    materially. When it has, a new row is written, because an edge going from
+    1c to 8c is news and hiding it inside a counter would lose the thing
+    worth looking at.
+
+    The returned Signal is the folded one when a repeat is detected, so a
+    proposal created from it links to the observation that actually started —
+    and proposal creation is unaffected either way, since its own duplicate
+    guard is what governs the queue.
+    """
+    config = get_config()
+    window = int(getattr(config.detectors, "dedupe_window_sec", 900))
+    threshold = Decimal(
+        str(getattr(config.detectors, "dedupe_edge_change_cents", 1.0))
+    )
+
+    if window > 0:
+        since = datetime.now(UTC) - timedelta(seconds=window)
+        previous = (
+            await session.execute(
+                select(Signal)
+                .where(
+                    Signal.detector == finding.detector,
+                    Signal.ticker == finding.ticker,
+                    Signal.side == finding.side,
+                    Signal.last_seen_at >= since,
+                )
+                .order_by(desc(Signal.last_seen_at))
+                .limit(1)
+            )
+        ).scalars().first()
+
+        if previous is not None and not is_material_change(
+            previous.net_edge_cents,
+            finding.net_edge_cents,
+            threshold_cents=threshold,
+        ):
+            previous.last_seen_at = datetime.now(UTC)
+            previous.seen_count = (previous.seen_count or 1) + 1
+            # Deliberately not re-published: the dashboard already shows this
+            # observation, and a fan-out per scan is the same noise in a
+            # different channel.
+            return previous
+
     signal = Signal(
         detector=finding.detector,
         ticker=finding.ticker,

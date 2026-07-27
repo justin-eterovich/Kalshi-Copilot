@@ -230,12 +230,44 @@ cross-asset fix look like it had not worked. Build all three.
 
 ---
 
-## Open items
+## Follow-up: the signal duplicate guard (and an OOM it exposed)
 
-- **The screener repeats itself.** It re-emits its top 20 every scan; nine
-  scans produced 180 near-identical signals for the same handful of strikes.
-  Proposals have a duplicate guard, signals do not. Needs one before this
-  detector is enabled for real.
+Signals now fold instead of appending. Within `detectors.dedupe_window_sec`
+(900s) an identical observation bumps `seen_count` and `last_seen_at` on the
+existing row rather than writing a new one — unless the net edge has moved by
+`dedupe_edge_change_cents` (1.0), which makes it a genuinely new observation.
+
+An edge going from 1¢ to 8¢ must never disappear into a counter, which is the
+whole reason the threshold exists rather than a plain "same detector, same
+ticker" match. A *shrinking* edge is equally news: it means the opportunity
+is gone.
+
+Measured live: **80 sightings folded into 23 rows** over five scans. (23 not
+20 because the screener's top-20 shifts as quotes move — new entrants
+correctly get their own rows.) The UI shows `3×`, `4×` in a `seen` column,
+which is strictly more informative than the rows it replaces: a persisting
+edge now looks different from one that flickered once.
+
+`record()` returns the folded row, so proposal creation is unaffected — the
+proposal links to the observation that actually started, and the queue is
+still governed by its own duplicate guard.
+
+### The OOM this uncovered
+
+Enabling the screener for the test killed the worker outright — no traceback,
+no log line, just a process that died and restarted and died again. The M6
+wiring had `select(Market)` with no column projection, no horizon filter in
+SQL, and no cap. The catalog had grown to **122,887 active markets with
+two-sided quotes**, each row carrying the full API payload in a `raw` JSONB
+column.
+
+It had worked an hour earlier at a smaller catalog size, which is what makes
+it worth recording: an unbounded query is a landmine that arms itself as the
+data grows, not a slow path. Fixed with six projected columns, the horizon
+filter pushed into SQL, and `MAX_SCREENER_ROWS = 20_000`. Same scan now
+completes in **0.93s**.
+
+## Open items
 - **Only BTC has a spot feed.** ETH, SOL and XRP markets are correctly
   refused, but that is 1,353 markets the detector can see and cannot price.
   Adding feeds is small work — `SPOT_SOURCES` is a dict.

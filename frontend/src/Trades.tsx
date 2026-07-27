@@ -478,6 +478,7 @@ export default function Trades() {
                   <th>side</th>
                   <th className="num">net edge</th>
                   <th className="num">conf</th>
+                  <th className="num">seen</th>
                   <th>why</th>
                 </tr>
               </thead>
@@ -512,6 +513,18 @@ export default function Trades() {
                         : asSignedCents(sg.net_edge_cents)}
                     </td>
                     <td className="num">{(sg.confidence * 100).toFixed(0)}%</td>
+                    {/* Repeats fold into the row instead of adding one, so a
+                        high count is a persisting edge rather than clutter. */}
+                    <td
+                      className="num muted"
+                      title={
+                        sg.last_seen_at
+                          ? `last seen ${asClock(sg.last_seen_at)}`
+                          : undefined
+                      }
+                    >
+                      {sg.seen_count > 1 ? `${sg.seen_count}×` : "—"}
+                    </td>
                     <td className="audit-detail">{sg.rationale}</td>
                   </tr>
                 ))}

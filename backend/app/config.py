@@ -83,6 +83,17 @@ class DetectorConfig(_Base):
 class DetectorsConfig(_Base):
     model_config = ConfigDict(extra="allow")
 
+    #: How long an identical observation is folded into the existing signal
+    #: row instead of writing a new one. Detectors re-derive the same finding
+    #: on every scan; without this the signals table fills with duplicates and
+    #: stops being read, which is the approval-fatigue failure one step
+    #: earlier in the pipeline. Zero disables folding entirely.
+    dedupe_window_sec: int = Field(900, ge=0)
+    #: How far the net edge must move for a repeat to count as a *new*
+    #: observation rather than the same one. Too coarse and an edge growing
+    #: from 1c to 8c disappears into a counter.
+    dedupe_edge_change_cents: float = Field(1.0, ge=0)
+
     set_arbitrage: DetectorConfig = DetectorConfig()
     stale_quote: DetectorConfig = DetectorConfig()
     resolution_sniper: DetectorConfig = DetectorConfig()

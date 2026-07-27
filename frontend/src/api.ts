@@ -371,6 +371,10 @@ export interface PositionRow {
 }
 
 export interface SignalRow {
+  /** Scans that have seen this same observation. 1 means it is new. */
+  seen_count: number;
+  /** When it was last still true — a persisting edge differs from a flicker. */
+  last_seen_at: string | null;
   id: number;
   detector: string;
   ticker: string;

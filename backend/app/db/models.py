@@ -331,6 +331,15 @@ class Signal(Base):
     rationale: Mapped[str | None] = mapped_column(Text)
     evidence: Mapped[dict | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = _ts()
+    #: When this observation was last still true, and how many scans have
+    #: seen it. A detector re-derives the same opportunity every scan — the
+    #: screener produced 180 near-identical rows in nine passes — and a table
+    #: that long is not read. Folding repeats into one row loses nothing:
+    #: "seen 47 times over 15m" is strictly more informative than 47 rows
+    #: that differ only in their timestamp, and it distinguishes an edge that
+    #: has persisted from one that flickered once.
+    last_seen_at: Mapped[datetime] = _ts()
+    seen_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
 
 class ProposedTrade(Base):

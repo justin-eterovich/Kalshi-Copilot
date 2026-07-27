@@ -307,9 +307,12 @@ Branch: `claude/kalshi-copilot-build-bgyv2d`
 - **Only BTC has a spot feed.** ETH/SOL/XRP markets are correctly refused by
   the stale-quote detector, which is ~1,353 markets it can see and cannot
   price. Adding feeds means adding to `SPOT_SOURCES` and polling per symbol.
-- **Signals have no duplicate guard.** Proposals do; signals do not, and the
-  screener re-emits its top 20 every scan (180 rows in nine scans). Fix that
-  before enabling `undervalued_screener` for real.
+- **Detector queries must be projected and bounded.** `select(Market)` with
+  no columns and no cap killed the worker outright — 122,887 active markets
+  each carrying the full `raw` JSONB payload, no traceback, just a process
+  that died and restarted. It had worked an hour earlier at a smaller catalog:
+  an unbounded query arms itself as the data grows. Project the columns, push
+  the filter into SQL, cap the rows.
 - **No detector has signalled on a genuine edge yet.** The full path was
   exercised by dropping `min_net_edge_cents` negative so set-arb would
   propose regardless — 42 multi-leg proposals from live books, one approved

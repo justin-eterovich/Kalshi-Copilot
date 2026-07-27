@@ -695,6 +695,12 @@ async def list_signals(
                 "size_hint": None if row.size_hint is None else str(row.size_hint),
                 "rationale": row.rationale,
                 "evidence": row.evidence,
+                # A repeat sighting bumps these rather than adding a row, so
+                # "seen 47x over 15m" replaces 47 near-identical entries.
+                "seen_count": row.seen_count or 1,
+                "last_seen_at": (
+                    row.last_seen_at.isoformat() if row.last_seen_at else None
+                ),
                 "created_at": (
                     row.created_at.isoformat() if row.created_at else None
                 ),

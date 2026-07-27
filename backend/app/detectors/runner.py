@@ -57,6 +57,12 @@ __all__ = [
 #: and earns less per contract, so the best size is rarely the biggest.
 CANDIDATE_SIZES = (Decimal(200), Decimal(100), Decimal(50), Decimal(20), Decimal(5))
 
+#: Hard ceiling on rows the screener will pull in one scan. The percentile it
+#: computes is relative to whatever it was given, so this bounds memory at the
+#: cost of making the ranking relative to a sample — which the module already
+#: says is true of any watchlist-shaped input.
+MAX_SCREENER_ROWS = 20_000
+
 
 class SetArbitrageDetector:
     """Prices every watched mutually-exclusive event, both directions."""
@@ -591,7 +597,7 @@ class UndervaluedScreenerDetector:
         return bool(getattr(config.detectors.undervalued_screener, "enabled", False))
 
     async def scan(self, session: AsyncSession, config: Config) -> list[Finding]:
-        from datetime import UTC, datetime
+        from datetime import UTC, datetime, timedelta
 
         from app.detectors.undervalued_screener import MarketSnapshot, screen
 
@@ -601,32 +607,48 @@ class UndervaluedScreenerDetector:
         max_hours = float(getattr(cfg, "max_hours_to_close", 168))
 
         now = datetime.now(UTC)
+        horizon = now + timedelta(hours=max_hours)
+
+        # Six columns, not whole ORM objects, and bounded by the same horizon
+        # the screener filters on. `select(Market)` here loaded 122,887 rows
+        # each carrying the full `raw` API payload as JSONB and killed the
+        # process outright — no traceback, no log line, just a dead worker
+        # that restarted and did it again. The catalog grows, so a query with
+        # no projection and no bound is a landmine rather than a slow path.
         rows = (
             await session.execute(
-                select(Market).where(
+                select(
+                    Market.ticker,
+                    Market.volume_24h,
+                    Market.yes_bid,
+                    Market.yes_ask,
+                    Market.close_time,
+                    Market.open_interest,
+                )
+                .where(
                     Market.status == "active",
                     Market.close_time.isnot(None),
+                    Market.close_time > now,
+                    Market.close_time <= horizon,
                     Market.yes_bid.isnot(None),
                     Market.yes_ask.isnot(None),
                 )
+                .limit(MAX_SCREENER_ROWS)
             )
-        ).scalars().all()
+        ).all()
 
         snapshots: list[MarketSnapshot] = []
-        for market in rows:
-            close = market.close_time
-            if close is None:
-                continue
+        for ticker, volume, bid, ask, close, oi in rows:
             if close.tzinfo is None:
                 close = close.replace(tzinfo=UTC)
             snapshots.append(
                 MarketSnapshot(
-                    ticker=market.ticker,
-                    volume_24h=market.volume_24h or Decimal(0),
-                    yes_bid=market.yes_bid,
-                    yes_ask=market.yes_ask,
+                    ticker=ticker,
+                    volume_24h=volume or Decimal(0),
+                    yes_bid=bid,
+                    yes_ask=ask,
                     hours_to_close=(close - now).total_seconds() / 3600.0,
-                    open_interest=market.open_interest,
+                    open_interest=oi,
                 )
             )
 

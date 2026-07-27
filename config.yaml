@@ -167,6 +167,16 @@ ingest:
 # earn your trust before it earns your money.
 # ---------------------------------------------------------------------------
 detectors:
+  # A detector re-derives the same opportunity on every scan. Within this
+  # window an identical observation bumps a counter on the existing signal
+  # instead of writing another row — the undervalued screener produced 180
+  # near-identical rows in nine passes, and a signals table nobody reads is
+  # the approval-fatigue failure one step earlier. Set 0 to disable folding.
+  dedupe_window_sec: 900
+  # ...unless the edge has actually moved this far, which makes it news
+  # rather than a repeat.
+  dedupe_edge_change_cents: 1.0
+
   set_arbitrage:
     enabled: false
     min_net_edge_cents: 1.0
