@@ -569,6 +569,36 @@ class KalshiRestClient:
         ):
             yield fill
 
+    async def get_settlements(
+        self,
+        *,
+        ticker: str | None = None,
+        event_ticker: str | None = None,
+        min_ts: int | None = None,
+        limit: int = 200,
+        max_pages: int | None = 5,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Iterate settled markets the account held a position in.
+
+        Mind the units: this payload mixes them. ``yes_total_cost_dollars``,
+        ``no_total_cost_dollars`` and ``fee_cost`` are fixed-point dollar
+        strings, but ``revenue`` and ``value`` are **integer cents** — two
+        conventions in one object, and the only place in the API where that
+        happens. Parsing a cents field as dollars understates it a
+        hundredfold, silently.
+        """
+        self._require_auth("/portfolio/settlements")
+        async for row in self.paginate(
+            "/portfolio/settlements",
+            "settlements",
+            limit=limit,
+            max_pages=max_pages,
+            ticker=ticker,
+            event_ticker=event_ticker,
+            min_ts=min_ts,
+        ):
+            yield row
+
     async def get_positions(
         self, *, ticker: str | None = None, count_filter: str | None = "position"
     ) -> dict[str, Any]:

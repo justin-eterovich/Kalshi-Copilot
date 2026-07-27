@@ -49,14 +49,17 @@ from app.db.models import (
     Position,
     ProposalStatus,
     ProposedTrade,
+    Settlement,
     Signal,
 )
 from app.kalshi.rest import KalshiApiError, KalshiRestClient
 from app.settings import Settings, get_settings
 from app.trading import proposals as prop
+from app.trading import risk
 from app.trading.executor import ExecutionError, Executor, fill_view, order_view
 from app.trading.interlocks import InterlockError, posture
 from app.trading.positions import position_view
+from app.trading.settlements import settlement_view
 
 log = get_logger(__name__)
 
@@ -517,11 +520,63 @@ async def daily_pnl(
                 "is_paper": row.is_paper,
                 "realized_pnl_cents": str(row.realized_pnl_cents or Decimal(0)),
                 "fees_paid_cents": str(row.fees_paid_cents or Decimal(0)),
+                "net_pnl_cents": str(
+                    (row.realized_pnl_cents or Decimal(0))
+                    - (row.fees_paid_cents or Decimal(0))
+                ),
                 "trades": row.trades or 0,
+                "settlements": row.settlements or 0,
             }
             for row in rows
         ]
     }
+
+
+@router.get("/risk")
+async def risk_state(
+    session: SessionDep, settings: SettingsDep, config: ConfigDep
+) -> dict[str, Any]:
+    """The portfolio limits and how close each one is.
+
+    Returned even when nothing is near a limit, because the dashboard's job
+    is to show headroom continuously rather than to announce a halt after the
+    fact. ``state`` is null only when no execution route is usable at all, in
+    which case every approval is already refused upstream.
+    """
+    state = await risk.halt_state(session, config, settings)
+    return {
+        "state": state.as_dict() if state else None,
+        "limits": {
+            "bankroll_usd": config.risk.bankroll_usd,
+            "max_pct_per_market": config.risk.max_pct_per_market,
+            "max_total_exposure_pct": config.risk.max_total_exposure_pct,
+            "daily_loss_limit_pct": config.risk.daily_loss_limit_pct,
+            "cooldown_after_consecutive_losses": (
+                config.risk.cooldown_after_consecutive_losses
+            ),
+            "cooldown_minutes": config.risk.cooldown_minutes,
+            "kelly_fraction": config.risk.kelly_fraction,
+            "max_pending_proposals": config.risk.max_pending_proposals,
+        },
+    }
+
+
+@router.get("/settlements")
+async def recent_settlements(
+    session: SessionDep, limit: int = Query(50, ge=1, le=500)
+) -> dict[str, Any]:
+    """Markets that resolved while we held them.
+
+    Separate from ``/fills`` on purpose: a settlement is an outcome, not a
+    decision, and it is the only place a held-to-resolution thesis shows its
+    result.
+    """
+    rows = (
+        await session.execute(
+            select(Settlement).order_by(desc(Settlement.created_at)).limit(limit)
+        )
+    ).scalars().all()
+    return {"settlements": [settlement_view(row) for row in rows]}
 
 
 @router.get("/signals")

@@ -929,3 +929,80 @@ a {
   color: var(--warn);
   border-color: var(--warn);
 }
+
+/* --------------------------------------------------------------------------
+   Risk meters
+
+   The point of a meter over a number is that it is readable at a glance from
+   across the room, which is the only way a limit gets noticed *before* it
+   refuses something.
+   -------------------------------------------------------------------------- */
+
+.meter {
+  margin: 10px 0 14px;
+}
+
+.meter-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 5px;
+}
+
+.meter-label {
+  color: var(--text-dim);
+  font-size: 12px;
+  text-transform: lowercase;
+}
+
+.meter-figure {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.meter-track {
+  height: 6px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  transition: width 0.4s ease;
+}
+
+.meter-fill.ok {
+  background: var(--accent);
+}
+.meter-fill.warn {
+  background: var(--warn);
+}
+.meter-fill.bad {
+  background: var(--bad);
+}
+
+.meter-figure.ok {
+  color: var(--text);
+}
+.meter-figure.warn {
+  color: var(--warn);
+}
+.meter-figure.bad {
+  color: var(--bad);
+}
+
+.meter-hint {
+  margin: 5px 0 0;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+td.ok {
+  color: var(--accent);
+}
+td.bad {
+  color: var(--bad);
+}

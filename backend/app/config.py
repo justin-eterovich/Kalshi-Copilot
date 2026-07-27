@@ -139,7 +139,11 @@ class NewsConfig(_Base):
 
 class NotificationsConfig(_Base):
     enabled: bool = True
-    web_push_enabled: bool = True
+    #: Defaults off. Web Push needs a secure context (HTTPS or localhost) and
+    #: the dashboard is plain HTTP on a LAN address by design, so a service
+    #: worker cannot register. Defaulting this true would promise alerts with
+    #: the tab closed that the browser silently refuses to deliver.
+    web_push_enabled: bool = False
     audio_enabled: bool = True
     favicon_badge: bool = True
 

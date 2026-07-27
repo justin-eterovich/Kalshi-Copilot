@@ -133,6 +133,19 @@ API's own signed `position_fp`.
   excluded ~50,000 markets from proposals over a multiplier that does not
   exist. `category` is still on the Event, not the Market, and is still
   joined across for display and detectors — it just does not price anything.
+- **`GET /portfolio/settlements` mixes units inside one object** — the only
+  endpoint that does. `yes_total_cost_dollars`, `no_total_cost_dollars` and
+  `fee_cost` are fixed-point dollar strings; `revenue` and `value` are
+  **integer cents**. Parsing a cents field as dollars understates it 100x,
+  silently. Settlement P&L is computed against our own `avg_price`, not the
+  exchange's cost basis — the two diverge once a position is partly traded
+  out, and a book with two sources of cost basis eventually contradicts
+  itself. See `app/trading/settlements.py`.
+- **A position held to settlement realises P&L through no fill at all.**
+  `realized_from_fill` only fires when a position is *reduced by trading*, so
+  until M5 the system booked the cost of every held-to-resolution thesis and
+  none of its proceeds. The simulated book settles from the market's own
+  `result`; exchange books settle from the endpoint above. Never cross them.
 - **Candle `price` OHLC is null when no trades occurred** in that period,
   which is most periods in a thin market. Fall back to the quote midpoint or
   charts render empty.
@@ -201,11 +214,14 @@ backend/app/
   trading/
     direction.py     ⭐ (side, action) <-> bid/ask. Never inline this.
     interlocks.py    execution routing + every safety check
+    risk.py          ⭐ portfolio limits: exposure, daily loss, cooldown
+    sizing.py        Kelly sizing; every cap is a ceiling, never a floor
     pricing.py       fee-aware ticket costing (calls fees.py, owns no fee math)
     proposals.py     proposal lifecycle: create, expire, decide
     executor.py      ⭐ the ONLY module that can cause an order to exist
     paper.py         pessimistic fill simulator
     positions.py     signed position + realised P&L accounting
+    settlements.py   ⭐ held-to-resolution P&L; two books, two sources
   worker/
     maintenance.py   proposal expiry, order auto-cancel, reconciliation
   api/routes/        HTTP endpoints
@@ -250,7 +266,7 @@ a liquidity score of −450 on a 0–100 scale, fractional sizes rendering as
 | M2 dashboard core | done |
 | M3 HITL approval/execution rail | done |
 | M4 detectors wave 1 | done (all three; none has signalled live yet) |
-| M5 risk layer + PWA notifications | pending |
+| M5 risk layer + notifications | done (Web Push deferred — needs TLS) |
 | M6 BTC engine + detectors wave 2 | pending |
 | M7 weather engine | pending |
 | M8 news/catalyst engine | pending |
@@ -266,10 +282,17 @@ Branch: `claude/kalshi-copilot-build-bgyv2d`
   to the demo exchange. That proves the plumbing, not the strategy. A real
   edge has still never appeared, which on liquid two-sided books is the
   expected answer.
-- **Two risk limits remain unenforced**: `max_total_exposure_pct` (needs live
-  position aggregation) and `daily_loss_limit_pct` (needs `PnlDaily` wired to
-  a halt). Both are M5. `max_pct_per_market` *is* now enforced, alongside a
-  queue-depth cap and a duplicate guard — see `risk.max_pending_proposals`.
+- **All risk limits are now enforced** (M5): `max_pct_per_market`,
+  `max_total_exposure_pct`, `daily_loss_limit_pct` and
+  `cooldown_after_consecutive_losses`, alongside the queue-depth cap and
+  duplicate guard. See `app/trading/risk.py` and `docs/m5-demo-notes.md`.
+- **Web Push is not built and `notifications.web_push_enabled` defaults
+  false.** The Push API and service workers need a *secure context*; the
+  dashboard is plain HTTP on a LAN address by design, so a service worker
+  cannot register. Alerting is in-tab only (title, favicon badge, audio).
+  Getting alerts with the tab closed needs TLS on the dashboard first — a
+  self-signed cert or a local CA — which is an operator decision, not
+  something to work around in the frontend.
 - **The watchlist goes stale.** Set arbitrage only considers events where
   *every* active leg is in `ingest.watchlist`, so as events settle the
   coverage decays. Regenerate from the top mutually-exclusive events by 24h

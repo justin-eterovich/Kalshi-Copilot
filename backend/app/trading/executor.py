@@ -52,7 +52,7 @@ from app.db.models import (
 )
 from app.kalshi.rest import TIF_GTC, TIF_IOC, KalshiApiError, KalshiRestClient
 from app.settings import Settings
-from app.trading import paper, positions, proposals
+from app.trading import paper, positions, proposals, risk
 from app.trading.direction import book_side, to_yes_price
 from app.trading.interlocks import ExecutionRoute, InterlockError, check_execution
 
@@ -150,7 +150,8 @@ class Executor:
         Raises:
             InterlockError: a safety check refused. Nothing is placed and the
                 proposal stays pending, so it can be approved again once the
-                condition clears (or expire on its own).
+                condition clears (or expire on its own). ``RiskError`` is a
+                subclass, so the portfolio limits refuse the same way.
             ExecutionError: placement itself failed. The proposal is marked
                 FAILED and the order row records why.
         """
@@ -160,6 +161,19 @@ class Executor:
             self._config,
             confirmed=confirmed,
             confirmation_phrase=confirmation_phrase,
+        )
+
+        # The portfolio limits, which no single proposal can check about
+        # itself. They live here rather than in the API layer for the same
+        # reason as everything above: this is the only function that can cause
+        # an order to exist, so it is the only place a check cannot be
+        # sidestepped. A refusal leaves the proposal pending — the limits are
+        # all temporary, and the trade may be fine in an hour.
+        await risk.guard_approval(
+            session,
+            self._config,
+            self._settings,
+            max_loss_cents=proposal.max_loss_cents,
         )
 
         existing = await self._live_order_for(session, proposal)

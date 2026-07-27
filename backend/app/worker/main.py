@@ -46,6 +46,11 @@ ORDER_SWEEP_SEC = 10
 #: Detector scans read books over REST for every leg of every watched
 #: event, so they are the heaviest loop here.
 DETECTOR_SCAN_SEC = 20
+#: Settlement is not a fast-moving event — a market resolves once and the
+#: payout does not change afterwards — so this is the slowest loop here. It
+#: still has to exist, because the risk layer's loss limit is only as current
+#: as the P&L it reads.
+SETTLEMENT_SWEEP_SEC = 120
 
 
 async def _heartbeat_loop(stop: asyncio.Event) -> None:
@@ -81,6 +86,26 @@ async def _order_sweep_loop(executor: Executor, stop: asyncio.Event) -> None:
             log.exception("order sweep failed: %s", exc)
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=ORDER_SWEEP_SEC)
+
+
+async def _settlement_loop(executor: Executor, stop: asyncio.Event) -> None:
+    """Realise P&L on positions whose markets have resolved.
+
+    Held-to-settlement is how most theses here are meant to pay off, and it
+    produces no fill — without this loop the system records the cost of every
+    such position and none of the proceeds.
+    """
+    sessions = get_session_factory()
+    settings = get_settings()
+    while not stop.is_set():
+        try:
+            await maintenance.sweep_settlements(
+                sessions, executor, settings, get_config()
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("settlement sweep failed: %s", exc)
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=SETTLEMENT_SWEEP_SEC)
 
 
 async def _detector_loop(detectors: list[Any], stop: asyncio.Event) -> None:
@@ -182,6 +207,7 @@ async def run() -> None:
         asyncio.create_task(_proposal_sweep_loop(stop), name="proposal-sweep"),
         asyncio.create_task(_order_sweep_loop(executor, stop), name="order-sweep"),
         asyncio.create_task(_detector_loop(detectors, stop), name="detectors"),
+        asyncio.create_task(_settlement_loop(executor, stop), name="settlements"),
     ]
 
     try:

@@ -33,7 +33,7 @@ from app.trading.direction import signed_contracts, to_yes_price
 
 log = get_logger(__name__)
 
-__all__ = ["apply_fill", "realized_from_fill", "position_view"]
+__all__ = ["apply_fill", "realized_from_fill", "position_view", "roll_daily"]
 
 HUNDRED = Decimal(100)
 
@@ -150,7 +150,12 @@ async def apply_fill(session: AsyncSession, fill: Fill, *, route: str) -> Positi
         position.fees_paid_cents or Decimal(0)
     ) + fill.fee_cents
 
-    await _roll_daily(
+    # Stamped on the fill as well as rolled into the day, so the risk layer
+    # can ask which of the recent closes lost money. A daily aggregate cannot
+    # answer that, and "were the last three trades losers?" is a limit.
+    fill.realized_pnl_cents = realized
+
+    await roll_daily(
         session,
         day=(fill.ts or datetime.now(UTC)).date(),
         route=route,
@@ -162,7 +167,7 @@ async def apply_fill(session: AsyncSession, fill: Fill, *, route: str) -> Positi
     return position
 
 
-async def _roll_daily(
+async def roll_daily(
     session: AsyncSession,
     *,
     day: date,
@@ -170,6 +175,7 @@ async def _roll_daily(
     is_paper: bool,
     realized: Decimal,
     fee_cents: Decimal,
+    kind: str = "fill",
 ) -> None:
     row = (
         await session.execute(
@@ -186,12 +192,16 @@ async def _roll_daily(
             unrealized_pnl_cents=Decimal(0),
             fees_paid_cents=Decimal(0),
             trades=0,
+            settlements=0,
         )
         session.add(row)
 
     row.realized_pnl_cents = (row.realized_pnl_cents or Decimal(0)) + realized
     row.fees_paid_cents = (row.fees_paid_cents or Decimal(0)) + fee_cents
-    row.trades = (row.trades or 0) + 1
+    if kind == "settlement":
+        row.settlements = (row.settlements or 0) + 1
+    else:
+        row.trades = (row.trades or 0) + 1
 
 
 def position_view(

@@ -113,6 +113,28 @@ async def _guard_duplicate(
         )
 
 
+async def _guard_halted(session: AsyncSession, config: Config) -> None:
+    """Refuse to propose while the book is halted.
+
+    The enforcement that matters is in the executor — nothing created here can
+    reach an exchange without passing that check again. This exists so a
+    halted system stops *producing* proposals rather than accumulating a
+    backlog it will refuse one at a time, which would train the operator to
+    click through refusals during exactly the drawdown the halt was called
+    for.
+    """
+    from app.settings import get_settings
+    from app.trading import risk
+
+    state = await risk.halt_state(session, config, get_settings())
+    if state is None:
+        return
+    try:
+        risk.check_halted(state, config)
+    except risk.RiskError as exc:
+        raise ProposalError(exc.code, str(exc)) from exc
+
+
 def _guard_market_size(
     max_loss_cents: Decimal | None, config: Config, *, what: str
 ) -> float:
@@ -230,6 +252,7 @@ async def create_proposal(
         fair_price=fair_price,
     )
 
+    await _guard_halted(session, config)
     await _guard_queue_depth(session, config)
     pct = _guard_market_size(quote.max_loss_cents, config, what=ticker)
 
@@ -243,6 +266,7 @@ async def create_proposal(
         leg_count=1,
         net_edge_cents=quote.net_edge_cents,
         est_fee_cents=quote.est_fee_cents,
+        max_loss_cents=quote.max_loss_cents,
         pct_of_bankroll=pct,
         rationale=rationale,
         status=ProposalStatus.PENDING,
@@ -398,6 +422,10 @@ def proposal_view(
             None if proposal.est_fee_cents is None
             else str(proposal.est_fee_cents)
         ),
+        "max_loss_cents": (
+            None if proposal.max_loss_cents is None
+            else str(proposal.max_loss_cents)
+        ),
         "pct_of_bankroll": proposal.pct_of_bankroll,
         "rationale": proposal.rationale,
         "status": proposal.status.value,
@@ -474,6 +502,7 @@ async def create_multi_leg_proposal(
             "create_proposal for a single-market ticket.",
         )
 
+    await _guard_halted(session, config)
     await _guard_queue_depth(session, config)
     await _guard_duplicate(session, source=source, key=event_ticker)
     pct = _guard_market_size(max_loss_cents, config, what=event_ticker)
@@ -489,6 +518,7 @@ async def create_multi_leg_proposal(
         leg_count=len(legs),
         net_edge_cents=net_edge_cents,
         est_fee_cents=est_fee_cents,
+        max_loss_cents=max_loss_cents,
         pct_of_bankroll=pct,
         rationale=rationale,
         status=ProposalStatus.PENDING,

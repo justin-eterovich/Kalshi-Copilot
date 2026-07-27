@@ -300,7 +300,14 @@ news:
 # No Telegram, no ntfy, no third-party push services.
 # ---------------------------------------------------------------------------
 notifications:
-  web_push_enabled: true
+  # OFF, and not merely unimplemented: the Push API and service workers
+  # require a *secure context*, and this dashboard is served over plain HTTP
+  # on a LAN address by design. Turning this on cannot work until the
+  # dashboard has TLS (a self-signed cert, or a local CA installed on each
+  # device), which is an operator decision — see docs/m5-demo-notes.md.
+  # Everything below works today and needs no permission prompt, but only
+  # while a tab is open.
+  web_push_enabled: false
   audio_enabled: true
   favicon_badge: true
   # Kill everything above with one flag.

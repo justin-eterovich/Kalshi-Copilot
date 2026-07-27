@@ -24,8 +24,8 @@ model-driven fair value.
 | **M2** | Dashboard core (screener, market page, charts) | ✅ done |
 | **M3** | HITL approval + execution rail | ✅ done |
 | **M4** | Detectors wave 1 (set-arb, resolution sniper, BTC stale-quote) | ✅ done |
-| M5 | Risk layer + PWA notifications | **next** |
-| M6 | BTC engine + detectors wave 2 | pending |
+| **M5** | Risk layer, settlements, Kelly sizing, in-tab alerts | ✅ done |
+| M6 | BTC engine + detectors wave 2 | **next** |
 | M7 | Weather engine | pending |
 | M8 | News + catalyst engine | pending |
 | M9 | Backtester, report card, hardening | pending |
@@ -254,6 +254,13 @@ fixed percentage (`decisive_margin_pct`), not output from a volatility model;
 that arrives in M6. So it requires both a margin *and* a short time to close,
 and caps fair value at 0.98 rather than 1.00. `custom` strike types are
 refused — their rules live in prose.
+
+Size comes from Kelly rather than a fixed `size_hint`, on the after-fee cost
+(`app/trading/sizing.py`). Because the fair value here is a heuristic, the
+undiscounted Kelly fraction can be alarming — 80% of bankroll for a 98¢-fair
+contract at 90¢ — so `risk.kelly_fraction`, the per-market cap and the
+exposure headroom all cut it before anything is proposed. The binding cap is
+named in the proposal's rationale.
 
 ### Resolution sniper
 
@@ -614,6 +621,10 @@ python -m pytest tests/ -v
 | Kill switch | Halts all proposals and cancels resting orders. |
 | Queue depth cap | `risk.max_pending_proposals` (default 10). Not a risk limit — it protects *attention*. A detector scanning every 20s produced 20 proposals per scan, and a queue nobody reads is rubber-stamped rather than reviewed. |
 | Per-market size limit | `risk.max_pct_per_market` is enforced at proposal creation, not merely displayed. |
+| Total exposure limit | `risk.max_total_exposure_pct`, measured as **cost basis** across open positions on that route. Marking to market would let an unrealised gain finance more risk before it has paid out. Ten trades each inside the per-market cap can still be the whole bankroll. |
+| Daily loss limit | `risk.daily_loss_limit_pct`, **net of fees**. Halts new proposals *and* approvals for the rest of the UTC day. A limit reading only realised P&L would let a fee-losing strategy run. |
+| Loss cooldown | `risk.cooldown_after_consecutive_losses` — a losing streak is when a human is most likely to approve something they would otherwise refuse. A "close" is a reducing fill **or a settlement**; a scratch does not break a streak, a winner does. |
+| Kelly-capped sizing | Size comes from `f* = (p-c)/(1-c)` on the **after-fee** cost, discounted by `risk.kelly_fraction`, then capped by the per-market limit, remaining exposure headroom, and executable depth. Every cap is a ceiling; sizes round down. |
 | Duplicate guard | A detector re-derives the same opportunity every scan; one live proposal per event per detector. |
 | Detector flags | Each detector independently enabled; all off by default. |
 | Fee fail-closed | Unknown fee multiplier ⇒ market excluded, never guessed. |

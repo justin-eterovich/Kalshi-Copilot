@@ -216,6 +216,8 @@ export interface Proposal {
   legs: ProposalLeg[];
   net_edge_cents: string | null;
   est_fee_cents: string | null;
+  /** Worst case across every leg, in cents. What the risk limits measure. */
+  max_loss_cents: string | null;
   pct_of_bankroll: number | null;
   rationale: string | null;
   status: string;
@@ -258,6 +260,66 @@ export interface FillRow {
   fee_cents: string;
   is_taker: boolean;
   ts: string | null;
+}
+
+/**
+ * Portfolio risk limits and how close each one is.
+ *
+ * Every money field is a decimal string of **cents**, like the rest of the
+ * API — formatted for display, never computed with.
+ */
+export interface RiskState {
+  route: string;
+  day: string;
+  bankroll_cents: string;
+  exposure_cents: string;
+  pending_cents: string;
+  committed_cents: string;
+  exposure_limit_cents: string;
+  headroom_cents: string;
+  daily_realized_cents: string;
+  daily_fees_cents: string;
+  /** Realised minus fees. The only honest version of the day's P&L. */
+  daily_net_cents: string;
+  daily_loss_limit_cents: string;
+  daily_loss_breached: boolean;
+  consecutive_losses: number;
+  cooldown_until: string | null;
+  in_cooldown: boolean;
+  halted: boolean;
+}
+
+export interface RiskLimits {
+  bankroll_usd: number;
+  max_pct_per_market: number;
+  max_total_exposure_pct: number;
+  daily_loss_limit_pct: number;
+  cooldown_after_consecutive_losses: number;
+  cooldown_minutes: number;
+  kelly_fraction: number;
+  max_pending_proposals: number;
+}
+
+export interface RiskResponse {
+  /** Null only when no execution route is usable at all. */
+  state: RiskState | null;
+  limits: RiskLimits;
+}
+
+/** A market that resolved while we held a position in it. */
+export interface SettlementRow {
+  ticker: string;
+  event_ticker: string | null;
+  route: string;
+  result: string | null;
+  settled_yes_value: string;
+  net_contracts: string;
+  avg_price: string;
+  realized_pnl_cents: string;
+  fee_cents: string;
+  /** exchange | market — the latter is the simulated book settling locally. */
+  source: string;
+  settled_at: string | null;
 }
 
 export interface PositionRow {
@@ -454,6 +516,11 @@ export const api = {
 
   audit: (kind?: string) =>
     getJson<{ entries: AuditEntry[] }>(`/api/audit?${qs({ kind, limit: 100 })}`),
+
+  risk: () => getJson<RiskResponse>("/api/risk"),
+
+  settlements: () =>
+    getJson<{ settlements: SettlementRow[] }>("/api/settlements?limit=50"),
 };
 
 // ---------------------------------------------------------------------------

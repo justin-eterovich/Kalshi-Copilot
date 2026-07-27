@@ -91,13 +91,21 @@ class FakeSession:
     legs: list[Any] = []
 
     async def execute(self, stmt: Any) -> FakeResult:
-        # Two SELECTs reach here: "is there a live order for this proposal"
-        # and "what are its legs". Distinguish by the compiled text rather
-        # than by call order, which would be brittle.
+        # Several SELECTs reach here — the two the executor makes ("is there
+        # a live order for this proposal", "what are its legs") plus the
+        # portfolio queries the risk layer runs before them. Dispatch on the
+        # driving table rather than on call order, which would be brittle, and
+        # rather than on a substring, which would hand a list of Orders to the
+        # risk layer's join against `orders` and unpack it as position rows.
         text = str(stmt).lower()
-        if "proposal_legs" in text:
+        if "from proposal_legs" in text:
             return FakeResult(self.legs)
-        return FakeResult(self._existing)
+        if "from orders" in text:
+            return FakeResult(self._existing)
+        # Everything else — positions, pnl_daily, fills, settlements — is an
+        # empty book. These tests are about the executor's control flow; the
+        # risk limits have their own.
+        return FakeResult([])
 
     def of_type(self, model: type) -> list[Any]:
         return [o for o in self.added if isinstance(o, model)]

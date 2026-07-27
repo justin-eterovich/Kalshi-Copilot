@@ -37,6 +37,9 @@ from app.db.models import Event, Market, Side
 from app.detectors.base import Finding
 from app.detectors.set_arbitrage import LegBook, max_executable_sets, price_set
 from app.kalshi.rest import KalshiApiError, KalshiRestClient
+from app.settings import get_settings
+from app.trading import risk
+from app.trading.sizing import recommend_size
 
 log = get_logger(__name__)
 
@@ -314,6 +317,14 @@ class StaleQuoteDetector:
         slippage = Decimal(str(config.costs.slippage_buffer_cents))
         findings: list[Finding] = []
 
+        # One snapshot for the whole scan. Sizing reads the portfolio's
+        # remaining headroom so an already-committed book proposes smaller
+        # rather than proposing something the executor will refuse — the
+        # limit is enforced there regardless, this just stops the queue
+        # filling with trades that cannot be approved.
+        state = await risk.halt_state(session, config, get_settings())
+        headroom = state.headroom_cents if state else None
+
         for market in markets:
             verdict = resolve_strike(
                 strike_type=market.strike_type,
@@ -341,7 +352,36 @@ class StaleQuoteDetector:
             mins_left = (
                 market.close_time - datetime.now(UTC)
             ).total_seconds() / 60
-            size = Decimal(str(getattr(cfg, "size_hint", 10)))
+
+            # Two passes, because fees round per fill and so the edge depends
+            # slightly on the size. Probe at a nominal size to learn the
+            # all-in cost, size against that, then re-price at the size we
+            # actually mean to trade — the number shown must be the number
+            # for this ticket, not for a hypothetical one.
+            probe = Decimal(str(getattr(cfg, "size_hint", 10)))
+            probe_edge = net_edge_cents(
+                fair, price, probe, series_of(market.ticker),
+                slippage_cents=slippage, schedule=schedule,
+            )
+            if probe_edge < min_edge:
+                continue
+
+            # cost = fair - edge, by construction: the net edge is exactly
+            # fair minus everything the contract costs to acquire. Deriving it
+            # this way keeps every fee in app.core.fees, where the rule says
+            # it belongs, instead of recomputing one here.
+            cost = fair - probe_edge / Decimal(100)
+            recommendation = recommend_size(
+                fair_price=fair,
+                cost_per_contract=cost,
+                config=config,
+                available_contracts=market.yes_ask_size if verdict.yes else None,
+                exposure_headroom_cents=headroom,
+            )
+            if not recommendation.is_tradeable:
+                continue
+
+            size = recommendation.contracts
             edge = net_edge_cents(
                 fair, price, size, series_of(market.ticker),
                 slippage_cents=slippage, schedule=schedule,
@@ -364,7 +404,10 @@ class StaleQuoteDetector:
                     rationale=(
                         f"spot {spot} is {verdict.margin_pct:.2f}% past the "
                         f"{market.strike_type} strike with "
-                        f"{mins_left:.0f}m left; {side.value} quoted at {price}"
+                        f"{mins_left:.0f}m left; {side.value} quoted at {price}. "
+                        f"{size} contracts at "
+                        f"{recommendation.scaled_fraction:.1%} of bankroll "
+                        f"(capped by {recommendation.binding_constraint})"
                     ),
                     evidence={
                         "spot": str(spot),
@@ -376,6 +419,10 @@ class StaleQuoteDetector:
                         "margin_pct": str(verdict.margin_pct),
                         "fair_price": str(fair),
                         "price": str(price),
+                        "all_in_cost": str(cost),
+                        "full_kelly": str(recommendation.kelly_fraction),
+                        "staked_fraction": str(recommendation.scaled_fraction),
+                        "size_capped_by": recommendation.binding_constraint,
                         "heuristic": "fixed margin, not a volatility model",
                     },
                 )

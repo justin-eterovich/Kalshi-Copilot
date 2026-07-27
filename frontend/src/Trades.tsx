@@ -6,11 +6,13 @@
  * that only appears after a refresh is an approval request you miss.
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import ApprovalCard from "./ApprovalCard";
+import RiskPanel from "./RiskPanel";
 import {
   api,
+  asCents,
   asClock,
   asDollars,
   asSignedCents,
@@ -21,9 +23,12 @@ import {
   type OrderRow,
   type PositionRow,
   type Proposal,
+  type RiskResponse,
+  type SettlementRow,
   type SignalRow,
   type TradingState,
 } from "./api";
+import { alertOnNew, setBadge, unlockAudio } from "./notify";
 import { useLiveFeed } from "./useLiveFeed";
 
 const WORKING = new Set(["pending", "resting", "partially_filled"]);
@@ -40,11 +45,17 @@ export default function Trades() {
   const [fills, setFills] = useState<FillRow[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [signals, setSignals] = useState<SignalRow[]>([]);
+  const [risk, setRisk] = useState<RiskResponse | null>(null);
+  const [settlements, setSettlements] = useState<SettlementRow[]>([]);
   const [error, setError] = useState<string | null>(null);
+
+  // Null until the first poll lands — an empty set here would be read as "the
+  // queue was empty last time" and would swallow the first alert.
+  const seenProposals = useRef<Set<number> | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const [s, p, o, pos, f, a, sig] = await Promise.all([
+      const [s, p, o, pos, f, a, sig, r, settled] = await Promise.all([
         api.tradingState(),
         api.proposals(),
         api.orders(),
@@ -52,6 +63,8 @@ export default function Trades() {
         api.fills(),
         api.audit(),
         api.signals(),
+        api.risk(),
+        api.settlements(),
       ]);
       setState(s);
       setProposals(p.proposals);
@@ -60,7 +73,17 @@ export default function Trades() {
       setFills(f.fills);
       setAudit(a.entries);
       setSignals(sig.signals);
+      setRisk(r);
+      setSettlements(settled.settlements);
       setError(null);
+
+      // A proposal lives about two minutes. If the tab is in the background
+      // for that long the decision is missed entirely, so the arrival has to
+      // be able to interrupt.
+      seenProposals.current = alertOnNew(
+        p.proposals.filter((x) => x.status === "pending").map((x) => x.id),
+        seenProposals.current,
+      );
     } catch (e) {
       setError(String(e));
     }
@@ -72,6 +95,23 @@ export default function Trades() {
     const id = setInterval(load, 3000);
     return () => clearInterval(id);
   }, [load]);
+
+  // Leaving the page must clear the badge; a stale "(3)" in the tab strip is
+  // worse than none, because it is the thing being trusted at a glance.
+  useEffect(() => () => setBadge(0), []);
+
+  // Browsers refuse to start an AudioContext before a real user gesture, so
+  // the first click anywhere on the page arms the ping. Until then the
+  // favicon and title badges carry the signal on their own.
+  useEffect(() => {
+    const arm = () => unlockAudio();
+    window.addEventListener("pointerdown", arm, { once: true });
+    window.addEventListener("keydown", arm, { once: true });
+    return () => {
+      window.removeEventListener("pointerdown", arm);
+      window.removeEventListener("keydown", arm);
+    };
+  }, []);
 
   // Proposals and orders bypass the per-market tick filter by design.
   useLiveFeed([], (message) => {
@@ -152,6 +192,11 @@ export default function Trades() {
           <span className="stat-value">{state?.proposal_ttl_sec ?? "—"}s</span>
         </div>
       </div>
+
+      {/* Above the queue on purpose: the limits are what will refuse an
+          approval, so they belong where they are read before deciding, not
+          buried under the decision. */}
+      <RiskPanel risk={risk} />
 
       <section className="panel" style={{ marginBottom: 12 }}>
         <div className="panel-head">
@@ -347,6 +392,63 @@ export default function Trades() {
           )}
         </section>
       </div>
+
+      <section className="panel" style={{ marginTop: 12 }}>
+        <div className="panel-head">
+          <h2>Settlements</h2>
+          <span className="muted">
+            outcomes, not decisions — where a held-to-resolution thesis is
+            finally scored
+          </span>
+        </div>
+        {settlements.length === 0 ? (
+          <Empty>
+            Nothing has settled yet. A position held to resolution shows its
+            result here, not in Fills.
+          </Empty>
+        ) : (
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>market</th>
+                  <th>route</th>
+                  <th>result</th>
+                  <th className="num">held</th>
+                  <th className="num">avg</th>
+                  <th className="num">paid</th>
+                  <th className="num">P&amp;L</th>
+                  <th>when</th>
+                </tr>
+              </thead>
+              <tbody>
+                {settlements.map((s) => (
+                  <tr key={`${s.ticker}-${s.route}`}>
+                    <td>
+                      <Link to={`/market/${s.ticker}`}>{s.ticker}</Link>
+                    </td>
+                    <td>{routeLabel(s.route)}</td>
+                    <td>{s.result ?? "—"}</td>
+                    <td className="num">{s.net_contracts}</td>
+                    {/* Both are YES prices in dollars, not cents figures —
+                        asDollars would divide them by 100 a second time. */}
+                    <td className="num">{asCents(s.avg_price)}</td>
+                    <td className="num">{asCents(s.settled_yes_value)}</td>
+                    <td
+                      className={
+                        Number(s.realized_pnl_cents) < 0 ? "num bad" : "num ok"
+                      }
+                    >
+                      {asSignedCents(s.realized_pnl_cents)}
+                    </td>
+                    <td>{s.settled_at ? asClock(s.settled_at) : "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
 
       <section className="panel" style={{ marginTop: 12 }}>
         <div className="panel-head">

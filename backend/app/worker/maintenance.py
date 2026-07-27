@@ -29,18 +29,24 @@ from app.core.logging import get_logger
 from app.core.money import parse_count, parse_dollars
 from app.db.models import Fill, Order, OrderStatus
 from app.kalshi.rest import KalshiApiError
-from app.trading import positions, proposals
+from app.settings import Settings
+from app.trading import positions, proposals, settlements
 from app.trading.direction import from_yes_price
 from app.trading.executor import (
     LIVE_ORDER_STATUSES,
     Executor,
     fee_cents_from_dollars,
 )
-from app.trading.interlocks import ExecutionRoute
+from app.trading.interlocks import ExecutionRoute, InterlockError, resolve_route
 
 log = get_logger(__name__)
 
-__all__ = ["sweep_proposals", "sweep_orders", "reconcile_order"]
+__all__ = [
+    "sweep_proposals",
+    "sweep_orders",
+    "sweep_settlements",
+    "reconcile_order",
+]
 
 
 async def sweep_proposals(sessions: async_sessionmaker[AsyncSession]) -> int:
@@ -102,6 +108,50 @@ async def sweep_orders(
     if cancelled:
         log.info("auto-cancelled %d working order(s)", cancelled)
     return cancelled
+
+
+async def sweep_settlements(
+    sessions: async_sessionmaker[AsyncSession],
+    executor: Executor,
+    settings: Settings,
+    config: Config,
+) -> int:
+    """Close out positions in markets that have resolved.
+
+    Runs both books every pass. The simulated one always settles locally from
+    the markets' own results; the exchange one is only swept when the current
+    route actually reaches Kalshi, because a settlement feed belongs to the
+    account it came from and applying it to some other book would realise P&L
+    against contracts that book never held.
+    """
+    applied = 0
+    async with sessions() as session:
+        try:
+            applied += await settlements.sync_local_settlements(session)
+        except Exception as exc:  # noqa: BLE001 - one bad market must not stall the rest
+            log.exception("local settlement sweep failed: %s", exc)
+
+        client = executor.rest
+        try:
+            route = resolve_route(settings, config)
+        except InterlockError:
+            # An unusable trading config still has a simulated book worth
+            # settling, which is why this comes after the local sweep.
+            route = None
+
+        if route is not None and route.hits_exchange and client is not None:
+            try:
+                applied += await settlements.sync_exchange_settlements(
+                    session, client, route=route.value
+                )
+            except KalshiApiError as exc:
+                log.warning("could not sync exchange settlements: %s", exc)
+
+        await session.commit()
+
+    if applied:
+        log.info("settled %d position(s)", applied)
+    return applied
 
 
 async def reconcile_order(

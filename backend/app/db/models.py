@@ -365,6 +365,12 @@ class ProposedTrade(Base):
     net_edge_cents: Mapped[Decimal | None] = mapped_column(Numeric(10, 4))
     #: Estimated fee in cents, fractional (fees round to a centicent).
     est_fee_cents: Mapped[Decimal | None] = mapped_column(CentsType)
+    #: Worst case for this decision, in cents, across every leg. Persisted
+    #: rather than recomputed because the risk layer must evaluate the number
+    #: the operator was actually shown on the card: a re-derivation prices
+    #: against a book that has moved since, so the limit would be enforcing
+    #: something nobody approved.
+    max_loss_cents: Mapped[Decimal | None] = mapped_column(CentsType)
     pct_of_bankroll: Mapped[float | None] = mapped_column(Float)
     rationale: Mapped[str | None] = mapped_column(Text)
 
@@ -487,6 +493,11 @@ class Fill(Base):
     #: note in that module about which direction to be wrong in.
     fee_cents: Mapped[Decimal] = mapped_column(CentsType, default=Decimal(0))
     is_taker: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: P&L this fill realised against the position it hit — zero for a fill
+    #: that opened or added. Stored per fill, not just rolled into the daily
+    #: aggregate, because the risk layer has to ask "were the last N closes
+    #: losers?" and an aggregate cannot answer that. See app.trading.risk.
+    realized_pnl_cents: Mapped[Decimal] = mapped_column(CentsType, default=Decimal(0))
     ts: Mapped[datetime] = _ts()
 
 
@@ -528,6 +539,57 @@ class Position(Base):
     )
 
 
+class Settlement(Base):
+    """A market that resolved while we held a position in it.
+
+    This table exists because **a position held to settlement never realises
+    P&L through a fill**, and settlement is how most of this system's theses
+    are meant to pay off. Without it the daily loss limit and the loss
+    cooldown are blind to the main way money is made or lost, and the report
+    card scores only the positions that happened to be traded out of early.
+
+    Deduplicated on ``(ticker, route)``: a market settles exactly once per
+    book, and applying a settlement twice would double the realised P&L
+    permanently, with nothing downstream to catch it.
+
+    P&L is computed against **our own** ``avg_price``, not against the cost
+    basis the exchange reports. The two disagree whenever a position was
+    partly traded out before settlement — the exchange's basis covers the
+    contracts it still saw, ours covers what we recognised — and mixing the
+    two would leave the position and the daily total telling different
+    stories. The settlement payload is used only for the two things it alone
+    knows: that the market resolved, and what a YES contract paid.
+    """
+
+    __tablename__ = "settlements"
+    __table_args__ = (UniqueConstraint("ticker", "route", name="uq_settlement"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    ticker: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    event_ticker: Mapped[str | None] = mapped_column(String(128), index=True)
+    route: Mapped[str] = mapped_column(String(16), default="simulated", nullable=False)
+    #: yes | no | scalar, as the exchange reports it.
+    market_result: Mapped[str | None] = mapped_column(String(16))
+    #: What one YES contract paid, in dollars: 1 for yes, 0 for no, and
+    #: somewhere between for a scalar market.
+    settled_yes_value: Mapped[Decimal] = mapped_column(PriceType, nullable=False)
+    #: The signed YES-equivalent position that was open when it settled, and
+    #: the average YES price it was carried at. Both kept so a settlement row
+    #: can be re-derived and argued with after the position row is flat.
+    net_contracts: Mapped[Decimal] = mapped_column(QtyType, default=Decimal(0))
+    avg_price: Mapped[Decimal] = mapped_column(PriceType, default=Decimal(0))
+    realized_pnl_cents: Mapped[Decimal] = mapped_column(CentsType, default=Decimal(0))
+    #: Settlement fees, where the series charges them. Fixed-point dollars on
+    #: the wire, cents here, and fractional either way.
+    fee_cents: Mapped[Decimal] = mapped_column(CentsType, default=Decimal(0))
+    #: ``exchange`` when it came from /portfolio/settlements, ``market`` when
+    #: it was derived locally from the market's own result. The simulated book
+    #: has no exchange settlements — those positions exist nowhere but here.
+    source: Mapped[str] = mapped_column(String(16), default="exchange")
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = _ts()
+
+
 class PnlDaily(Base):
     __tablename__ = "pnl_daily"
     __table_args__ = (UniqueConstraint("day", "route", name="uq_pnl_day"),)
@@ -545,7 +607,11 @@ class PnlDaily(Base):
         CentsType, default=Decimal(0)
     )
     fees_paid_cents: Mapped[Decimal] = mapped_column(CentsType, default=Decimal(0))
+    #: Fills applied on this day. Counted separately from settlements because
+    #: they are different events: a fill is a decision, a settlement is an
+    #: outcome, and a day of three settlements and no trades is not idle.
     trades: Mapped[int] = mapped_column(Integer, default=0)
+    settlements: Mapped[int] = mapped_column(Integer, default=0)
 
 
 # ---------------------------------------------------------------------------
