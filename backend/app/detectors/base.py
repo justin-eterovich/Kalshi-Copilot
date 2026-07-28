@@ -35,11 +35,33 @@ log = get_logger(__name__)
 __all__ = [
     "Finding",
     "Detector",
+    "enabled_detector_names",
     "record",
     "publish_signal",
     "propose_finding",
     "is_material_change",
 ]
+
+
+def enabled_detector_names(config: Config) -> list[str]:
+    """Every detector currently enabled, including those configured elsewhere.
+
+    ``DetectorsConfig.enabled_names()`` walks the ``detectors:`` block and can
+    only recognise ``DetectorConfig`` fields, so the weather engine — switched
+    on at ``weather.enabled``, a ``WeatherConfig`` one level up — never
+    appeared in the worker's boot log or in ``/api/system``'s
+    ``enabled_detectors``. It scanned, and could signal, while the dashboard
+    said no detectors were enabled.
+
+    That is the same failure the ``leaderboard_watcher`` stub exists to
+    prevent, pointed the other way: there, a detector missing from the registry
+    looks like one that runs and finds nothing; here, a detector missing from
+    the *status* looks like one that is switched off.
+    """
+    names = list(config.detectors.enabled_names())
+    if config.weather.enabled and "weather" not in names:
+        names.append("weather")
+    return names
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +212,11 @@ async def publish_signal(finding: Finding, signal_id: int | None = None) -> None
         log.warning("could not publish signal for %s: %s", finding.ticker, exc)
 
 
+#: Detectors already told about the single-leg gap. The per-finding refusal
+#: below is counted every scan; this narrates the *reason* once per process.
+_SINGLE_LEG_WARNED: set[str] = set()
+
+
 async def propose_finding(
     session: AsyncSession,
     config: Config,
@@ -205,12 +232,62 @@ async def propose_finding(
 
     Still nothing automatic: this creates a *pending* proposal. It reaches an
     exchange only after a human approves it.
+
+    A **single-leg** finding goes to :func:`create_proposal` instead, through
+    exactly the same guards (halted, queue depth, duplicate, per-market size)
+    and the same pending queue. It used to return ``None`` silently, so an
+    enabled stale-quote detector that had found an edge, sized it with Kelly
+    and named its binding cap looked from the operator's side exactly like one
+    that had found nothing — five of the six detectors could never reach the
+    queue, while the README described the proposals they would produce.
+
+    A single-leg proposal is not a weaker decision than a multi-leg one; the
+    reason set arbitrage must stay one proposal is that its legs *hedge each
+    other*, which is a property of that strategy, not of proposals.
     """
-    from app.trading.proposals import create_multi_leg_proposal
+    from app.trading.proposals import (
+        ProposalError,
+        create_multi_leg_proposal,
+        create_proposal,
+    )
 
     legs = finding.evidence.get("legs") or []
     if len(legs) < 2:
-        return None
+        price = finding.evidence.get("price")
+        if price is None or not finding.size_hint:
+            # Nothing to write a ticket from. Still not silent: a finding that
+            # cannot be costed is a detector bug, not an absence of edge.
+            if finding.detector not in _SINGLE_LEG_WARNED:
+                _SINGLE_LEG_WARNED.add(finding.detector)
+                log.warning(
+                    "%s produced a finding with no executable price or size "
+                    "(price=%r, size_hint=%r); recorded as a signal only.",
+                    finding.detector, price, finding.size_hint,
+                )
+            raise ProposalError(
+                "not_costable",
+                f"{finding.detector} found an opportunity on {finding.ticker} "
+                f"with no executable price or size, so no ticket can be "
+                f"written; recorded as a signal only.",
+            )
+
+        proposal, _quote = await create_proposal(
+            session,
+            config,
+            ticker=finding.ticker,
+            side=finding.side,
+            # These detectors buy the side their model says is right. A
+            # detector that means to sell says so in its evidence.
+            action=str(finding.evidence.get("action") or "buy"),
+            limit_price=str(price),
+            contracts=str(finding.size_hint),
+            source=finding.detector,
+            fair_price=finding.fair_price,
+            rationale=finding.rationale,
+            signal_id=signal.id,
+            actor="system",
+        )
+        return proposal
 
     direction = finding.evidence.get("direction", "sell")
 

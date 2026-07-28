@@ -200,28 +200,71 @@ class FeeSchedule:
         return self.verified_on is not None
 
     @property
-    def default_is_safe(self) -> bool:
-        """True when assuming the default for an unlisted series cannot
-        understate a fee — i.e. no listed multiplier exceeds the default."""
+    def default_taker_is_safe(self) -> bool:
+        """No listed *taker* multiplier exceeds the taker default."""
         if not self.series:
             return True
         return max(taker for _, taker in self.series.values()) <= (
             self.default_taker_multiplier
         )
 
-    def _multipliers(self, series: str | None) -> tuple[Decimal, Decimal]:
+    @property
+    def default_maker_is_safe(self) -> bool:
+        """No listed *maker* multiplier exceeds the maker default.
+
+        This is **False** on the real schedule and that is not a parse error:
+        listed series carry maker multipliers up to 1 while the documented
+        default is 0. So assuming the default for a series we did not find
+        genuinely can understate a maker fee, and that side has to fail closed.
+        """
+        if not self.series:
+            return True
+        return max(maker for maker, _ in self.series.values()) <= (
+            self.default_maker_multiplier
+        )
+
+    @property
+    def default_is_safe(self) -> bool:
+        """True when assuming the default for an unlisted series cannot
+        understate a fee — on **either** side.
+
+        Checked per side rather than as one flag, because the two answers
+        differ and collapsing them loses real money in one direction or
+        excludes the whole catalogue in the other. This property answers the
+        general question its docstring always claimed to; the fee lookups
+        below ask the narrower, side-specific one, so an unlisted series is
+        still priced as a taker (safe) and still refused as a maker (not).
+        """
+        return self.default_taker_is_safe and self.default_maker_is_safe
+
+    def _multipliers(
+        self, series: str | None, *, need: str = "both"
+    ) -> tuple[Decimal, Decimal]:
+        """Multipliers for ``series``, refusing when the default is unsafe.
+
+        ``need`` names the side actually being priced. Refusing on the general
+        flag would exclude every unlisted series from every proposal over a
+        *maker* multiplier, while the order being priced is a taker — which is
+        the same shape as the abandoned category-keyed design that excluded
+        ~50,000 markets over a multiplier that did not apply to them.
+        """
         key = (series or "").strip().upper()
         if key in self.series:
             return self.series[key]
-        if not self.default_is_safe:
+        unsafe = {
+            "taker": not self.default_taker_is_safe,
+            "maker": not self.default_maker_is_safe,
+            "both": not self.default_is_safe,
+        }[need]
+        if unsafe:
             raise UnknownSeries(series)
         return self.default_maker_multiplier, self.default_taker_multiplier
 
     def taker_multiplier(self, series: str | None) -> Decimal:
-        return self._multipliers(series)[1]
+        return self._multipliers(series, need="taker")[1]
 
     def maker_multiplier(self, series: str | None) -> Decimal:
-        return self._multipliers(series)[0]
+        return self._multipliers(series, need="maker")[0]
 
     def taker_rate(self, series: str | None = None) -> Decimal:
         """Effective taker rate (multiplier applied) for ``series``."""

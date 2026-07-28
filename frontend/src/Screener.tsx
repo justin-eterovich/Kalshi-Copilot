@@ -9,7 +9,7 @@ import {
   type MarketRow,
   type MarketsPage,
 } from "./api";
-import { useLiveFeed } from "./useLiveFeed";
+import { FEED_STATUS_TITLE, useLiveFeed } from "./useLiveFeed";
 
 const SORTS = [
   { key: "volume_24h", label: "24h vol" },
@@ -23,9 +23,19 @@ const SORTS = [
 
 const PAGE_SIZE = 60;
 
-function Stat({ label, value, warn }: { label: string; value: string; warn?: boolean }) {
+function Stat({
+  label,
+  value,
+  warn,
+  title,
+}: {
+  label: string;
+  value: string;
+  warn?: boolean;
+  title?: string;
+}) {
   return (
-    <div className="stat">
+    <div className="stat" title={title}>
       <div className="stat-label">{label}</div>
       <div className={warn ? "stat-value warn" : "stat-value"}>{value}</div>
     </div>
@@ -34,9 +44,14 @@ function Stat({ label, value, warn }: { label: string; value: string; warn?: boo
 
 function ScoreBar({ score }: { score: number | null }) {
   if (score === null) return <span className="muted">—</span>;
+  // Clamped at both ends. Only the top was, so a negative score would emit
+  // `width:-450%` — an invalid declaration the browser drops, leaving a
+  // full-looking bar beside a number reading "-450". The server clamps too;
+  // this is the half that was missing when the -450 bug last happened.
+  const width = Math.max(0, Math.min(100, score));
   return (
     <span className="score">
-      <span className="score-bar" style={{ width: `${Math.min(100, score)}%` }} />
+      <span className="score-bar" style={{ width: `${width}%` }} />
       <span className="score-num">{score.toFixed(0)}</span>
     </span>
   );
@@ -135,10 +150,13 @@ export default function Screener() {
               value={stats.markets_uncategorised.toLocaleString()}
               warn={stats.markets_uncategorised > 0}
             />
+            {/* "socket", not "feed": this is the relay connection, and it
+                stays green if ingest stops publishing behind it. */}
             <Stat
-              label="feed"
+              label="socket"
               value={feedStatus}
               warn={feedStatus !== "live"}
+              title={FEED_STATUS_TITLE}
             />
           </div>
         ) : (
@@ -214,13 +232,18 @@ export default function Screener() {
                 <tr>
                   <th>ticker</th>
                   <th>market</th>
-                  <th className="num">bid</th>
-                  <th className="num">ask</th>
-                  <th className="num">last</th>
-                  <th className="num">spr</th>
+                  {/* Unit in the header rather than on every cell: a bare
+                      "0.4" is ambiguous between 0.4¢ and $0.40 to anyone who
+                      has not read the source. */}
+                  <th className="num">bid ¢</th>
+                  <th className="num">ask ¢</th>
+                  <th className="num">last ¢</th>
+                  <th className="num">spr ¢</th>
                   <th className="num">24h vol</th>
                   <th className="num">OI</th>
-                  <th>liquidity</th>
+                  <th title="an ordering for attention, not a probability">
+                    liquidity
+                  </th>
                   <th className="num">closes</th>
                 </tr>
               </thead>

@@ -180,7 +180,11 @@ detectors:
   set_arbitrage:
     enabled: false
     min_net_edge_cents: 1.0
-    require_full_depth: true       # only signal if every leg fills at quote
+    # NOT IMPLEMENTED — read by nothing. Set-arb already requires full depth
+    # on every leg unconditionally; wiring this as a toggle would let a set
+    # be priced from partial coverage, and a set priced from partial
+    # coverage is not a set. Left here as a note, not a tunable.
+    # require_full_depth: true
 
     # Series whose markets are collectively EXHAUSTIVE — some leg is certain
     # to resolve YES. Only these get buy-side signals.
@@ -235,7 +239,10 @@ detectors:
     # Signals stay non-actionable until an independent source confirms the
     # outcome. Nothing wires one in yet — reading `settlement_sources` is
     # M7/M8 work — so this emits notes to look at, never proposals.
-    min_source_confidence: 0.95
+    # NOT IMPLEMENTED — read by nothing, and a placeholder for a settlement
+    # source that does not exist. The sniper stays research-only until one
+    # does; this value would not change that.
+    # min_source_confidence: 0.95
 
   undervalued_screener:
     enabled: false
@@ -285,8 +292,9 @@ bitcoin:
   ewma_lambda: 0.94
   vol_lookback_minutes: 1440
   min_net_edge_cents: 2.0
-  # Optional upgrade: price brackets off Deribit's implied distribution.
-  use_deribit_implied: false
+  # NOT IMPLEMENTED — read by nothing. Pricing brackets off Deribit's implied
+  # distribution would be a real upgrade; this flag is not it.
+  # use_deribit_implied: false
 
 # ---------------------------------------------------------------------------
 # Weather engine  (M7)
@@ -359,6 +367,9 @@ notifications:
 # Backtester / paper accounting  (M9)
 # ---------------------------------------------------------------------------
 backtest:
-  # Simulated fills assume we cross the spread and pay taker fees.
-  pessimistic_fills: true
+  # NOT IMPLEMENTED — read by nothing. The backtester always fills through
+  # `app/trading/paper.py`, the same pessimistic simulator live paper trading
+  # uses. A flag implying a friendlier alternative exists would be a lie, and
+  # a friendlier one is exactly what a backtest must not have.
+  # pessimistic_fills: true
   report_card_min_trades: 20

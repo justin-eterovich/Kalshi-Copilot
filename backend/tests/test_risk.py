@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
@@ -22,6 +23,7 @@ from app.trading.risk import (
     check_exposure,
     check_halted,
     consecutive_losses,
+    market_exposure_cents,
     position_cost_cents,
 )
 
@@ -300,3 +302,254 @@ class TestRiskState:
         now = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
         assert not state(now=now, cooldown_until=now).in_cooldown
         assert state(now=now, cooldown_until=now + timedelta(seconds=1)).in_cooldown
+
+
+# ---------------------------------------------------------------------------
+# Per-market exposure
+# ---------------------------------------------------------------------------
+
+
+class FakeResult:
+    def __init__(self, rows: list[Any]) -> None:
+        self._rows = rows
+
+    def scalars(self) -> FakeResult:
+        return self
+
+    def all(self) -> list[Any]:
+        return list(self._rows)
+
+
+class ExposureSession:
+    """Answers the two queries :func:`market_exposure_cents` issues.
+
+    A fake cannot evaluate a real WHERE clause, so the one filter these tests
+    are actually about — ``exclude_proposal_id`` — is applied by reading it
+    back out of the compiled statement. That keeps the assertion honest rather
+    than circular: if the exclusion stopped being pushed into SQL there would
+    be no parameter to read, the excluded proposal would come back, and the
+    sum would be wrong.
+    """
+
+    def __init__(
+        self,
+        *,
+        positions: list[tuple[Decimal, Decimal]] | None = None,
+        pending: list[tuple[int, Decimal | None]] | None = None,
+    ) -> None:
+        self.positions = positions or []
+        self.pending = pending or []
+        #: Every statement seen, so a test can assert what was pushed to SQL.
+        self.statements: list[str] = []
+
+    async def execute(self, stmt: Any) -> FakeResult:
+        text = str(stmt)
+        self.statements.append(text)
+        if "FROM positions" in text:
+            return FakeResult(list(self.positions))
+        if "FROM proposed_trades" in text:
+            excluded = self._excluded_ids(stmt)
+            return FakeResult(
+                [loss for pid, loss in self.pending if pid not in excluded]
+            )
+        raise AssertionError(f"unexpected query: {text}")
+
+    @staticmethod
+    def _excluded_ids(stmt: Any) -> set[int]:
+        if "proposed_trades.id !=" not in str(stmt):
+            return set()
+        return {
+            value
+            for value in stmt.compile().params.values()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+
+
+class TestMarketExposure:
+    """What ``max_pct_per_market`` is supposed to be measured against.
+
+    The limit used to divide **one proposal's** ``max_loss_cents`` by the
+    bankroll and issue no query at all — it took no session, so it could not
+    see the market's existing position or the rest of the queue. The
+    per-proposal boundary was exact, which is exactly why it looked like it
+    worked, while eight individually compliant proposals on one ticker reached
+    39.79% of bankroll against a 5% cap and every one of them reported itself
+    inside the limit.
+    """
+
+    ROUTE = "demo_exchange"
+
+    async def test_no_tickers_is_zero_and_asks_the_database_nothing(self) -> None:
+        """A proposal with no markets has no market exposure. Short-circuit,
+        so an empty ``IN ()`` never reaches SQL."""
+        session = ExposureSession(positions=[(Decimal(10), Decimal("0.40"))])
+        assert (
+            await market_exposure_cents(session, route=self.ROUTE, tickers=[])
+            == Decimal(0)
+        )
+        assert session.statements == []
+
+    async def test_an_empty_book_is_zero(self) -> None:
+        session = ExposureSession()
+        assert (
+            await market_exposure_cents(
+                session, route=self.ROUTE, tickers=["KXMLB-26-WSH"]
+            )
+            == Decimal(0)
+        )
+
+    async def test_it_counts_the_cost_basis_of_an_open_yes_position(self) -> None:
+        session = ExposureSession(positions=[(Decimal(10), Decimal("0.40"))])
+        assert await market_exposure_cents(
+            session, route=self.ROUTE, tickers=["KXMLB-26-WSH"]
+        ) == Decimal(400)
+
+    async def test_a_no_position_contributes_the_complement(self) -> None:
+        """Signed YES-equivalents: -5 carried at a YES price of 0.70 is 5 NO
+        contracts bought at 0.30, so 150 cents at risk — ``abs(net) * (1 -
+        avg_price) * 100``, exactly as :func:`position_cost_cents` says."""
+        session = ExposureSession(positions=[(Decimal(-5), Decimal("0.70"))])
+        assert await market_exposure_cents(
+            session, route=self.ROUTE, tickers=["KXMLB-26-WSH"]
+        ) == Decimal(150)
+
+    async def test_several_positions_sum(self) -> None:
+        session = ExposureSession(
+            positions=[
+                (Decimal(10), Decimal("0.40")),
+                (Decimal(-5), Decimal("0.70")),
+            ]
+        )
+        assert await market_exposure_cents(
+            session, route=self.ROUTE, tickers=["A", "B"]
+        ) == Decimal(550)
+
+    async def test_pending_proposals_count_too(self) -> None:
+        """They are one click from being positions, and the whole point of a
+        per-market cap is to bound what one market can cost you."""
+        session = ExposureSession(
+            pending=[(1, Decimal(1000)), (2, Decimal(2000))]
+        )
+        assert await market_exposure_cents(
+            session, route=self.ROUTE, tickers=["KXMLB-26-WSH"]
+        ) == Decimal(3000)
+
+    async def test_positions_and_the_queue_are_added_together(self) -> None:
+        session = ExposureSession(
+            positions=[(Decimal(10), Decimal("0.40"))],
+            pending=[(1, Decimal(1000))],
+        )
+        assert await market_exposure_cents(
+            session, route=self.ROUTE, tickers=["KXMLB-26-WSH"]
+        ) == Decimal(1400)
+
+    async def test_a_pending_proposal_with_no_worst_case_counts_as_zero(
+        self,
+    ) -> None:
+        """``max_loss_cents`` is nullable. A null must not poison the sum."""
+        session = ExposureSession(pending=[(1, None), (2, Decimal(500))])
+        assert await market_exposure_cents(
+            session, route=self.ROUTE, tickers=["KXMLB-26-WSH"]
+        ) == Decimal(500)
+
+    async def test_exclude_proposal_id_removes_exactly_that_proposal(self) -> None:
+        """At approval time the proposal under consideration is still PENDING
+        and therefore already inside this sum. A caller that then adds its own
+        ``max_loss_cents`` on top would count it twice and refuse the trade its
+        own headroom was reserved for."""
+        pending = [(1, Decimal(1000)), (2, Decimal(2000)), (3, Decimal(3000))]
+        session = ExposureSession(pending=pending)
+
+        assert await market_exposure_cents(
+            session,
+            route=self.ROUTE,
+            tickers=["KXMLB-26-WSH"],
+            exclude_proposal_id=2,
+        ) == Decimal(4000)
+
+    async def test_excluding_nothing_keeps_the_whole_queue(self) -> None:
+        session = ExposureSession(pending=[(1, Decimal(1000)), (2, Decimal(2000))])
+        assert await market_exposure_cents(
+            session, route=self.ROUTE, tickers=["KXMLB-26-WSH"]
+        ) == Decimal(3000)
+
+    async def test_the_exclusion_is_pushed_into_sql(self) -> None:
+        """Not filtered in Python afterwards. A filter is not a cap, and a cap
+        applied after the rows have already been loaded is neither."""
+        session = ExposureSession(pending=[(1, Decimal(1000))])
+        await market_exposure_cents(
+            session,
+            route=self.ROUTE,
+            tickers=["KXMLB-26-WSH"],
+            exclude_proposal_id=7,
+        )
+        proposals_sql = next(
+            s for s in session.statements if "FROM proposed_trades" in s
+        )
+        assert "proposed_trades.id !=" in proposals_sql
+
+    async def test_the_query_is_projected_not_a_whole_row(self) -> None:
+        """Two columns from positions, one from proposals.
+
+        ``select(Model)`` with no columns is how this codebase has killed the
+        worker twice — 122,887 rows each carrying the full ``raw`` JSONB
+        payload, no traceback, just a process that died and restarted.
+        """
+        session = ExposureSession(
+            positions=[(Decimal(1), Decimal("0.5"))], pending=[(1, Decimal(1))]
+        )
+        await market_exposure_cents(
+            session, route=self.ROUTE, tickers=["KXMLB-26-WSH"]
+        )
+        positions_sql = next(s for s in session.statements if "FROM positions" in s)
+        assert positions_sql.strip().startswith(
+            "SELECT positions.net_contracts, positions.avg_price"
+        )
+        proposals_sql = next(
+            s for s in session.statements if "FROM proposed_trades" in s
+        )
+        assert proposals_sql.strip().startswith(
+            "SELECT proposed_trades.max_loss_cents"
+        )
+
+    async def test_an_event_ticker_widens_the_match(self) -> None:
+        """A multi-leg proposal is "for" a market either directly or through
+        its event — the same matching shape as the duplicate guard."""
+        session = ExposureSession(pending=[(1, Decimal(1000))])
+        await market_exposure_cents(
+            session,
+            route=self.ROUTE,
+            tickers=["KXEV-26-A"],
+            event_ticker="KXEV-26",
+        )
+        proposals_sql = next(
+            s for s in session.statements if "FROM proposed_trades" in s
+        )
+        assert "proposed_trades.event_ticker" in proposals_sql
+
+    async def test_it_is_scoped_to_one_route(self) -> None:
+        """The simulated, demo and live books are separate stacks of money."""
+        session = ExposureSession(positions=[(Decimal(1), Decimal("0.5"))])
+        await market_exposure_cents(
+            session, route=self.ROUTE, tickers=["KXMLB-26-WSH"]
+        )
+        positions_sql = next(s for s in session.statements if "FROM positions" in s)
+        assert "positions.route" in positions_sql
+
+    async def test_the_cumulative_total_is_what_the_cap_now_sees(self) -> None:
+        """The headline regression, as arithmetic.
+
+        Eight proposals of 4.97% of a $1,000 bankroll — 497c each — are each
+        inside a 5% (5,000c) cap on their own. Together they are 3,976c, and
+        the ninth is what the cap has to refuse. Measured live at 39.79% of
+        bankroll in one ticker against a 5% ceiling.
+        """
+        session = ExposureSession(
+            pending=[(i, Decimal(497)) for i in range(1, 9)]
+        )
+        committed = await market_exposure_cents(
+            session, route=self.ROUTE, tickers=["KXMLB-26-WSH"]
+        )
+        assert committed == Decimal(3976)
+        bankroll_cents = Decimal(100_000)
+        assert committed / bankroll_cents > Decimal("0.039")

@@ -5,15 +5,19 @@ The protocol: subscribing to ``orderbook_delta`` yields one
 ``orderbook_delta`` messages carrying signed size changes at a price level.
 Every message on a subscription carries a monotonically increasing ``seq``.
 
-**The rule that matters:** if a sequence number is skipped, the local book is
-no longer trustworthy. Guessing across a gap produces a book that looks
+**The rule that matters:** if a sequence number is skipped, no book on that
+subscription is trustworthy. Guessing across a gap produces a book that looks
 plausible and is wrong, which is exactly how an arbitrage detector talks you
-into a trade that does not exist. On any gap the book is marked stale, and it
+into a trade that does not exist. So a gap marks books stale, and a stale book
 refuses to answer questions until a fresh snapshot arrives.
 
-**``seq`` counts the subscription, not the market**, and this module used to
-get that wrong. One ``orderbook_delta`` subscription covers every ticker in
-it and numbers all of their messages from one counter, so consecutive deltas
+**That judgement is not made here.** ``seq`` counts the *subscription*, not the
+market, so the only place it can be judged is where subscriptions are tracked:
+``_check_seq`` in :mod:`app.kalshi.ws`. This class records ``seq``, refuses a
+replayed (lower) one, and judges nothing else. What follows is why.
+
+One ``orderbook_delta`` subscription covers every ticker in it
+and numbers all of their messages from one counter, so consecutive deltas
 for a single market are *not* consecutive in ``seq``. Verified against the
 live demo stream with 65 markets subscribed::
 

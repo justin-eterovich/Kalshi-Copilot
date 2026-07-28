@@ -1,12 +1,12 @@
 """Detector / scanner worker.
 
-Currently runs the execution rail's upkeep — proposal expiry, order
-auto-cancel, exchange reconciliation.  The detector registry and proposal
-generation land in M4-M7.
+Runs the execution rail's upkeep — proposal expiry, order auto-cancel,
+exchange reconciliation, settlement — alongside the detector registry and the
+calibration collector.
 
 **No code path in this service can place an order.**  It expires, cancels and
-reconciles; it never creates.  Detectors will emit signals here, and even
-those only become proposals that a human must approve one at a time.
+reconciles; it never creates.  Detectors emit signals here, and even those
+only become proposals that a human must approve one at a time.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from app.config import get_config
 from app.core.logging import configure_logging, get_logger
 from app.core.redis import beat, close_redis, get_redis
 from app.db.base import dispose_engine, get_session_factory
-from app.detectors.base import propose_finding, record
+from app.detectors.base import enabled_detector_names, propose_finding, record
 from app.detectors.runner import (
     LeaderboardWatcherDetector,
     LongshotCalibrationDetector,
@@ -146,9 +146,13 @@ async def _detector_loop(detectors: list[Any], stop: asyncio.Event) -> None:
     while not stop.is_set():
         config = get_config()
         active = [d for d in detectors if d.enabled(config)]
-        refused: dict[str, int] = {}
         if active and not config.risk.kill_switch:
             for detector in active:
+                # Per detector, not per cycle. Declared once outside this loop,
+                # it accumulated: detector N's summary line reported the
+                # refusals of detectors 1..N, so the last one in the registry
+                # always looked like the one being refused.
+                refused: dict[str, int] = {}
                 try:
                     async with sessions() as session:
                         findings = await detector.scan(session, config)
@@ -194,7 +198,7 @@ async def run() -> None:
     await get_redis().ping()
     log.info("redis connected")
 
-    enabled = config.detectors.enabled_names()
+    enabled = enabled_detector_names(config)
     if enabled:
         log.info("detectors enabled: %s", ", ".join(enabled))
     else:

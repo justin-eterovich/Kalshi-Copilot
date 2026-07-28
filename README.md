@@ -175,6 +175,14 @@ The header shows which one is active. Two rows deserve emphasis:
   degrading to paper. A config that says live must not trade fictionally
   while the dashboard says otherwise.
 
+One detail the table flattens: **`resolve_route` decides `live_exchange` from
+`mode` and the two environment flags alone** — the credentials column is a
+*separate* check made at approval time, not part of routing. So the header can
+read "live" on a box with no prod key, and the refusal arrives when you try to
+approve rather than when the route is computed. The paper rows are different:
+there, credentials genuinely select between the demo exchange and the local
+simulator.
+
 Set `trading.paper_uses_demo_exchange: false` to force the local simulator
 even when demo credentials exist.
 
@@ -245,22 +253,40 @@ whole event. A set priced from partial coverage is not a set.
 
 Compares a fresh independent spot price against a crypto strike. Spot is
 polled from Coinbase into `external_prices` (set `bitcoin.enabled: true`),
-and the detector checks the *age* of the newest observation rather than
-trusting it — a stale reference against a live market invents an edge in
-whichever direction the market already moved.
+and the detector checks the *age* of the newest observation — and of the
+volatility estimate built from it — rather than trusting either. A stale
+reference against a live market invents an edge in whichever direction the
+market already moved.
 
-This is a **heuristic, not a probability**. "Decisively past the strike" is a
-fixed percentage (`decisive_margin_pct`), not output from a volatility model;
-that arrives in M6. So it requires both a margin *and* a short time to close,
-and caps fair value at 0.98 rather than 1.00. `custom` strike types are
-refused — their rules live in prose.
+**"Independent" does not mean "the same number".** These markets settle on a
+CF Benchmarks index (BRTI for BTC), usually as the mean of the sixty seconds
+before a stated instant. Coinbase's last trade is a different publisher and a
+different statistic, and near a strike that basis is the size of the edge. It
+is a reference for deciding whether spot has *decisively* cleared a strike; it
+is never the settlement price.
+
+Since M6, fair value comes from the volatility model
+(`app/btc/vol.py`) and nothing else — no vol estimate means no signal, not a
+fallback. `decisive_margin_pct` survives only as a **veto in front of** that
+model: a strike spot has barely cleared is where a lognormal is least
+trustworthy, so the crude test gets to say "not this one" before the precise
+one says a number. It also requires a short time to close, and caps fair value
+below certainty. `custom` strike types are refused — their rules live in prose.
 
 Size comes from Kelly rather than a fixed `size_hint`, on the after-fee cost
-(`app/trading/sizing.py`). Because the fair value here is a heuristic, the
-undiscounted Kelly fraction can be alarming — 80% of bankroll for a 98¢-fair
-contract at 90¢ — so `risk.kelly_fraction`, the per-market cap and the
-exposure headroom all cut it before anything is proposed. The binding cap is
-named in the proposal's rationale.
+(`app/trading/sizing.py`). The undiscounted Kelly fraction can be alarming —
+80% of bankroll for a 98¢-fair contract at 90¢ — so `risk.kelly_fraction`, the
+per-market cap and the exposure headroom all cut it, and the binding cap is
+named on the signal.
+
+**It cannot currently create a proposal.** The only detector→proposal path
+takes a *multi-leg* finding, so set arbitrage is the one detector whose output
+reaches the approval queue; a single-leg finding is refused with
+`single_leg_unsupported`, counted in the scan's refusal line, and recorded as a
+signal. Acting on one means writing the ticket by hand from `/api/signals`.
+That refusal is loud on purpose — it used to be a silent `return None`, which
+made a detector that had found and sized a real edge look exactly like one
+that had found nothing.
 
 ### Resolution sniper
 
@@ -285,6 +311,13 @@ at is the same spread you must cross to act. The result type therefore has no
 edge, fair-value or EV field at all, and a test asserts those names stay
 absent so nothing downstream can start reading one. Its score is an ordering
 for attention: not cents, not a probability, and a 70 is not twice a 35.
+
+It is also **an ordering within the rows it fetched**. The score's largest
+term is a volume percentile computed across the supplied set, and the scan is
+capped at 20,000 markets — against 88,110 eligible at the shipped 168-hour
+horizon. The fetch is ordered quietest-first, so the cap keeps the tail the
+screen is looking for, and it logs a warning when it binds. Narrow
+`max_hours_to_close` if you want the percentile to mean what it says.
 
 ### Whale flow
 
@@ -816,7 +849,7 @@ python -m pytest tests/ -v
 | Live never degrades | `mode: live` without the env interlocks refuses, rather than silently trading on paper. |
 | Proposal TTL | A proposal expires (120s default) and cannot then be approved. Checked at approval, not just by the sweep. |
 | Multi-leg all-or-none | A set arb is one proposal. Execution is *not* atomic — Kalshi has no such primitive — so legs go out in one IOC batch and any imbalance is reported as `PARTIAL`, never hidden. |
-| No write retries | A timed-out order POST may have been accepted, so it raises instead of retrying. Recovery is reconciliation by client order ID. |
+| No write retries | A timed-out order POST may have been accepted, so it raises instead of retrying. Recovery is reconciliation by client order ID: the worker sweep re-asks the exchange what it holds under the ID we generated (`maintenance.recover_orphaned_orders`) and *adopts* the answer. There is no second POST. `GET /portfolio/orders` has no `client_order_id` filter, so the match is made locally over recent pages — a miss means "not in the pages we looked at", not "never placed". |
 | Kill switch | Halts all proposals and cancels resting orders. |
 | Queue depth cap | `risk.max_pending_proposals` (default 10). Not a risk limit — it protects *attention*. A detector scanning every 20s produced 20 proposals per scan, and a queue nobody reads is rubber-stamped rather than reviewed. |
 | Per-market size limit | `risk.max_pct_per_market` is enforced at proposal creation, not merely displayed. |
@@ -826,7 +859,7 @@ python -m pytest tests/ -v
 | Kelly-capped sizing | Size comes from `f* = (p-c)/(1-c)` on the **after-fee** cost, discounted by `risk.kelly_fraction`, then capped by the per-market limit, remaining exposure headroom, and executable depth. Every cap is a ceiling; sizes round down. |
 | Duplicate guard | A detector re-derives the same opportunity every scan; one live proposal per event per detector. |
 | Detector flags | Each detector independently enabled; all off by default. |
-| Fee fail-closed | Unknown fee multiplier ⇒ market excluded, never guessed. |
+| Fee fail-closed | An **unverified schedule** blocks pricing entirely — no proposal, and `/api/fees/quote` 409s. An **unlisted series** takes the documented default (`M=1` taker), which is safe only while no listed multiplier exceeds it: that condition is checked (`default_is_safe`), and the moment a premium series appears the unlisted case raises `UnknownSeries` and the market is excluded instead. |
 | Idempotent orders | Client-supplied order IDs; a network retry cannot double-place. |
 | Stale orderbook | A websocket sequence gap marks the local book stale; it raises rather than answering from guessed state. |
 | Audit log | Append-only record of every signal, proposal, decision, order, fill, and fee. |

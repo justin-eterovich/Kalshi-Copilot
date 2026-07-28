@@ -41,6 +41,12 @@ include = ["app*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# --strict-config turns an unrecognised setting above into a hard error rather
+# than a silent default. Without it, a missing or renamed `asyncio_mode` makes
+# every async test skip quietly — 62 of them here — and the suite still reports
+# green. --strict-markers does the same for a mistyped marker. Only the builtin
+# `parametrize` is used today, so neither costs anything to switch on.
+addopts = "--strict-config --strict-markers"
 filterwarnings = ["error::DeprecationWarning:app.*"]
 
 [tool.ruff]

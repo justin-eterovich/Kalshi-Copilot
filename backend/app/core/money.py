@@ -51,6 +51,10 @@ class MoneyParseError(ValueError):
 
 
 def _to_decimal(value: Any, field: str) -> Decimal:
+    return _reject_non_finite(_coerce_decimal(value, field), value, field)
+
+
+def _coerce_decimal(value: Any, field: str) -> Decimal:
     if isinstance(value, Decimal):
         return value
     if isinstance(value, bool):
@@ -72,6 +76,27 @@ def _to_decimal(value: Any, field: str) -> Decimal:
     raise MoneyParseError(f"{field}: unsupported type {type(value).__name__}")
 
 
+def _reject_non_finite(parsed: Decimal, original: Any, field: str) -> Decimal:
+    """Refuse NaN and the infinities.
+
+    ``Decimal("NaN")`` is a perfectly valid Decimal, so the parse above
+    accepts it and every downstream comparison then raises
+    ``InvalidOperation`` — an ``ArithmeticError``, which the ``ValueError``
+    handlers around money parsing do not catch. Observed: a 500 from
+    ``/api/fees/quote?price_dollars=NaN``, and a proposal stored and served
+    with ``net_edge_cents: "NaN"`` after executing a real order.
+
+    A non-finite price is not a near-miss to be clamped; it is a value that
+    poisons every average computed over the column it lands in. Refuse it at
+    the one chokepoint every price, count and fee flows through — including
+    the ``Decimal`` passthrough, which is how a NaN constructed upstream
+    would otherwise slip in untouched.
+    """
+    if not parsed.is_finite():
+        raise MoneyParseError(f"{field}: refusing non-finite value {original!r}")
+    return parsed
+
+
 def parse_dollars(value: Any, field: str = "price") -> Decimal:
     """Parse a ``FixedPointDollars`` string into a Decimal dollar amount.
 
@@ -91,8 +116,14 @@ def parse_count(value: Any, field: str = "count") -> Decimal:
 
 
 def dollars_to_cents(dollars: Decimal) -> Decimal:
-    """Convert a dollar amount to cents, preserving sub-cent precision."""
-    return dollars * Decimal(100)
+    """Convert a dollar amount to cents, preserving sub-cent precision.
+
+    Takes a ``Decimal`` directly rather than going through :func:`parse_dollars`,
+    which made it the one way into the money path that skipped the non-finite
+    check. Its callers all parse first, so this was never reachable — but "not
+    reachable today" is how the other holes in this file started.
+    """
+    return _reject_non_finite(dollars, dollars, "dollars") * Decimal(100)
 
 
 def cents_to_dollars(cents: Decimal | int | str) -> Decimal:

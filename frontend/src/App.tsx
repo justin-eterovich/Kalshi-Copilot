@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router-dom";
+import KillSwitch from "./KillSwitch";
 import MarketPage from "./MarketPage";
 import Screener from "./Screener";
 import SystemPanel from "./SystemPanel";
@@ -31,25 +32,26 @@ export default function App() {
   const [trading, setTrading] = useState<TradingState | null>(null);
   const location = useLocation();
 
+  const load = useCallback(async () => {
+    try {
+      const [s, h] = await Promise.all([api.system(), api.health()]);
+      setSystem(s);
+      setHealth(h);
+    } catch {
+      /* the active panel surfaces the error */
+    }
+    try {
+      setTrading(await api.tradingState());
+    } catch {
+      /* trading state is additive; the header degrades without it */
+    }
+  }, []);
+
   useEffect(() => {
-    const load = async () => {
-      try {
-        const [s, h] = await Promise.all([api.system(), api.health()]);
-        setSystem(s);
-        setHealth(h);
-      } catch {
-        /* the active panel surfaces the error */
-      }
-      try {
-        setTrading(await api.tradingState());
-      } catch {
-        /* trading state is additive; the header degrades without it */
-      }
-    };
     load();
     const id = setInterval(load, 5000);
     return () => clearInterval(id);
-  }, []);
+  }, [load]);
 
   const live = system?.live_trading_armed ?? false;
   const pending = trading?.pending_proposals ?? 0;
@@ -86,6 +88,15 @@ export default function App() {
 
         <span className="spacer" />
 
+        {/* The emergency stop belongs where it is reachable from every page,
+            not on the third tab. It reads the server's state and never its
+            own optimism. */}
+        <KillSwitch
+          engaged={system?.kill_switch ?? trading?.kill_switch ?? false}
+          configFloor={trading?.kill_switch_config_floor ?? false}
+          onChanged={load}
+        />
+
         {trading && (
           <Pill ok={!trading.real_money} warn={trading.real_money}>
             {routeLabel(trading.execution_route)}
@@ -108,6 +119,19 @@ export default function App() {
       </header>
 
       <main>
+        {/* Hoisted out of the system tab. With an unverified schedule nothing
+            can be proposed at all, and the screener and trades page otherwise
+            look completely normal — the operator finds out by typing a ticket
+            and being refused. */}
+        {system?.fees.verified_on === null && (
+          <div className="banner">
+            <strong>Fee schedule unverified.</strong> Nothing can be proposed
+            until it is checked — every edge figure is net of fees, so an
+            unchecked fee table makes all of them untrustworthy. Run{" "}
+            <code>python scripts/refresh_fee_schedule.py</code>.
+          </div>
+        )}
+
         <div className={live ? "banner" : "banner safe"}>
           {live ? (
             <>

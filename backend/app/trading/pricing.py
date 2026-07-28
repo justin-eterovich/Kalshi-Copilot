@@ -209,6 +209,25 @@ def price_ticket(
     fair: Decimal | None = None
     if fair_price is not None:
         fair = parse_dollars(fair_price, "fair_price")
+        # The same domain check `limit_price` gets above, and for the same
+        # reason. Without it `fair_price="56"` — the obvious slip for 56c —
+        # was accepted and priced as $56 fair value against a 1.8c contract,
+        # returning a claimed +$55.97/contract edge with HTTP 200. That number
+        # is then written to `proposed_trades.net_edge_cents` and the audit
+        # log, where it becomes the "claimed edge" the report card grades the
+        # detector against.
+        #
+        # Strict bounds, matching `limit_price`: a fair value of exactly 0 or
+        # 1 asserts certainty, and nothing in this system is allowed to
+        # manufacture the last cents of edge out of an assumption of
+        # settlement — the stale-quote detector caps fair at 0.98 for the
+        # same reason.
+        if not (Decimal(0) < fair < Decimal(1)):
+            raise ValueError(
+                f"fair_price must be strictly between 0 and 1 dollars, got "
+                f"{fair_price!r}. Kalshi quotes dollar strings like '0.5600' "
+                f"— '56' means $56, not 56 cents."
+            )
         # net_edge_cents is written from the buyer's point of view. A sell at
         # p with fair f is exactly a buy of the opposite contract at 1-p with
         # fair 1-f, so the same function prices both — no second edge formula

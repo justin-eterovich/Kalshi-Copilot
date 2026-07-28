@@ -8,6 +8,9 @@
  *   misclick cannot produce.
  * - The countdown is visible, and an expired proposal cannot be approved at
  *   all — the button is gone, not merely styled as disabled.
+ * - The **wire form** is on screen: the traded-side view ("buy NO 30¢") and
+ *   the thing actually sent ("ask @ 0.70") are different sentences, and only
+ *   the second one can be checked against the exchange.
  */
 
 import { useEffect, useState } from "react";
@@ -15,12 +18,32 @@ import { Link } from "react-router-dom";
 import {
   ApiError,
   api,
+  asCentsAmount,
+  asCount,
   asDollars,
   asSignedCents,
   centsNum,
+  moneySign,
   type Proposal,
+  type ProposalLeg,
   type TradingState,
 } from "./api";
+
+/**
+ * The literal wire form of one leg, or null if the API did not send it.
+ *
+ * "Buy NO at 30¢" reaches Kalshi as an **ask at 0.70**, because the order API
+ * quotes one book from the YES side. Both halves have to be right or the
+ * position is inverted, and nothing downstream catches that: the P(1-P) fee
+ * is symmetric, so a flipped direction produces the same fee, the same
+ * notional and a confirmation that looks correct. Showing it here is the only
+ * check a human gets — and for a detector-generated proposal it is the only
+ * check anyone gets, because no one priced it by hand.
+ */
+function wireForm(leg: ProposalLeg): string | null {
+  if (!leg.book_side || !leg.wire_price) return null;
+  return `${leg.book_side} ${leg.contracts} @ ${leg.wire_price}`;
+}
 
 function useCountdown(expiresAt: string | null): number | null {
   const [remaining, setRemaining] = useState<number | null>(null);
@@ -144,14 +167,25 @@ export default function ApprovalCard({
         </div>
         <div className="stat">
           <span className="stat-label">size</span>
-          <span className="stat-value">{proposal.legs[0]?.contracts ?? "—"}</span>
+          <span className="stat-value">
+            {asCount(proposal.legs[0]?.contracts ?? null)}
+          </span>
+        </div>
+        {/* The worst case belongs at the decision point, not only on the
+            ticket that composed it. It is also what the risk limits measure,
+            and a detector proposal was never composed on a ticket at all. */}
+        <div className="stat">
+          <span className="stat-label">max loss</span>
+          <span className="stat-value">
+            {proposal.max_loss_cents === null
+              ? "—"
+              : asDollars(proposal.max_loss_cents)}
+          </span>
         </div>
         <div className="stat">
           <span className="stat-label">fee</span>
           <span className="stat-value">
-            {proposal.est_fee_cents === null
-              ? "—"
-              : asDollars(proposal.est_fee_cents)}
+            {asCentsAmount(proposal.est_fee_cents)}
           </span>
         </div>
         <div className="stat">
@@ -160,9 +194,11 @@ export default function ApprovalCard({
             className={
               proposal.net_edge_cents === null
                 ? "stat-value"
-                : Number(proposal.net_edge_cents) >= 0
-                  ? "stat-value up"
-                  : "stat-value down"
+                : moneySign(proposal.net_edge_cents) < 0
+                  ? "stat-value down"
+                  : moneySign(proposal.net_edge_cents) > 0
+                    ? "stat-value up"
+                    : "stat-value"
             }
           >
             {proposal.net_edge_cents === null
@@ -180,12 +216,40 @@ export default function ApprovalCard({
         </div>
       </div>
 
+      {/* The wire form, for a single-leg proposal. Multi-leg gets a column in
+          the legs table below instead. */}
+      {proposal.leg_count === 1 && proposal.legs[0] && (
+        <div className="wire-row">
+          <span className="wire-label">sends as</span>
+          {wireForm(proposal.legs[0]) ? (
+            <span className="mono wire-value">
+              {wireForm(proposal.legs[0])}
+            </span>
+          ) : (
+            <span className="wire-missing">
+              not supplied by the API — the direction cannot be checked here
+            </span>
+          )}
+        </div>
+      )}
+
       {proposal.leg_count > 1 && (
         <div className="legs">
           <div className="legs-head">
             every leg is placed together, or the set is not a hedge
           </div>
           <table className="table">
+            <thead>
+              <tr>
+                <th>market</th>
+                <th>direction</th>
+                <th className="num">price ¢</th>
+                <th className="num">size</th>
+                <th title="what actually reaches Kalshi: one book, quoted from the YES side">
+                  sends as
+                </th>
+              </tr>
+            </thead>
             <tbody>
               {proposal.legs.map((leg) => (
                 <tr key={leg.seq}>
@@ -193,8 +257,13 @@ export default function ApprovalCard({
                   <td className={leg.action === "buy" ? "up" : "down"}>
                     {leg.action} {leg.side}
                   </td>
-                  <td className="num">{centsNum(leg.limit_price, 2)}¢</td>
-                  <td className="num">{leg.contracts}</td>
+                  <td className="num">{centsNum(leg.limit_price, 2)}</td>
+                  <td className="num">{asCount(leg.contracts)}</td>
+                  <td className="mono">
+                    {wireForm(leg) ?? (
+                      <span className="wire-missing">not supplied</span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -260,14 +329,11 @@ export default function ApprovalCard({
             />
           )}
 
+          {/* Deliberately reversed. "confirm & place" used to land exactly
+              where "approve…" had been, so two clicks in the same spot were
+              closer to one click than the two-step design intends — and on
+              the paper route there is no typed phrase to slow it down. */}
           <div className="approval-actions">
-            <button
-              className="btn primary"
-              disabled={busy || !phraseOk}
-              onClick={() => decide(true)}
-            >
-              {busy ? "placing…" : "confirm & place"}
-            </button>
             <button
               className="btn"
               disabled={busy}
@@ -277,6 +343,13 @@ export default function ApprovalCard({
               }}
             >
               cancel
+            </button>
+            <button
+              className="btn primary"
+              disabled={busy || !phraseOk}
+              onClick={() => decide(true)}
+            >
+              {busy ? "placing…" : "confirm & place"}
             </button>
           </div>
         </div>

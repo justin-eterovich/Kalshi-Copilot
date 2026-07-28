@@ -96,3 +96,45 @@ class TestFeeQuote:
         """Fees are fractional cents; a JSON number would invite rounding."""
         result = await fee_quote(price_dollars="0.5000", contracts="1")
         assert isinstance(result["fee_cents"], str)
+
+
+class TestNonFiniteInputs:
+    """``NaN`` produced a bare HTTP 500 on a public endpoint.
+
+    ``Decimal("NaN")`` is a valid Decimal, so the money parser accepted it and
+    the fee engine then raised ``InvalidOperation`` — an ``ArithmeticError``,
+    which the ``ValueError`` handler here does not catch. The response was
+    ``500 Internal Server Error`` with an empty body, and the same value
+    reached Postgres by the other route: proposal 267 is stored ``executed``
+    with ``net_edge_cents: "NaN"`` against a real demo fill.
+
+    A refusal at the parse step turns all of that into a 400 that says which
+    field was wrong.
+    """
+
+    @pytest.mark.parametrize(
+        "bad", ["NaN", "-NaN", "sNaN", "Infinity", "-Infinity", "inf"]
+    )
+    async def test_a_non_finite_price_returns_400(self, bad: str) -> None:
+        with pytest.raises(HTTPException) as exc:
+            await fee_quote(price_dollars=bad, contracts="1")
+        assert exc.value.status_code == 400
+
+    @pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
+    async def test_a_non_finite_contract_count_returns_400(self, bad: str) -> None:
+        with pytest.raises(HTTPException) as exc:
+            await fee_quote(price_dollars="0.5000", contracts=bad)
+        assert exc.value.status_code == 400
+
+    async def test_the_400_names_the_field(self) -> None:
+        """A bare 500 tells an operator nothing about which input was bad."""
+        with pytest.raises(HTTPException) as exc:
+            await fee_quote(price_dollars="NaN", contracts="1")
+        assert "price" in str(exc.value.detail).lower()
+
+    async def test_nothing_non_finite_is_ever_echoed_back(self) -> None:
+        """The endpoint echoes its inputs for display. A refused request must
+        produce no body at all rather than a payload carrying ``"NaN"`` into
+        the UI."""
+        with pytest.raises(HTTPException):
+            await fee_quote(price_dollars="NaN", contracts="1")

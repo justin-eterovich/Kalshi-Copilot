@@ -24,10 +24,11 @@ system is built to refuse.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Config
@@ -75,6 +76,37 @@ MAX_SCREENER_ROWS = 20_000
 #: screener already learned this the expensive way; this is the same lesson
 #: applied to its neighbours before they get the chance to teach it again.
 MAX_DETECTOR_ROWS = 20_000
+
+
+def _warn_if_capped(
+    detector: str, rows: Sequence[Any], cap: int, what: str
+) -> bool:
+    """Say so, loudly, when a row cap actually binds.
+
+    A cap that truncates in silence is worse than no cap: the detector still
+    emits confident findings, just over an arbitrary slice of the universe it
+    claimed to scan, and nothing in the output says which slice. Every capped
+    query in this module now also carries a deterministic ``ORDER BY``, so a
+    truncated scan is at least reproducible and keeps the rows the detector
+    most wants — but the operator still has to be told the horizon in
+    ``config.yaml`` has outgrown the query behind it.
+
+    Returns whether the cap bound, so a caller that must refuse can.
+    """
+    count = len(rows)
+    if count < cap:
+        return False
+    log.warning(
+        "%s: row cap reached — %d %s fetched at the %d-row ceiling, so this "
+        "scan saw a truncated universe. Narrow the horizon in config.yaml or "
+        "raise the cap deliberately; the ranking below is relative to what was "
+        "fetched, not to the exchange.",
+        detector,
+        count,
+        what,
+        cap,
+    )
+    return True
 
 
 class SetArbitrageDetector:
@@ -257,6 +289,10 @@ class SetArbitrageDetector:
                     Market.status == "active",
                     Market.event_ticker.in_(candidate_events),
                 )
+                # Grouped by event in the query so a truncation cuts between
+                # events wherever possible, rather than scattering half of
+                # several across the boundary.
+                .order_by(Market.event_ticker, Market.ticker)
                 .limit(MAX_DETECTOR_ROWS)
             )
         ).all()
@@ -264,6 +300,19 @@ class SetArbitrageDetector:
         by_event: dict[str, list[str]] = {}
         for event_ticker, ticker in rows:
             by_event.setdefault(event_ticker, []).append(ticker)
+
+        if _warn_if_capped(self.name, rows, MAX_DETECTOR_ROWS, "event legs"):
+            # The final event in an ordered, truncated result is the one that
+            # may be missing legs, and a set priced from part of its legs is
+            # not a set — the all-legs-watched test below would still pass on
+            # the fragment. Drop it rather than price it.
+            partial = rows[-1][0]
+            by_event.pop(partial, None)
+            log.warning(
+                "set_arb: dropping event %s — its leg set may be truncated by "
+                "the row cap, and a partially-seen exclusive set is not one",
+                partial,
+            )
 
         return {
             event: sorted(tickers)
@@ -360,11 +409,27 @@ class StaleQuoteDetector:
             return []
 
         horizon = datetime.now(UTC) + timedelta(minutes=max_minutes)
-        # Projected and capped. The unprojected form is bounded only by
-        # `max_minutes_to_close`, an operator-editable number with nothing
-        # behind it: there are 78,616 active Crypto markets, so raising that
-        # config value scales this query linearly until the worker dies the
-        # way it did at 122,887 rows carrying full `raw` payloads.
+        # Selected by **ticker prefix**, not by category.
+        #
+        # `category` is copied onto Market from the parent Event by
+        # `backfill_categories`, so a newly listed crypto market is invisible
+        # here until that join has run — 7,216 active markets were in exactly
+        # that state at the M9 audit. It is also the field this codebase has
+        # already decided must not decide anything: "Crypto" holds BTC, ETH,
+        # SOL and XRP, which is how an ETH strike was once priced against
+        # Bitcoin for a phantom 72c edge.
+        #
+        # The prefixes below are the same ones `reference_symbol_for` matches,
+        # so this selects exactly the universe the per-market guard can name —
+        # and that guard still runs on every row, refusing anything whose feed
+        # is missing or stale. Prefix-matching the ticker is equivalent to
+        # prefix-matching the series because no prefix contains a hyphen.
+        #
+        # Projected and capped for the reason the neighbours are: the only
+        # other bound is `max_minutes_to_close`, an operator-editable number
+        # with nothing behind it, and raising it scales this query linearly
+        # until the worker dies the way it did at 122,887 rows carrying full
+        # `raw` payloads.
         markets = (
             await session.execute(
                 select(
@@ -376,18 +441,36 @@ class StaleQuoteDetector:
                     Market.yes_bid,
                     Market.yes_ask,
                     Market.yes_ask_size,
+                    # Carried despite being the widest column here, because
+                    # the structured fields cannot distinguish a barrier
+                    # market from a level one: `KXBTCMAXMON` reports
+                    # `strike_type: "greater"` and only its rules say "is ever
+                    # above". `resolve_strike` requires this argument for that
+                    # reason, and a projection that omitted it would have to
+                    # pass None — i.e. silently price barriers as terminal.
+                    Market.rules_primary,
                 )
                 .where(
                     Market.status == "active",
-                    Market.category == "Crypto",
+                    or_(
+                        *(
+                            Market.ticker.like(f"{prefix}%")
+                            for prefix in REFERENCE_PREFIXES
+                        )
+                    ),
                     Market.close_time.isnot(None),
                     Market.close_time <= horizon,
                     Market.close_time > datetime.now(UTC),
                     Market.yes_ask.isnot(None),
                 )
+                # Soonest to close first: this detector requires a short time
+                # to close, so a truncated scan should keep the markets it
+                # would actually have acted on.
+                .order_by(Market.close_time, Market.ticker)
                 .limit(MAX_DETECTOR_ROWS)
             )
         ).all()
+        _warn_if_capped(self.name, markets, MAX_DETECTOR_ROWS, "crypto markets")
 
         schedule = load_fee_schedule()
         slippage = Decimal(str(config.costs.slippage_buffer_cents))
@@ -415,6 +498,7 @@ class StaleQuoteDetector:
                 floor_strike=market.floor_strike,
                 cap_strike=market.cap_strike,
                 spot=spot,
+                rules_primary=market.rules_primary,
             )
             if verdict is None:
                 continue
@@ -438,6 +522,22 @@ class StaleQuoteDetector:
                 estimate = await horizon_sigma(
                     session, config, minutes_to_close=mins_left, symbol=symbol
                 )
+                # `SigmaEstimate.as_of` says "consumers must check this
+                # themselves", and this is the only consumer. A sigma computed
+                # from a series that stopped an hour ago is stale in exactly
+                # the way a stale spot price is, and manufactures an edge the
+                # same way — recording the timestamp in the evidence is not
+                # checking it. Bucketed to the minute, so the freshness bound
+                # is the spot bound plus one bucket.
+                if estimate is not None and not reference_is_fresh(
+                    estimate.as_of, max_age_sec=max_age + 60.0
+                ):
+                    log.debug(
+                        "stale_quote: %s sigma is stale (as_of %s); refusing",
+                        market.ticker,
+                        estimate.as_of.isoformat(),
+                    )
+                    estimate = None
                 if estimate is not None:
                     fair = vol_fair_price(
                         strike_type=market.strike_type,
@@ -594,9 +694,15 @@ class ResolutionSniperDetector:
                     Market.close_time.isnot(None),
                     Market.close_time < datetime.now(UTC),
                 )
+                # Longest past close first — the most-lagged markets are the
+                # ones this detector is about, so a truncated scan keeps them.
+                .order_by(Market.close_time, Market.ticker)
                 .limit(MAX_DETECTOR_ROWS)
             )
         ).all()
+        _warn_if_capped(
+            self.name, markets, MAX_DETECTOR_ROWS, "markets past close"
+        )
 
         findings: list[Finding] = []
         for market in markets:
@@ -692,9 +798,30 @@ class UndervaluedScreenerDetector:
                     Market.yes_bid.isnot(None),
                     Market.yes_ask.isnot(None),
                 )
+                # Quietest first, deterministically.
+                #
+                # The cap binds hard here — 88,110 markets were eligible at
+                # the shipped 168-hour horizon against a 20,000-row ceiling —
+                # and the score is a volume percentile *relative to the rows
+                # fetched*, so which 23% arrived decided every rank emitted.
+                # Without an ORDER BY that was whatever Postgres happened to
+                # return, i.e. a different answer each scan for no reason the
+                # operator could see.
+                #
+                # Ascending volume is the tail the screener is looking for, so
+                # a truncated fetch now keeps the markets it would have ranked
+                # highest anyway. It is still a sample: the percentile is
+                # computed within the quiet end rather than across the whole
+                # eligible set, which compresses it. The module already says
+                # the percentile is relative to the set it is given; the
+                # warning below says when that set stopped being the intended
+                # one. NULLs sort first, and a market with no recorded 24h
+                # volume is as thin as this screen can see.
+                .order_by(Market.volume_24h.asc().nullsfirst(), Market.ticker)
                 .limit(MAX_SCREENER_ROWS)
             )
         ).all()
+        _warn_if_capped(self.name, rows, MAX_SCREENER_ROWS, "eligible markets")
 
         snapshots: list[MarketSnapshot] = []
         for ticker, volume, bid, ask, close, oi in rows:
@@ -781,14 +908,31 @@ class WhaleFlowDetector:
         since = datetime.now(UTC) - timedelta(minutes=lookback)
         # Tape is a hypertable and grows with both watchlist size and trade
         # rate, so `lookback_minutes` alone is not a bound on the row count.
-        rows = (
-            await session.execute(
-                select(Tape.ticker, Tape.ts, Tape.yes_price, Tape.count, Tape.taker_side)
-                .where(Tape.ts >= since)
-                .order_by(Tape.ts)
-                .limit(MAX_DETECTOR_ROWS)
+        #
+        # Fetched newest-first so that when the cap binds it is the *oldest*
+        # tape that falls off. Ascending order plus a LIMIT threw away the
+        # recent end of the window instead, which for a flow detector is the
+        # only end that matters — a sweep from twenty minutes ago is history.
+        # `analyse` needs chronological order, so the page is reversed below.
+        rows = list(
+            reversed(
+                (
+                    await session.execute(
+                        select(
+                            Tape.ticker,
+                            Tape.ts,
+                            Tape.yes_price,
+                            Tape.count,
+                            Tape.taker_side,
+                        )
+                        .where(Tape.ts >= since)
+                        .order_by(Tape.ts.desc(), Tape.ticker)
+                        .limit(MAX_DETECTOR_ROWS)
+                    )
+                ).all()
             )
-        ).all()
+        )
+        _warn_if_capped(self.name, rows, MAX_DETECTOR_ROWS, "tape prints")
 
         by_ticker: dict[str, list[Trade]] = {}
         for row in rows:
@@ -857,36 +1001,43 @@ class LongshotCalibrationDetector:
         return bool(getattr(config.detectors.longshot_calibration, "enabled", False))
 
     async def scan(self, session: AsyncSession, config: Config) -> list[Finding]:
+        from sqlalchemy import func
+
         from app.db.models import CalibrationLog
-        from app.detectors.longshot_calibration import (
-            Observation,
-            calibrate,
-            significant,
-        )
+        from app.detectors.longshot_calibration import calibrate_counts, significant
 
         cfg = config.detectors.longshot_calibration
         min_samples = int(getattr(cfg, "min_samples_before_signalling", 500))
 
+        # Counted in SQL, not in Python. `calibrate` only ever needed two
+        # numbers per bucket, and the row-per-market form was the last query
+        # in this module with no cap on it at all: CalibrationLog holds one row
+        # per market *ever* and is never pruned, against a catalog of 220,244
+        # markets that grows. Ninety-nine buckets come back instead, whatever
+        # the table's size — a bound that is a property of the query rather
+        # than of today's data.
         rows = (
             await session.execute(
                 select(
-                    CalibrationLog.price_bucket_cents, CalibrationLog.settled_yes
-                ).where(CalibrationLog.settled_yes.isnot(None))
+                    CalibrationLog.price_bucket_cents,
+                    func.count().label("samples"),
+                    func.count()
+                    .filter(CalibrationLog.settled_yes.is_(True))
+                    .label("yes_count"),
+                )
+                .where(CalibrationLog.settled_yes.isnot(None))
+                .group_by(CalibrationLog.price_bucket_cents)
             )
         ).all()
 
-        stats = calibrate(
-            [
-                Observation(price_bucket_cents=int(b), settled_yes=bool(y))
-                for b, y in rows
-            ]
-        )
+        counts = {int(b): (int(n), int(y)) for b, n, y in rows}
+        stats = calibrate_counts(counts)
         hits = significant(stats, min_samples=min_samples)
         if not hits:
             log.debug(
                 "longshot_calibration: %d settled observation(s), none past the "
                 "%d-sample floor",
-                len(rows),
+                sum(n for n, _ in counts.values()),
                 min_samples,
             )
             return []
@@ -1031,9 +1182,13 @@ class WeatherDetector:
                     Market.yes_bid.isnot(None),
                     Market.yes_ask.isnot(None),
                 )
+                # Soonest to close first: the near lead times are the ones the
+                # calibration actually covers.
+                .order_by(Market.close_time, Market.ticker)
                 .limit(MAX_DETECTOR_ROWS)
             )
         ).all()
+        _warn_if_capped(self.name, markets, MAX_DETECTOR_ROWS, "weather markets")
         if not markets:
             return []
 

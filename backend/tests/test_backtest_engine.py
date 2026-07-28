@@ -164,3 +164,135 @@ class TestObservationShape:
         # Bought YES at 0.95, settled YES: 5c a contract on 10, less fees.
         assert result.realized_pnl_cents > 0
         assert result.fees_paid_cents > 0
+
+
+# ---------------------------------------------------------------------------
+# The summary's drawdown line
+# ---------------------------------------------------------------------------
+
+
+class TestSummaryDrawdown:
+    """An equity curve for `max_drawdown` must start at zero.
+
+    `replay()` appends exactly one equity point per observation, *after* the
+    fills at that instant — there is no pre-trade point, deliberately, because
+    the curve's length has to equal `observations`. So the opening balance is
+    the caller's job to prepend, and this call site had missed it: a run that
+    paid 1.75c of fees on its first observation has the curve
+    `[-1.75, -1.75]`, `max_drawdown` of which is **0**. With the leading zero
+    it is 1.75.
+
+    "An error that only ever flatters" — `report.py:611` prepends the same
+    point with a five-line comment explaining why, and
+    `test_backtest_stats.py` pins the error class explicitly. The codebase
+    knew; the summary line did not.
+    """
+
+    @staticmethod
+    def _result(
+        curve: list[str], *, starting_equity_cents: str = "0"
+    ) -> "object":
+        from app.backtest import coverage as cov
+        from app.backtest.engine import BacktestResult
+
+        replay_result = rp.ReplayResult(
+            trades=(),
+            fills=(),
+            equity_curve=tuple(
+                (T0 + timedelta(minutes=i), Decimal(value))
+                for i, value in enumerate(curve)
+            ),
+            unsettled=(),
+            starting_equity_cents=Decimal(starting_equity_cents),
+            ending_equity_cents=Decimal(curve[-1]) if curve else Decimal(0),
+            realized_pnl_cents=Decimal(0),
+            fees_paid_cents=Decimal("1.75"),
+            observations=len(curve),
+        )
+        report = cov.audit(
+            [],
+            window_start=T0,
+            window_end=T0 + timedelta(days=30),
+            expected_interval=timedelta(seconds=1),
+        )
+        return BacktestResult(
+            coverage=report,
+            replay=replay_result,
+            expectancy=None,
+            verdict=None,
+            headline="test",
+        )
+
+    @staticmethod
+    def _drawdown_line(result: object) -> str:
+        return next(
+            line
+            for line in result.summary_lines()  # type: ignore[attr-defined]
+            if line.startswith("max drawdown:")
+        )
+
+    def test_an_opening_loss_is_reported_as_a_drawdown(self) -> None:
+        """The regression, exactly.
+
+        Without the prepended opening balance this line reads `0c` for a run
+        that lost 1.75c on its very first observation and never recovered.
+        """
+        line = self._drawdown_line(self._result(["-1.75", "-1.75"]))
+        assert line == "max drawdown: 1.75c"
+
+    def test_a_larger_opening_loss_is_measured_from_the_open(self) -> None:
+        line = self._drawdown_line(self._result(["-400", "-250", "-300"]))
+        assert line == "max drawdown: 400c"
+
+    def test_a_curve_that_only_ever_rose_has_no_drawdown(self) -> None:
+        """The guard must not invent one."""
+        line = self._drawdown_line(self._result(["10", "20", "30"]))
+        assert line == "max drawdown: 0c"
+
+    def test_a_later_decline_is_still_measured(self) -> None:
+        """Peak 500, trough 100: the leading zero must not shadow it."""
+        line = self._drawdown_line(self._result(["200", "500", "100", "300"]))
+        assert line == "max drawdown: 400c"
+
+    def test_a_non_zero_opening_balance_is_the_one_used(self) -> None:
+        """A P&L curve opens at zero; an equity curve opens at the bankroll.
+        The starting equity the replay was given is the right first point
+        either way, and hardcoding `Decimal(0)` would report a fictional
+        drawdown of the entire starting balance.
+        """
+        line = self._drawdown_line(
+            self._result(
+                ["99000", "98000", "99500"], starting_equity_cents="100000"
+            )
+        )
+        assert line == "max drawdown: 2000c"
+
+    def test_the_summary_still_reports_the_other_numbers(self) -> None:
+        """Sanity: the fix is one line inside a block that renders several."""
+        lines = self._result(["-1.75", "-1.75"]).summary_lines()  # type: ignore[attr-defined]
+        assert any(line.startswith("observations replayed:") for line in lines)
+        assert any(line.startswith("realised P&L:") for line in lines)
+
+    def test_a_refused_coverage_report_renders_no_drawdown_line(self) -> None:
+        """Coverage is checked before the replay, not after — a backtest that
+        runs first and reports coverage as a footnote produces a number, and a
+        number is what gets remembered."""
+        from app.backtest import coverage as cov
+        from app.backtest.engine import BacktestResult
+
+        result = BacktestResult(
+            coverage=cov.audit(
+                [],
+                window_start=T0,
+                window_end=T0 + timedelta(days=30),
+                expected_interval=timedelta(seconds=1),
+            ),
+            replay=None,
+            expectancy=None,
+            verdict=None,
+            headline="test",
+        )
+        assert result.ran is False
+        assert not any(
+            line.startswith("max drawdown:") for line in result.summary_lines()
+        )

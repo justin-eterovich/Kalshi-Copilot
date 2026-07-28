@@ -1,4 +1,4 @@
-import { centsNum, type OrderbookResponse } from "./api";
+import { asCount, type OrderbookResponse } from "./api";
 
 /**
  * Depth ladder.
@@ -7,6 +7,14 @@ import { centsNum, type OrderbookResponse } from "./api";
  * to buy NO. A NO bid at price p is economically an offer to sell YES at
  * (1 - p), so the ask side is derived that way — which is what makes the two
  * columns comparable on one price axis.
+ *
+ * **This is a second copy of a mapping the codebase says must have exactly
+ * one.** `backend/app/trading/direction.py` owns the real one, and CLAUDE.md
+ * says never to inline it. This copy is display-only — it cannot cause an
+ * order to exist and nothing downstream reads it — but if the convention ever
+ * changes, this is the copy nobody greps for. It stays here only because a
+ * depth ladder cannot be drawn without putting both sides on one axis, and
+ * routing a chart through the order rail would be worse.
  */
 
 interface Level {
@@ -45,7 +53,7 @@ function Side({
   return (
     <div className="ladder-side">
       <div className="ladder-head">
-        <span>{side === "bid" ? "bid (buy YES)" : "ask (sell YES)"}</span>
+        <span>{side === "bid" ? "bid ¢ (buy YES)" : "ask ¢ (sell YES)"}</span>
         <span className="num">size</span>
       </div>
       {levels.length === 0 && <div className="ladder-empty">no resting size</div>}
@@ -56,7 +64,9 @@ function Side({
             style={{ width: `${max > 0 ? (l.size / max) * 100 : 0}%` }}
           />
           <span className="ladder-price">{l.price.toFixed(1)}</span>
-          <span className="ladder-size num">{l.size.toLocaleString()}</span>
+          {/* Same count language as every other size in the app; this column
+              used to be the one place a raw toLocaleString appeared. */}
+          <span className="ladder-size num">{asCount(String(l.size))}</span>
         </div>
       ))}
     </div>
@@ -89,10 +99,10 @@ export default function OrderBookLadder({
     <div>
       <div className="ladder-summary">
         <span>
-          bid <strong className="up">{bestBid?.toFixed(1) ?? "—"}</strong>
+          bid <strong className="up">{bestBid?.toFixed(1) ?? "—"}¢</strong>
         </span>
         <span>
-          ask <strong className="down">{bestAsk?.toFixed(1) ?? "—"}</strong>
+          ask <strong className="down">{bestAsk?.toFixed(1) ?? "—"}¢</strong>
         </span>
         <span>
           spread <strong>{spread !== null ? spread.toFixed(1) : "—"}¢</strong>
@@ -110,5 +120,3 @@ export default function OrderBookLadder({
     </div>
   );
 }
-
-export { centsNum };

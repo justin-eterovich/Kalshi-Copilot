@@ -31,7 +31,7 @@ export default function TapeView({
     <div className="tape">
       <div className="tape-head">
         <span>time</span>
-        <span className="num">price</span>
+        <span className="num">price ¢</span>
         <span className="num">size</span>
         <span>taker</span>
       </div>
@@ -39,12 +39,18 @@ export default function TapeView({
         const size = Number(t.count ?? 0);
         // Highlight prints well above this market's own norm.
         const big = median > 0 && size >= median * 5;
+        // A missing taker side is not a NO-side aggressor. `"yes" ? up : down`
+        // painted every unknown print red while its own side cell read "—".
+        const tone =
+          t.taker_side === "yes" ? "up" : t.taker_side === "no" ? "down" : "";
         return (
           <div
-            className={`tape-row ${t.taker_side === "yes" ? "up" : "down"}${big ? " big" : ""}`}
+            className={`tape-row ${tone}${big ? " big" : ""}`}
             key={`${t.ts}-${i}`}
           >
-            <span className="tape-time">{asClock(t.ts)}</span>
+            <span className="tape-time" title={t.ts}>
+              {asClock(t.ts)}
+            </span>
             <span className="num">{centsNum(t.yes_price)}</span>
             <span className="num">{asCount(t.count)}</span>
             <span className="tape-side">{t.taker_side ?? "—"}</span>

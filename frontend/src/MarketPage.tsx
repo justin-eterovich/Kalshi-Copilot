@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import OrderBookLadder from "./OrderBookLadder";
 import PriceChart from "./PriceChart";
@@ -6,6 +6,7 @@ import TapeView from "./TapeView";
 import TradeTicket from "./TradeTicket";
 import {
   api,
+  asClock,
   asCount,
   asTimeToClose,
   centsNum,
@@ -16,7 +17,7 @@ import {
   type Trade,
   type TradingState,
 } from "./api";
-import { useLiveFeed } from "./useLiveFeed";
+import { FEED_STATUS_TITLE, useLiveFeed } from "./useLiveFeed";
 
 const PERIODS = [
   { label: "1m", sec: 60, lookback: 12 },
@@ -44,6 +45,8 @@ export default function MarketPage() {
   const [period, setPeriod] = useState(PERIODS[0]);
   const [error, setError] = useState<string | null>(null);
   const [chartNote, setChartNote] = useState<string | null>(null);
+  const [candleSource, setCandleSource] = useState<string | null>(null);
+  const [quoteAt, setQuoteAt] = useState<Date | null>(null);
   const [trading, setTrading] = useState<TradingState | null>(null);
 
   const watch = useMemo(() => (ticker ? [ticker] : []), [ticker]);
@@ -55,15 +58,35 @@ export default function MarketPage() {
     setMarket((prev) => (prev ? { ...prev, ...data } : prev));
   });
 
-  const loadCore = useCallback(async () => {
+  /**
+   * The headline quote.
+   *
+   * Polled, not fetched once. It used to update only on websocket ticks — and
+   * the websocket needs credentials even for public channels, while the whole
+   * point of this page is that it works without a key. So the default state
+   * was a 30px accent price frozen at page load, sitting directly above a
+   * ladder that was five seconds fresh, with only a small "offline" pill to
+   * say so.
+   */
+  const loaded = useRef(false);
+
+  const loadQuote = useCallback(async () => {
     if (!ticker) return;
     try {
       setMarket(await api.market(ticker));
+      loaded.current = true;
+      setQuoteAt(new Date());
       setError(null);
     } catch (e) {
-      setError(String(e));
-      return;
+      // Only fail the page outright if there was never anything to show. Now
+      // that this polls, a single transient error must not replace a working
+      // page with a banner.
+      if (!loaded.current) setError(String(e));
     }
+  }, [ticker]);
+
+  const loadSiblings = useCallback(() => {
+    if (!ticker) return;
     api.siblings(ticker).then((r) => setSiblings(r.markets)).catch(() => {});
   }, [ticker]);
 
@@ -72,12 +95,14 @@ export default function MarketPage() {
     try {
       const result = await api.candles(ticker, period.sec, period.lookback);
       setCandles(result.candles);
+      setCandleSource(result.source);
       setChartNote(
         result.candles.length === 0
           ? "No candles for this window. Kalshi returns none for markets that have never traded."
           : null,
       );
     } catch {
+      setCandleSource(null);
       setChartNote("Could not load candles.");
     }
   }, [ticker, period]);
@@ -89,8 +114,17 @@ export default function MarketPage() {
   }, [ticker]);
 
   useEffect(() => {
-    loadCore();
-  }, [loadCore]);
+    loaded.current = false;
+    loadQuote();
+    // Same cadence as the book and tape below it, so the page is internally
+    // consistent rather than two ages of data stacked on top of each other.
+    const id = setInterval(loadQuote, 5000);
+    return () => clearInterval(id);
+  }, [loadQuote]);
+
+  useEffect(() => {
+    loadSiblings();
+  }, [loadSiblings]);
 
   useEffect(() => {
     loadCandles();
@@ -138,8 +172,11 @@ export default function MarketPage() {
             <span className="mono">{market.ticker}</span>
             {market.category && <span className="chip">{market.category}</span>}
             {market.status && <span className="chip">{market.status}</span>}
-            <span className={feedStatus === "live" ? "pill ok" : "pill warn"}>
-              {feedStatus}
+            <span
+              className={feedStatus === "live" ? "pill ok" : "pill warn"}
+              title={FEED_STATUS_TITLE}
+            >
+              socket {feedStatus}
             </span>
           </div>
         </div>
@@ -149,13 +186,27 @@ export default function MarketPage() {
             <span className="up">{centsNum(market.yes_bid)}</span>
             <span className="muted"> / </span>
             <span className="down">{centsNum(market.yes_ask)}</span>
+            <span className="muted"> ¢ bid/ask</span>
+          </div>
+          <div className="quote-age muted">
+            {quoteAt ? `quote read ${asClock(quoteAt.toISOString())}` : "loading…"}
           </div>
         </div>
       </div>
 
       <section className="panel" style={{ marginBottom: 12 }}>
         <div className="panel-head">
-          <h2>Price</h2>
+          <h2>
+            Price{" "}
+            {/* The ladder said where its data came from and the chart did
+                not, though the API returns it. README promises this per
+                panel. */}
+            {candleSource && (
+              <span className="muted src-tag">
+                {candleSource === "kalshi" ? "live" : "cached"}
+              </span>
+            )}
+          </h2>
           <div className="seg">
             {PERIODS.map((p) => (
               <button
@@ -179,7 +230,9 @@ export default function MarketPage() {
         </section>
 
         <section className="panel">
-          <h2>Tape</h2>
+          <h2>
+            Tape <span className="muted src-tag">polled · 5s</span>
+          </h2>
           <TapeView trades={trades} />
         </section>
 
@@ -198,7 +251,14 @@ export default function MarketPage() {
           <Row k="type">{market.market_type || "—"}</Row>
           <Row k="24h volume">{asCount(market.volume_24h)}</Row>
           <Row k="open interest">{asCount(market.open_interest)}</Row>
-          <Row k="liquidity score">{market.liquidity_score ?? "—"}</Row>
+          {/* Same field the screener renders at 0dp with a bar; showing
+              "95.5" here and "96" there is two renderings of one number on
+              one page load. */}
+          <Row k="liquidity score">
+            {market.liquidity_score === null
+              ? "—"
+              : market.liquidity_score.toFixed(0)}
+          </Row>
           <Row k="closes">{asTimeToClose(market.hours_to_close)}</Row>
           <Row k="tick structure">{market.price_level_structure || "—"}</Row>
           {market.event && (
@@ -234,9 +294,9 @@ export default function MarketPage() {
                 <tr>
                   <th>ticker</th>
                   <th>outcome</th>
-                  <th className="num">bid</th>
-                  <th className="num">ask</th>
-                  <th className="num">last</th>
+                  <th className="num">bid ¢</th>
+                  <th className="num">ask ¢</th>
+                  <th className="num">last ¢</th>
                   <th className="num">24h vol</th>
                 </tr>
               </thead>

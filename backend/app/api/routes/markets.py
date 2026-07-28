@@ -69,7 +69,39 @@ def _get_backfiller(request: Request) -> Backfiller | None:
     return getattr(request.app.state, "backfiller", None)
 
 
-def _liquidity_score(m: Market) -> float | None:
+#: Exactly the columns `_market_row` and `_liquidity_score` read.
+#:
+#: Screener queries select these rather than the whole entity. `select(Market)`
+#: drags `raw` — the full API payload as JSONB — on every row, and nothing in
+#: the response has ever read it: 660 KB and 0.30s for one page of 1,000. That
+#: is the pattern CLAUDE.md names as the thing that killed the worker outright,
+#: here on the endpoint the dashboard polls. A SQLAlchemy `Row` exposes its
+#: columns as attributes, so the row builders below work unchanged.
+_MARKET_COLUMNS = (
+    Market.ticker,
+    Market.event_ticker,
+    Market.series_ticker,
+    Market.title,
+    Market.yes_sub_title,
+    Market.no_sub_title,
+    Market.category,
+    Market.status,
+    Market.yes_bid,
+    Market.yes_ask,
+    Market.no_bid,
+    Market.no_ask,
+    Market.last_price,
+    Market.previous_price,
+    Market.volume,
+    Market.volume_24h,
+    Market.open_interest,
+    Market.liquidity_dollars,
+    Market.close_time,
+    Market.first_seen_at,
+)
+
+
+def _liquidity_score(m: Any) -> float | None:
     """Rough 0-100 tradeability score.
 
     Deliberately simple and readable rather than clever: a tight spread and
@@ -100,7 +132,7 @@ def _liquidity_score(m: Market) -> float | None:
     return round(min(100.0, max(0.0, raw)), 1)
 
 
-def _market_row(m: Market) -> dict[str, Any]:
+def _market_row(m: Any) -> dict[str, Any]:
     spread = (
         m.yes_ask - m.yes_bid
         if m.yes_ask is not None and m.yes_bid is not None
@@ -185,7 +217,7 @@ async def list_markets(
             Market.close_time <= datetime.fromtimestamp(cutoff, tz=UTC)
         )
 
-    stmt = select(Market)
+    stmt = select(*_MARKET_COLUMNS)
     count_stmt = select(func.count()).select_from(Market)
     for f in filters:
         stmt = stmt.where(f)
@@ -194,13 +226,18 @@ async def list_markets(
     column = SORTABLE[sort]
     stmt = (
         stmt.order_by(
-            column.desc().nullslast() if order == "desc" else column.asc().nullsfirst()
+            column.desc().nullslast() if order == "desc" else column.asc().nullsfirst(),
+            # Tie-break on the primary key so paging is stable. Sorting by
+            # `volume_24h` alone leaves thousands of rows tied at NULL or 0 in
+            # no defined order, and page 2 could then repeat or skip rows from
+            # page 1 for no reason the operator could see.
+            Market.ticker,
         )
         .limit(limit)
         .offset(offset)
     )
 
-    rows = (await session.execute(stmt)).scalars().all()
+    rows = (await session.execute(stmt)).all()
     total = (await session.execute(count_stmt)).scalar_one()
 
     return {
@@ -273,12 +310,12 @@ async def get_siblings(ticker: str, session: SessionDep) -> dict[str, Any]:
 
     rows = (
         await session.execute(
-            select(Market)
+            select(*_MARKET_COLUMNS)
             .where(Market.event_ticker == market.event_ticker)
-            .order_by(Market.last_price.desc().nullslast())
+            .order_by(Market.last_price.desc().nullslast(), Market.ticker)
             .limit(60)
         )
-    ).scalars().all()
+    ).all()
 
     return {
         "event_ticker": market.event_ticker,
@@ -440,9 +477,18 @@ async def catalog_stats(session: SessionDep) -> dict[str, Any]:
 
     recent_listings = (
         await session.execute(
-            select(Market).order_by(Market.first_seen_at.desc()).limit(8)
+            # Four columns, not the whole entity: this response renders four
+            # fields and `raw` is the largest column in the table.
+            select(
+                Market.ticker,
+                Market.title,
+                Market.category,
+                Market.first_seen_at,
+            )
+            .order_by(Market.first_seen_at.desc(), Market.ticker)
+            .limit(8)
         )
-    ).scalars().all()
+    ).all()
 
     # Markets we could not fee-price if a proposal appeared right now.
     uncategorised = await count(

@@ -53,6 +53,17 @@ __all__ = [
 ]
 
 
+#: Ceiling on forecast rows resolved per backfill sweep. Un-backfilled rows
+#: accumulate for any station whose observations stop, and "within
+#: lookback_days" bounds the data rather than the query.
+MAX_BACKFILL_ROWS = 5_000
+
+#: Ceiling on observations read to resolve one batch. 21 stations over a
+#: fortnight of hourly observations is a few thousand; this is the backstop
+#: for a station that reports far more often than expected.
+MAX_OBSERVATION_ROWS = 100_000
+
+
 def tracked_stations() -> list[str]:
     """Every station some series has been asserted to settle on."""
     return sorted({claim.station_id for claim in SERIES_STATIONS.values()})
@@ -200,9 +211,15 @@ async def backfill_actuals(
     now = now or datetime.now(UTC)
     since = (now - timedelta(days=lookback_days)).date()
 
+    # Capped and newest-first. `lookback_days` is a bound on today's data, not
+    # on the query: a station whose observations stop keeps accumulating rows
+    # that can never be filled in, and every one of them was fetched as a full
+    # ORM entity on every sweep. Newest-first means a stuck tail cannot starve
+    # the days still worth resolving.
     pending = (
         await session.execute(
-            select(WeatherForecast).where(
+            select(WeatherForecast)
+            .where(
                 WeatherForecast.actual_f.is_(None),
                 WeatherForecast.target_date >= since,
                 # Only days that are unambiguously over. A day still in
@@ -211,16 +228,36 @@ async def backfill_actuals(
                 # forecasts run hot.
                 WeatherForecast.target_date < (now - timedelta(days=1)).date(),
             )
+            .order_by(WeatherForecast.target_date.desc(), WeatherForecast.id)
+            .limit(MAX_BACKFILL_ROWS)
         )
     ).scalars().all()
     if not pending:
         return 0
+    if len(pending) >= MAX_BACKFILL_ROWS:
+        log.warning(
+            "weather backfill: %d forecast rows at the %d-row ceiling; the "
+            "remainder waits for the next sweep",
+            len(pending),
+            MAX_BACKFILL_ROWS,
+        )
+
+    # One query for every (station, day) in the batch, instead of one per
+    # pending row. At 21 stations over a fortnight that was hundreds of round
+    # trips per sweep, each returning a handful of temperatures.
+    extremes = await _observed_extremes(
+        session,
+        stations={row.station_id for row in pending},
+        days={row.target_date for row in pending},
+    )
 
     filled = 0
     for row in pending:
-        actual = await _observed_extreme(
-            session, row.station_id, row.target_date, measure=row.measure
-        )
+        measured = extremes.get((row.station_id, row.target_date))
+        if measured is None:
+            continue
+        low, high = measured
+        actual = high if row.measure == "high" else low
         if actual is None:
             continue
         row.actual_f = actual
@@ -229,41 +266,82 @@ async def backfill_actuals(
     return filled
 
 
-async def _observed_extreme(
-    session: AsyncSession, station_id: str, day: date, *, measure: str
-) -> Decimal | None:
-    """Highest or lowest observation recorded on ``day`` UTC for a station.
+async def _observed_extremes(
+    session: AsyncSession,
+    *,
+    stations: set[str],
+    days: set[date],
+) -> dict[tuple[str, date], tuple[Decimal | None, Decimal | None]]:
+    """``(station, UTC day) -> (min, max)`` over one fetch.
 
     Deliberately UTC-bounded rather than local: the observations table stores
     aware UTC timestamps, and a station's local day is a window this function
     does not have the offset to compute.
 
     **That approximation is worse for lows than for highs**, and knowingly so.
-    A local day's hottest hours sit well inside any reasonable window, so a
-    few hours of boundary slip rarely changes the maximum. A local day's
-    *minimum* happens just before dawn — right against the boundary — so for a
-    US station, whose local midnight falls 5-8 hours after UTC midnight, the
-    UTC window can straddle two different nights and pick the colder. The
-    number is still useful for calibration, where a consistent bias is
-    measured rather than assumed away, but it is not a settlement value and
-    the low side carries the larger error.
+    A local day's hottest hours sit well inside any reasonable window, so a few
+    hours of boundary slip rarely changes the maximum. A local day's *minimum*
+    happens just before dawn — right against the boundary — so for a US
+    station, whose local midnight falls 5-8 hours after UTC midnight, the UTC
+    window can straddle two different nights and pick the colder. The number is
+    still useful for calibration, where a consistent bias is measured rather
+    than assumed away, but it is not a settlement value and the low side
+    carries the larger error.
+
+    Bucketed in Python rather than grouped in SQL on purpose: grouping needs
+    the observation timestamp cast to a date, and that cast resolves against
+    the *server's* timezone rather than ours. An explicit UTC window is the
+    same boundary the single-row version uses, and a day boundary that moves
+    with a server setting is precisely the kind of silent difference this
+    codebase refuses.
     """
-    start = datetime.combine(day, datetime.min.time(), tzinfo=UTC)
+    if not stations or not days:
+        return {}
+
+    start = datetime.combine(min(days), datetime.min.time(), tzinfo=UTC)
+    end = datetime.combine(max(days), datetime.min.time(), tzinfo=UTC) + timedelta(
+        days=1
+    )
+
     rows = (
         await session.execute(
-            select(WeatherObservation.temperature_f).where(
-                WeatherObservation.station_id == station_id,
+            select(
+                WeatherObservation.station_id,
+                WeatherObservation.observed_at,
+                WeatherObservation.temperature_f,
+            )
+            .where(
+                WeatherObservation.station_id.in_(sorted(stations)),
                 WeatherObservation.observed_at >= start,
-                WeatherObservation.observed_at < start + timedelta(days=1),
+                WeatherObservation.observed_at < end,
                 WeatherObservation.temperature_f.isnot(None),
             )
+            .order_by(WeatherObservation.observed_at)
+            .limit(MAX_OBSERVATION_ROWS)
         )
-    ).scalars().all()
+    ).all()
+    if len(rows) >= MAX_OBSERVATION_ROWS:
+        log.warning(
+            "weather backfill: %d observations at the %d-row ceiling; some "
+            "days in this batch may be resolved from a partial series",
+            len(rows),
+            MAX_OBSERVATION_ROWS,
+        )
 
-    values = [v for v in rows if v is not None]
-    if not values:
-        return None
-    return max(values) if measure == "high" else min(values)
+    out: dict[tuple[str, date], tuple[Decimal | None, Decimal | None]] = {}
+    for station_id, observed_at, temperature in rows:
+        if temperature is None:
+            continue
+        ts = observed_at
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        key = (station_id, ts.astimezone(UTC).date())
+        low, high = out.get(key, (None, None))
+        out[key] = (
+            temperature if low is None or temperature < low else low,
+            temperature if high is None or temperature > high else high,
+        )
+    return out
 
 
 async def sweep_weather(

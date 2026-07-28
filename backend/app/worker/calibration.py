@@ -31,7 +31,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -195,11 +195,28 @@ async def backfill_outcomes(session: AsyncSession) -> int:
     Projected and capped like everything else that touches ``markets``: the
     pending set only shrinks when markets settle, so on a catalog that is
     mostly open it is the *older* of the two unbounded queries here.
+
+    **The yes/no test is pushed into SQL, and that is what stops this
+    starving.** An observation whose market resolves ``void`` or to a scalar
+    payout is deliberately never filled in, so under an ``ORDER BY id`` it sat
+    at the head of the pending set forever. Once those exceeded ``MAX_BACKFILL``
+    every sweep would re-read the same permanently-stuck prefix and no newer
+    observation would ever be resolved again — a query that works until the
+    data ages, which is the failure mode this codebase keeps meeting. Selecting
+    only rows whose market actually says "yes" or "no" means the head of the
+    queue always moves.
     """
+    # `result` is `''` for an open market, not NULL, so this is a positive
+    # test for the two settled values rather than a "not empty" one.
+    settled_result = func.lower(func.trim(func.coalesce(Market.result, "")))
     pending = (
         await session.execute(
-            select(CalibrationLog.id, CalibrationLog.ticker)
-            .where(CalibrationLog.settled_yes.is_(None))
+            select(CalibrationLog.id, settled_result)
+            .join(Market, Market.ticker == CalibrationLog.ticker)
+            .where(
+                CalibrationLog.settled_yes.is_(None),
+                settled_result.in_(("yes", "no")),
+            )
             .order_by(CalibrationLog.id)
             .limit(MAX_BACKFILL)
         )
@@ -207,26 +224,16 @@ async def backfill_outcomes(session: AsyncSession) -> int:
     if not pending:
         return 0
 
-    tickers = [ticker for _, ticker in pending]
-    results = dict(
-        (
-            await session.execute(
-                select(Market.ticker, Market.result).where(Market.ticker.in_(tickers))
-            )
-        ).all()
-    )
-
     now = datetime.now(UTC)
     settled_yes: list[int] = []
     settled_no: list[int] = []
-    for row_id, ticker in pending:
-        result = (results.get(ticker) or "").strip().lower()
+    for row_id, result in pending:
         if result == "yes":
             settled_yes.append(row_id)
-        elif result == "no":
+        else:
             settled_no.append(row_id)
-        # Anything else is unsettled, voided, or a scalar payout. A void is
-        # not a "no" — the stake came back — and folding one in would bias the
+        # Anything else never reaches here: a void or a scalar payout is not a
+        # "no" — the stake came back — and folding one in would bias the
         # observed rate downwards in exactly the low band the screen is about.
 
     for ids, outcome in ((settled_yes, True), (settled_no, False)):

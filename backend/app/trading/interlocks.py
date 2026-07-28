@@ -117,6 +117,7 @@ def check_execution(
     config: Config,
     *,
     confirmed: bool,
+    kill_switch: bool,
     confirmation_phrase: str | None = None,
     now: datetime | None = None,
 ) -> ExecutionRoute:
@@ -141,7 +142,17 @@ def check_execution(
             "human approval of that specific trade.",
         )
 
-    if config.risk.kill_switch:
+    # Either source engages it. `config.risk.kill_switch` is the static floor
+    # from config.yaml; `kill_switch` is the runtime flag in Redis, which is
+    # the one an operator can actually reach on a running system. A config
+    # that says true can never be released by the API — a deliberate one-way
+    # door, so an operator who has halted trading in the file cannot be undone
+    # by a click.
+    #
+    # `kill_switch` is a required argument with no default on purpose. There
+    # is no safe default: `False` would mean a caller that forgot it silently
+    # bypasses the emergency stop.
+    if kill_switch or config.risk.kill_switch:
         raise InterlockError(
             "kill_switch",
             "the kill switch is engaged: no new orders are placed and resting "

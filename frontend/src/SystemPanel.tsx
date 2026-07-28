@@ -1,5 +1,14 @@
 import type { Health, SystemStatus } from "./api";
 
+/**
+ * Build progress.
+ *
+ * This list is hand-maintained and there is no endpoint behind it, so it rots
+ * silently: it sat at M6 while M7, M8 and M9 were deployed and serving, and
+ * the dashboard is the operator's only status surface. **It must be updated
+ * in the same change that finishes a milestone**, against the status table in
+ * README.md, which is the source of truth.
+ */
 const MILESTONES: [string, string, boolean][] = [
   ["M0", "Scaffold, compose stack, fees module", true],
   ["M1", "Ingest + storage", true],
@@ -10,9 +19,9 @@ const MILESTONES: [string, string, boolean][] = [
   // context and the dashboard is plain HTTP on a LAN address by design.
   ["M5", "Risk layer + in-tab alerts", true],
   ["M6", "BTC vol engine + detectors wave 2", true],
-  ["M7", "Weather engine", false],
-  ["M8", "News + catalyst engine", false],
-  ["M9", "Backtester + hardening", false],
+  ["M7", "Weather engine", true],
+  ["M8", "News + catalyst engine", true],
+  ["M9", "Backtester + hardening", true],
 ];
 
 function Row({ k, children }: { k: string; children: React.ReactNode }) {
@@ -46,15 +55,9 @@ export default function SystemPanel({
 }) {
   return (
     <div>
-      {system?.fees.verified_on === null && (
-        <div className="banner">
-          <strong>Fee schedule unverified.</strong> Run{" "}
-          <code>python scripts/refresh_fee_schedule.py</code> to confirm the
-          series multipliers against Kalshi's official PDF. Until then nothing
-          can be proposed — every edge figure is net of fees, so an unchecked
-          fee table makes all of them untrustworthy.
-        </div>
-      )}
+      {/* The fee-unverified banner used to live here, on the third tab. It is
+          now in App.tsx beside the safe-mode banner, where every page sees
+          it — it is the state in which nothing can be proposed at all. */}
 
       {system && !system.credentials_present && (
         <div className="banner">
@@ -178,6 +181,11 @@ export default function SystemPanel({
               </li>
             ))}
           </ul>
+          <p className="muted" style={{ marginTop: 8 }}>
+            Built and tested is not the same as running: every detector ships
+            disabled, and several engines need history before they price
+            anything.
+          </p>
         </section>
       </div>
     </div>

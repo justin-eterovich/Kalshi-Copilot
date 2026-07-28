@@ -58,6 +58,15 @@ class FakeResult:
     def first(self) -> Any:
         return self._rows[0] if self._rows else None
 
+    def one_or_none(self) -> Any:
+        # The `SELECT ... FOR UPDATE` re-read of the proposal lands here. A
+        # fake session cannot take a row lock, so it returns nothing and the
+        # executor keeps the object it was handed — which is what these tests
+        # want, since they are about control flow rather than about locking.
+        if len(self._rows) > 1:
+            raise AssertionError("one_or_none() on multiple rows")
+        return self._rows[0] if self._rows else None
+
     def all(self) -> list[Any]:
         return list(self._rows)
 
@@ -203,13 +212,25 @@ def key_file(tmp_path: Path) -> Path:
 
 @pytest.fixture(autouse=True)
 def no_redis(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Publishing is best-effort; keep it out of these tests entirely."""
+    """Publishing is best-effort; keep it out of these tests entirely.
+
+    ``get_kill_switch`` is patched for a different reason. It reads Redis and
+    **fails closed** — an unreachable Redis returns ``True``, because on an
+    emergency stop the safe reading of "unknown" is "engaged". That is correct
+    in production and would refuse every test in this module, so the runtime
+    flag is pinned clear here and exercised explicitly in
+    :class:`TestRuntimeKillSwitch`.
+    """
 
     async def noop(*_args: Any, **_kwargs: Any) -> None:
         return None
 
+    async def switch_off() -> bool:
+        return False
+
     monkeypatch.setattr("app.trading.proposals.publish", noop)
     monkeypatch.setattr("app.trading.executor.Executor._publish_order", noop)
+    monkeypatch.setattr("app.trading.executor.get_kill_switch", switch_off)
 
 
 def demo_settings(key_file: Path) -> Settings:
@@ -317,6 +338,81 @@ class TestInterlocksAtExecution:
         assert proposal.status is ProposalStatus.PENDING
 
 
+class TestRuntimeKillSwitch:
+    """The half of the switch an operator can actually reach.
+
+    ``config.risk.kill_switch`` is read once per process (``get_config()`` is
+    ``lru_cache``d), so engaging it meant editing a file and restarting
+    containers — and the switch's two halves live in different processes, so a
+    partial restart left resting orders live while the dashboard read
+    "engaged". The runtime flag lives in Redis and is read on every approval.
+    """
+
+    async def test_the_runtime_flag_places_nothing(
+        self, key_file: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def engaged() -> bool:
+            return True
+
+        monkeypatch.setattr("app.trading.executor.get_kill_switch", engaged)
+
+        session = session_with_market()
+        rest = FakeRest()
+        executor = Executor(rest, demo_settings(key_file), make_config())
+
+        with pytest.raises(InterlockError) as exc:
+            await executor.approve_and_execute(
+                session, make_proposal(), confirmed=True
+            )
+
+        assert exc.value.code == "kill_switch"
+        assert rest.create_calls == []
+        assert session.of_type(Order) == []
+
+    async def test_it_is_read_on_every_approval_not_cached(
+        self, key_file: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reason it is in Redis rather than in the config object.
+
+        A value read once at startup is not an emergency stop; it is a
+        deployment setting wearing one's clothes.
+        """
+        reads = 0
+
+        async def counting() -> bool:
+            nonlocal reads
+            reads += 1
+            return False
+
+        monkeypatch.setattr("app.trading.executor.get_kill_switch", counting)
+
+        executor = Executor(FakeRest(), demo_settings(key_file), make_config())
+        for _ in range(3):
+            await executor.approve_and_execute(
+                session_with_market(), make_proposal(), confirmed=True
+            )
+
+        assert reads == 3
+
+    async def test_an_unreachable_redis_refuses_rather_than_arming(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``get_kill_switch`` itself fails closed.
+
+        Asserted against the real function with a broken client: if Redis
+        cannot answer, we cannot prove the operator has *not* hit the switch,
+        and the safe reading of "unknown" on an emergency stop is "engaged".
+        """
+        from app.core import redis as core_redis
+
+        class BrokenRedis:
+            async def get(self, _key: str) -> str:
+                raise ConnectionError("redis is down")
+
+        monkeypatch.setattr(core_redis, "get_redis", lambda: BrokenRedis())
+        assert await core_redis.get_kill_switch() is True
+
+
 # ---------------------------------------------------------------------------
 # Idempotency
 # ---------------------------------------------------------------------------
@@ -353,7 +449,13 @@ class TestIdempotency:
     async def test_every_order_carries_a_unique_client_order_id(
         self, key_file: Path
     ) -> None:
-        """The idempotency key the exchange dedupes on."""
+        """The idempotency key the exchange dedupes on.
+
+        These proposals are unpersisted (``created_at`` is a server default,
+        so it is None until a flush), which is the random branch of
+        :func:`_client_order_id`. Determinism for a *persisted* proposal is
+        pinned in :class:`TestClientOrderId`.
+        """
         ids = set()
         for _ in range(5):
             session = session_with_market()
@@ -363,6 +465,212 @@ class TestIdempotency:
             )
             ids.add(order.client_order_id)
         assert len(ids) == 5
+
+    async def test_a_filled_order_also_blocks_a_second_placement(
+        self, key_file: Path
+    ) -> None:
+        """The common case the old guard missed.
+
+        ``_existing_order_for`` used to select only pending/resting/partially
+        filled, which excludes FILLED — the normal outcome for a taker order
+        on a liquid book. So the "one order per proposal" guard did not fire
+        in precisely the situation it exists for, and two concurrent approvals
+        of one proposal placed two real orders, two fills, two contracts where
+        the operator authorised one.
+        """
+        existing = Order(
+            proposal_id=1,
+            client_order_id="already-filled",
+            ticker="TEST-MKT",
+            side=Side.YES,
+            action="buy",
+            limit_price=Decimal("0.50"),
+            contracts=Decimal(10),
+            filled_contracts=Decimal(10),
+            status=OrderStatus.FILLED,
+            route="demo_exchange",
+        )
+        existing.id = 99
+        session = session_with_market(existing_orders=[existing])
+        rest = FakeRest()
+        executor = Executor(rest, demo_settings(key_file), make_config())
+
+        order = await executor.approve_and_execute(
+            session, make_proposal(), confirmed=True
+        )
+
+        assert order is existing
+        assert rest.create_calls == []
+
+    async def test_a_rejected_order_also_blocks_a_second_placement(
+        self, key_file: Path
+    ) -> None:
+        """The important one, and the least obvious.
+
+        A write that timed out is recorded REJECTED but **may still have
+        reached the matching engine** — ``rest.py`` refuses to retry writes for
+        exactly that reason. Treating a REJECTED row as licence to place again
+        is the double-submit this codebase declines everywhere else. If an
+        order row exists at all, recovery is reconciliation by client order ID,
+        never a second POST.
+        """
+        existing = Order(
+            proposal_id=1,
+            client_order_id="maybe-reached-the-engine",
+            ticker="TEST-MKT",
+            side=Side.YES,
+            action="buy",
+            limit_price=Decimal("0.50"),
+            contracts=Decimal(10),
+            status=OrderStatus.REJECTED,
+            error="write timed out",
+            route="demo_exchange",
+        )
+        existing.id = 98
+        session = session_with_market(existing_orders=[existing])
+        rest = FakeRest()
+        executor = Executor(rest, demo_settings(key_file), make_config())
+
+        order = await executor.approve_and_execute(
+            session, make_proposal(), confirmed=True
+        )
+
+        assert order is existing
+        assert rest.create_calls == []
+
+    @pytest.mark.parametrize("status", list(OrderStatus))
+    async def test_an_order_in_any_status_blocks_a_second_placement(
+        self, status: OrderStatus, key_file: Path
+    ) -> None:
+        """Deliberately unfiltered by status.
+
+        Parametrized over the whole enum so that adding a state cannot quietly
+        reopen the hole: a *new* status would otherwise default to "not a live
+        order", which is how FILLED slipped through the first time.
+        """
+        existing = Order(
+            proposal_id=1,
+            client_order_id=f"existing-{status.value}",
+            ticker="TEST-MKT",
+            side=Side.YES,
+            action="buy",
+            limit_price=Decimal("0.50"),
+            contracts=Decimal(10),
+            status=status,
+            route="demo_exchange",
+        )
+        existing.id = 42
+        session = session_with_market(existing_orders=[existing])
+        rest = FakeRest()
+        executor = Executor(rest, demo_settings(key_file), make_config())
+
+        order = await executor.approve_and_execute(
+            session, make_proposal(), confirmed=True
+        )
+
+        assert order is existing
+        assert rest.create_calls == []
+        assert rest.batch_calls == []
+
+
+class TestClientOrderId:
+    """The exchange's own defence against a double placement.
+
+    README calls client-supplied order IDs the reason "a network retry cannot
+    double-place". That was not true while this was ``uuid.uuid4()`` per
+    attempt: two approvals of one proposal minted two different IDs, so the
+    exchange had no basis on which to reject the second and duly filled both.
+    Two distinct exchange order IDs, two fills, 470 microseconds apart.
+
+    Deriving the ID from ``(proposal_id, leg_seq, created_at)`` makes the
+    exchange the last line of defence behind the row lock in
+    ``approve_and_execute``.
+    """
+
+    CREATED = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
+
+    def _proposal(self, **overrides: object) -> ProposedTrade:
+        return make_proposal(created_at=self.CREATED, **overrides)
+
+    def test_the_same_leg_gets_the_same_id_every_time(self) -> None:
+        from app.trading.executor import _client_order_id
+
+        first = _client_order_id(self._proposal(), 0)
+        second = _client_order_id(self._proposal(), 0)
+        assert first == second
+
+    def test_different_legs_get_different_ids(self) -> None:
+        """A set arbitrage places several orders under one proposal; they must
+        not collide with each other."""
+        from app.trading.executor import _client_order_id
+
+        proposal = self._proposal()
+        ids = {_client_order_id(proposal, seq) for seq in range(5)}
+        assert len(ids) == 5
+
+    def test_a_different_creation_time_gives_a_different_id(self) -> None:
+        """A rebuilt database restarts the proposal ID sequence.
+
+        Without ``created_at`` folded in, proposal 1 of a fresh database would
+        mint the same client order ID as proposal 1 of the old one — and the
+        exchange still remembers the old one.
+        """
+        from app.trading.executor import _client_order_id
+
+        old = _client_order_id(self._proposal(), 0)
+        new = _client_order_id(
+            make_proposal(created_at=self.CREATED + timedelta(seconds=1)), 0
+        )
+        assert old != new
+
+    def test_a_different_proposal_gives_a_different_id(self) -> None:
+        from app.trading.executor import _client_order_id
+
+        first = _client_order_id(self._proposal(id=1), 0)
+        second = _client_order_id(self._proposal(id=2), 0)
+        assert first != second
+
+    def test_an_unpersisted_proposal_still_gets_an_id(self) -> None:
+        """Nothing stable to derive from, and a random ID is strictly better
+        than a colliding one."""
+        from app.trading.executor import _client_order_id
+
+        unpersisted = make_proposal(created_at=None)
+        unpersisted.id = None
+        first = _client_order_id(unpersisted, 0)
+        second = _client_order_id(unpersisted, 0)
+        assert first and second
+        assert first != second
+
+    def test_a_proposal_with_no_creation_time_still_gets_an_id(self) -> None:
+        """``created_at`` is a server default, so it is None before a flush."""
+        from app.trading.executor import _client_order_id
+
+        assert _client_order_id(make_proposal(created_at=None), 0)
+
+    def test_it_is_a_uuid_string(self) -> None:
+        """The exchange takes a string; asserting the shape keeps a future
+        change from sending something it will reject."""
+        import uuid
+
+        from app.trading.executor import _client_order_id
+
+        uuid.UUID(_client_order_id(self._proposal(), 0))
+        uuid.UUID(_client_order_id(make_proposal(created_at=None), 0))
+
+    async def test_the_order_carries_the_derived_id(self, key_file: Path) -> None:
+        """End to end: what is placed is what would be reconciled against."""
+        from app.trading.executor import _client_order_id
+
+        session = session_with_market()
+        rest = FakeRest()
+        executor = Executor(rest, demo_settings(key_file), make_config())
+        proposal = self._proposal()
+
+        order = await executor.approve_and_execute(session, proposal, confirmed=True)
+
+        assert order.client_order_id == _client_order_id(proposal, 0)
+        assert rest.create_calls[0]["client_order_id"] == order.client_order_id
 
     async def test_the_order_row_exists_before_the_placement_call(
         self, key_file: Path
@@ -391,6 +699,46 @@ class TestIdempotency:
 
 
 class TestWireTranslation:
+    @pytest.mark.parametrize(
+        ("side", "action", "limit_price", "book_side", "yes_price"),
+        [
+            (Side.YES, "buy", "0.56", "bid", "0.56"),
+            (Side.YES, "sell", "0.56", "ask", "0.56"),
+            (Side.NO, "buy", "0.30", "ask", "0.70"),
+            (Side.NO, "sell", "0.30", "bid", "0.70"),
+        ],
+    )
+    async def test_all_four_rows_of_the_direction_table_reach_the_wire(
+        self,
+        side: Side,
+        action: str,
+        limit_price: str,
+        book_side: str,
+        yes_price: str,
+        key_file: Path,
+    ) -> None:
+        """The whole truth table, at the call site rather than only in
+        ``direction.py``.
+
+        The unit tests cover the mapping; this covers the executor actually
+        *using* it. Only the two buy rows were exercised end to end, so a call
+        site that dropped the ``to_yes_price`` call on a sell would have passed
+        the suite — and nothing downstream catches an inversion: the fee
+        formula ``P(1-P)`` is symmetric, so a flipped direction produces the
+        same fee, the same notional, and a plausible confirmation.
+        """
+        session = session_with_market(
+            [make_leg(side=side, action=action, limit_price=Decimal(limit_price))]
+        )
+        rest = FakeRest()
+        executor = Executor(rest, demo_settings(key_file), make_config())
+
+        await executor.approve_and_execute(session, make_proposal(), confirmed=True)
+
+        sent = rest.create_calls[0]
+        assert sent["book_side"] == book_side
+        assert Decimal(sent["price_dollars"]) == Decimal(yes_price)
+
     async def test_buy_yes_is_sent_as_a_bid(self, key_file: Path) -> None:
         session = session_with_market(
             [make_leg(side=Side.YES, action="buy", limit_price=Decimal("0.56"))]

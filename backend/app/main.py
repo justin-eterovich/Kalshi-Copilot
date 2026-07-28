@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api import ws
 from app.api.routes import health, markets, trading
+from app.detectors.base import enabled_detector_names
 from app.config import get_config
 from app.core.fees import load_fee_schedule
 from app.core.logging import configure_logging, get_logger
@@ -109,7 +110,10 @@ def _log_safety_posture(settings, config) -> None:
             "unknown multiplier are excluded from proposals (fail-closed)."
         )
 
-    enabled = config.detectors.enabled_names()
+    # Same helper /api/system uses, so the boot log and the dashboard
+    # cannot disagree about which detectors are on (the weather engine is
+    # configured outside the `detectors:` block and was missing from one).
+    enabled = enabled_detector_names(config)
     log.info("detectors enabled: %s", ", ".join(enabled) if enabled else "none")
 
 
