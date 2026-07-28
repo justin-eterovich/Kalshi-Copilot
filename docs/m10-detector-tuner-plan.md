@@ -3,9 +3,10 @@
 Send yesterday's detector picks and their current marks to Opus 5; get back a
 proposed change to the detector thresholds; a human applies it.
 
-Status: **plan only, nothing built.** Read the refusal gate section (§6) before
-estimating value — on today's data this feature refuses on day one, the same way
-the backtester does, and for the same reason.
+Status: **M10a is built** (`app/tuning/`, `scripts/tune_detectors.py`) — harvest,
+mark, gate, dossier, no LLM. M10b and M10c are still plan only. Read the refusal
+gate section (§6) before estimating value: on today's data this refuses on day
+one, the same way the backtester does and for the same reason.
 
 ---
 
@@ -335,10 +336,15 @@ and worth flagging to the operator before the first run.
 
 Milestone by milestone, demo notes at each stop.
 
-- **M10a — dossier and scorer, no LLM.** Harvest, mark, coverage gate, CLI that
-  prints the report. Immediately useful on its own: it answers "what did the
-  detectors claim yesterday and what happened" for the first time. Refuses
-  today, by design, and that refusal is the deliverable's first real test.
+- **M10a — dossier and scorer, no LLM. BUILT.** Harvest, mark, coverage gate,
+  CLI that prints the report. Immediately useful on its own: it answers "what
+  did the detectors claim yesterday and what happened" for the first time.
+  Refuses today, by design, and that refusal is the deliverable's first real
+  test. One bug found while testing and worth recording: a `size_hint` of
+  exactly `0` is falsy, so `contracts or 1` silently scored a
+  deliberately-unsized finding as a one-contract trade. It is an `is None`
+  check now, and zero is a named refusal — the same tri-state trap as
+  `Market.result == ''` reading as settled.
 - **M10b — the Opus 5 call and the proposal.** Knob registry, structured
   output, `TuningProposal` rows, counterfactual replay, the UI card. Approval
   emits a YAML patch the operator applies by hand.
