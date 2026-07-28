@@ -504,6 +504,15 @@ async def _realised_events(
     Three projected, capped queries rather than one join: the cap then applies
     to each independently and no single query can fan out. This layer holds no
     logic — everything that could be wrong lives in the pure function.
+
+    **All three truncate from the same end.** Orders are fetched newest-first
+    (there is no other sensible way to cap them), so fills and settlements are
+    fetched newest-first too and reversed here. Fetching fills oldest-first
+    against orders newest-first meant that once either cap bound, the fills
+    that survived referenced orders that did not — and an unresolvable
+    ``order_id`` attributes to nobody, silently, in the panel that decides
+    whether a detector sees real money. Attribution still needs ascending
+    time, hence the reversal.
     """
     orders = [
         OrderRow(id=oid, proposal_id=pid, route=route or "simulated")
@@ -525,23 +534,26 @@ async def _realised_events(
             realized_pnl_cents=Decimal(realized or 0),
             ts=ts,
         )
-        for order_id, ticker, fee, realized, ts in (
-            await session.execute(
-                select(
-                    Fill.order_id,
-                    Fill.ticker,
-                    Fill.fee_cents,
-                    Fill.realized_pnl_cents,
-                    Fill.ts,
+        for order_id, ticker, fee, realized, ts in reversed(
+            (
+                await session.execute(
+                    select(
+                        Fill.order_id,
+                        Fill.ticker,
+                        Fill.fee_cents,
+                        Fill.realized_pnl_cents,
+                        Fill.ts,
+                    )
+                    .where(Fill.ts >= since)
+                    # Newest-first to match the order cap, then reversed:
+                    # attribution merges a settlement into the *first* proposal
+                    # that traded the market, and "first" needs ascending time.
+                    # An unordered fetch would attribute nondeterministically.
+                    .order_by(Fill.ts.desc(), Fill.id.desc())
+                    .limit(MAX_ROWS)
                 )
-                .where(Fill.ts >= since)
-                # Ordered because attribution merges a settlement into the
-                # first proposal that traded the market, and "first" needs an
-                # order. An unordered fetch would attribute nondeterministically.
-                .order_by(Fill.ts)
-                .limit(MAX_ROWS)
-            )
-        ).all()
+            ).all()
+        )
     ]
 
     settlements = [
@@ -556,22 +568,43 @@ async def _realised_events(
             # into the equity curve at the wrong place.
             ts=settled_at or created_at,
         )
-        for ticker, route, realized, fee, settled_at, created_at in (
-            await session.execute(
-                select(
-                    Settlement.ticker,
-                    Settlement.route,
-                    Settlement.realized_pnl_cents,
-                    Settlement.fee_cents,
-                    Settlement.settled_at,
-                    Settlement.created_at,
+        for ticker, route, realized, fee, settled_at, created_at in reversed(
+            (
+                await session.execute(
+                    select(
+                        Settlement.ticker,
+                        Settlement.route,
+                        Settlement.realized_pnl_cents,
+                        Settlement.fee_cents,
+                        Settlement.settled_at,
+                        Settlement.created_at,
+                    )
+                    .where(Settlement.created_at >= since)
+                    # Newest-first, then reversed — same reason as the fills.
+                    .order_by(Settlement.created_at.desc(), Settlement.id.desc())
+                    .limit(MAX_ROWS)
                 )
-                .where(Settlement.created_at >= since)
-                .order_by(Settlement.created_at)
-                .limit(MAX_ROWS)
-            )
-        ).all()
+            ).all()
+        )
     ]
+
+    # Said out loud, because past this point a truncated read is
+    # indistinguishable from a quiet deployment. The report card's whole job is
+    # to be honest about how much evidence it has.
+    for name, rows in (
+        ("orders", orders),
+        ("fills", fills),
+        ("settlements", settlements),
+    ):
+        if len(rows) >= MAX_ROWS:
+            log.warning(
+                "report card: %d %s at the %d-row ceiling — this report covers "
+                "the most recent rows only, and events referring to anything "
+                "older will read as unattributed",
+                len(rows),
+                name,
+                MAX_ROWS,
+            )
 
     return attribute_events(
         order_rows=orders,

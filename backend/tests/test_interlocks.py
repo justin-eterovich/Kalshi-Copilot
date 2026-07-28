@@ -176,6 +176,7 @@ class TestCheckExecution:
             make_settings(tmp_key=key_file),
             make_config(mode="paper"),
             confirmed=True,
+            kill_switch=False,
         )
         assert route is ExecutionRoute.DEMO_EXCHANGE
 
@@ -187,18 +188,9 @@ class TestCheckExecution:
                 make_settings(tmp_key=key_file),
                 make_config(mode="paper"),
                 confirmed=False,
+                kill_switch=False,
             )
         assert exc.value.code == "not_confirmed"
-
-    def test_kill_switch_blocks_everything(self, key_file: Path) -> None:
-        with pytest.raises(InterlockError) as exc:
-            check_execution(
-                make_proposal(),
-                make_settings(tmp_key=key_file),
-                make_config(mode="paper", kill_switch=True),
-                confirmed=True,
-            )
-        assert exc.value.code == "kill_switch"
 
     def test_expired_proposal_is_refused(self, key_file: Path) -> None:
         expired = make_proposal(
@@ -210,6 +202,7 @@ class TestCheckExecution:
                 make_settings(tmp_key=key_file),
                 make_config(mode="paper"),
                 confirmed=True,
+                kill_switch=False,
             )
         assert exc.value.code == "expired"
 
@@ -228,6 +221,7 @@ class TestCheckExecution:
                 make_settings(tmp_key=key_file),
                 make_config(mode="paper"),
                 confirmed=True,
+                kill_switch=False,
             )
 
     @pytest.mark.parametrize(
@@ -249,6 +243,7 @@ class TestCheckExecution:
                 make_settings(tmp_key=key_file),
                 make_config(mode="paper"),
                 confirmed=True,
+                kill_switch=False,
             )
         assert exc.value.code == "not_pending"
 
@@ -262,6 +257,7 @@ class TestCheckExecution:
                 settings,
                 make_config(mode="live"),
                 confirmed=True,
+                kill_switch=False,
             )
         assert exc.value.code == "confirmation_phrase_mismatch"
 
@@ -274,6 +270,7 @@ class TestCheckExecution:
             settings,
             make_config(mode="live"),
             confirmed=True,
+            kill_switch=False,
             confirmation_phrase="test-mkt",  # case-insensitive
         )
         assert route is ExecutionRoute.LIVE_EXCHANGE
@@ -291,6 +288,7 @@ class TestCheckExecution:
                 settings,
                 make_config(mode="live"),
                 confirmed=True,
+                kill_switch=False,
                 confirmation_phrase="SOME-OTHER-MKT",
             )
         assert exc.value.code == "confirmation_phrase_mismatch"
@@ -301,8 +299,135 @@ class TestCheckExecution:
             make_settings(tmp_key=key_file),
             make_config(mode="paper"),
             confirmed=True,
+            kill_switch=False,
         )
         assert route is ExecutionRoute.DEMO_EXCHANGE
+
+
+class TestKillSwitch:
+    """Two sources, either of which engages it, and no safe default.
+
+    ``config.risk.kill_switch`` is the static floor from ``config.yaml``, read
+    once per process because ``get_config()`` is ``lru_cache``d. That made it
+    unusable as an emergency stop: engaging it meant editing a file and
+    restarting containers, and since its two halves live in different
+    processes — ``api`` refuses approvals, ``worker`` cancels resting orders —
+    restarting only one left resting orders live while the dashboard read
+    "engaged".
+
+    So there is now a runtime flag as well, passed in by the caller from
+    Redis. Either source refuses. Neither can release the other: a config that
+    says ``true`` is a one-way door the API cannot open.
+    """
+
+    def test_the_runtime_flag_alone_engages_it(self, key_file: Path) -> None:
+        """Even though ``config.risk.kill_switch`` is False."""
+        config = make_config(mode="paper")
+        assert config.risk.kill_switch is False
+
+        with pytest.raises(InterlockError) as exc:
+            check_execution(
+                make_proposal(),
+                make_settings(tmp_key=key_file),
+                config,
+                confirmed=True,
+                kill_switch=True,
+            )
+        assert exc.value.code == "kill_switch"
+
+    def test_the_config_flag_alone_engages_it(self, key_file: Path) -> None:
+        """Even though the runtime flag is clear.
+
+        The file cannot be overridden from the API — an operator who halted
+        trading in ``config.yaml`` must not be undone by a click.
+        """
+        with pytest.raises(InterlockError) as exc:
+            check_execution(
+                make_proposal(),
+                make_settings(tmp_key=key_file),
+                make_config(mode="paper", kill_switch=True),
+                confirmed=True,
+                kill_switch=False,
+            )
+        assert exc.value.code == "kill_switch"
+
+    def test_both_engaged_is_still_one_refusal(self, key_file: Path) -> None:
+        with pytest.raises(InterlockError) as exc:
+            check_execution(
+                make_proposal(),
+                make_settings(tmp_key=key_file),
+                make_config(mode="paper", kill_switch=True),
+                confirmed=True,
+                kill_switch=True,
+            )
+        assert exc.value.code == "kill_switch"
+
+    def test_it_is_checked_before_the_proposal_status(self, key_file: Path) -> None:
+        """An emergency stop outranks every other reason to refuse.
+
+        Ordering is observable through ``code``: with the switch engaged and a
+        non-pending proposal, the answer must be ``kill_switch`` — the
+        operator needs to know the system is halted, not that this one
+        proposal was already decided.
+        """
+        with pytest.raises(InterlockError) as exc:
+            check_execution(
+                make_proposal(status=ProposalStatus.EXECUTED),
+                make_settings(tmp_key=key_file),
+                make_config(mode="paper"),
+                confirmed=True,
+                kill_switch=True,
+            )
+        assert exc.value.code == "kill_switch"
+
+    def test_confirmation_is_still_checked_first(self, key_file: Path) -> None:
+        """The switch does not shadow the missing-confirmation refusal.
+
+        Both refuse; ``not_confirmed`` is the more specific thing to tell a
+        caller that supplied no consent at all.
+        """
+        with pytest.raises(InterlockError) as exc:
+            check_execution(
+                make_proposal(),
+                make_settings(tmp_key=key_file),
+                make_config(mode="paper"),
+                confirmed=False,
+                kill_switch=True,
+            )
+        assert exc.value.code == "not_confirmed"
+
+    def test_omitting_the_argument_is_a_typeerror(self, key_file: Path) -> None:
+        """The fail-closed property, pinned.
+
+        ``kill_switch`` is required and has no default *on purpose*: there is
+        no safe one. ``False`` would mean a caller that forgot the argument
+        silently bypasses the emergency stop, which is precisely the class of
+        guard this codebase calls worse than no guard at all. A ``TypeError``
+        at the call site is the whole point — do not give this a default to
+        make a test pass.
+        """
+        with pytest.raises(TypeError):
+            check_execution(  # type: ignore[call-arg]
+                make_proposal(),
+                make_settings(tmp_key=key_file),
+                make_config(mode="paper"),
+                confirmed=True,
+            )
+
+    def test_it_cannot_be_passed_positionally(self, key_file: Path) -> None:
+        """Keyword-only, so it cannot be transposed with ``confirmed``.
+
+        Two adjacent booleans meaning opposite things is exactly the argument
+        pair worth making unswappable.
+        """
+        with pytest.raises(TypeError):
+            check_execution(  # type: ignore[misc]
+                make_proposal(),
+                make_settings(tmp_key=key_file),
+                make_config(mode="paper"),
+                True,
+                False,
+            )
 
     def test_exchange_route_without_credentials_is_refused(self) -> None:
         """Credentials can disappear between boot and approval."""

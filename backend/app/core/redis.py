@@ -19,6 +19,42 @@ CH_SYSTEM: Final = "copilot:system"
 HEARTBEAT_KEY: Final = "copilot:heartbeat:{service}"
 HEARTBEAT_TTL_SEC: Final = 45
 
+#: The runtime kill switch.
+#:
+#: It lives in Redis rather than ``config.yaml`` because it has to be
+#: engageable *on a running system* and visible to every process at once.
+#: ``get_config()`` is ``@lru_cache(maxsize=1)``, so a config-file switch is
+#: read once per process and never again — and the switch's two halves run in
+#: different processes (``api`` refuses approvals, ``worker`` cancels resting
+#: orders). Engaging it by editing the file and restarting one container left
+#: resting orders live while the dashboard read "engaged", which is worse than
+#: having no switch at all.
+#:
+#: No TTL: an emergency stop must not time out and quietly re-arm trading.
+KILL_SWITCH_KEY: Final = "copilot:kill_switch"
+
+
+async def get_kill_switch() -> bool:
+    """Whether the runtime kill switch is engaged.
+
+    Fails **closed**: if Redis cannot be reached we cannot prove the operator
+    has not hit the switch, and the safe reading of "unknown" on an emergency
+    stop is "engaged".
+    """
+    try:
+        return bool(await get_redis().get(KILL_SWITCH_KEY))
+    except Exception:
+        return True
+
+
+async def set_kill_switch(engaged: bool) -> None:
+    """Engage or release the runtime kill switch."""
+    client = get_redis()
+    if engaged:
+        await client.set(KILL_SWITCH_KEY, "1")
+    else:
+        await client.delete(KILL_SWITCH_KEY)
+
 _client: redis.Redis | None = None
 
 

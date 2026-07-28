@@ -9,6 +9,18 @@ export interface FeedMessage {
 export type FeedStatus = "connecting" | "live" | "offline";
 
 /**
+ * What "live" here does and does not mean.
+ *
+ * It is the state of the **relay socket**, not of the data. If ingest stops
+ * publishing to Redis while this socket stays open, the pill keeps saying
+ * live. Every surface that shows it should carry this as a tooltip so the
+ * word is not read as "these numbers are current" — the honest freshness
+ * signals are the per-panel ones (`live`/`cached`, the quote read time).
+ */
+export const FEED_STATUS_TITLE =
+  "connection to the dashboard's relay socket — not a guarantee that data is flowing";
+
+/**
  * Subscribe to the backend WebSocket relay.
  *
  * Reconnects with backoff. Pass `tickers` to filter the tick firehose down to

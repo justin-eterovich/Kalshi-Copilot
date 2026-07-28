@@ -14,8 +14,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ApiError,
   api,
+  asCentsAmount,
   asDollars,
   asSignedCents,
+  moneySign,
   routeLabel,
   type MarketDetail,
   type TicketInput,
@@ -101,6 +103,11 @@ export default function TradeTicket({
   const refreshQuote = useCallback(async () => {
     if (!price || !contracts) {
       setQuote(null);
+      // Clearing the field clears its complaint too. Without this the last
+      // error stayed on screen against an empty form, describing a value the
+      // operator had already deleted.
+      setError(null);
+      setBlocked(null);
       return;
     }
     try {
@@ -167,7 +174,8 @@ export default function TradeTicket({
       {killed && (
         <div className="banner">
           <strong>Kill switch engaged.</strong> No new proposals are accepted
-          and resting orders are being cancelled.
+          and resting orders were cancelled. Release it from the control in
+          the header.
         </div>
       )}
 
@@ -270,28 +278,45 @@ export default function TradeTicket({
       {quote && (
         <div className="quote-box">
           <Row k="cost">{asDollars(quote.notional_cents)}</Row>
+          {/* Fees are a cents quantity and the schedule rounds them to a
+              centicent: one contract at 50¢ costs 1.75¢. Shown as dollars at
+              two decimals that became "$0.02" — the number the whole units
+              discipline exists to keep out of this system. */}
           <Row k="fee">
-            {asDollars(quote.est_fee_cents)}
+            {asCentsAmount(quote.est_fee_cents)}
             <span className="muted"> ({quote.is_taker ? "taker" : "maker"})</span>
           </Row>
           <Row k="total">
             <strong>{asDollars(quote.total_cost_cents)}</strong>
           </Row>
-          <Row k="breakeven">{Number(quote.breakeven_cents).toFixed(2)}¢</Row>
+          <Row k="breakeven">{asCentsAmount(quote.breakeven_cents)}</Row>
           <Row k="max win">{asDollars(quote.max_win_cents)}</Row>
           <Row k="max loss">{asDollars(quote.max_loss_cents)}</Row>
           {quote.net_edge_cents !== null && (
             <Row k="net edge">
               <span
-                className={Number(quote.net_edge_cents) >= 0 ? "up" : "down"}
+                className={
+                  moneySign(quote.net_edge_cents) < 0
+                    ? "down"
+                    : moneySign(quote.net_edge_cents) > 0
+                      ? "up"
+                      : ""
+                }
               >
                 {asSignedCents(quote.net_edge_cents)}
               </span>
               <span className="muted"> /contract, after fees</span>
             </Row>
           )}
+          {/* The literal wire form. Kalshi quotes one book from the YES side,
+              so "buy NO at 30¢" goes out as an ask at 0.70 — and nothing
+              downstream catches an inversion, because the P(1-P) fee is
+              symmetric. The approval card shows this again at the decision. */}
           <Row k="sends as">
-            <span className="mono">
+            <span
+              className="mono"
+              title="what actually reaches Kalshi: book side, count, YES price"
+            >
               {quote.wire.book_side} {quote.wire.count} @ {quote.wire.yes_price}
             </span>
           </Row>

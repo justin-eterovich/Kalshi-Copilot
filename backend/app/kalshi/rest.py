@@ -533,10 +533,16 @@ class KalshiRestClient:
         *,
         ticker: str | None = None,
         status: str | None = None,
+        min_ts: int | None = None,
+        max_ts: int | None = None,
         limit: int = 200,
         max_pages: int | None = 5,
     ) -> AsyncIterator[dict[str, Any]]:
-        """Iterate orders. ``status`` is ``resting``, ``canceled`` or ``executed``."""
+        """Iterate orders. ``status`` is ``resting``, ``canceled`` or ``executed``.
+
+        ``min_ts`` / ``max_ts`` are Unix **seconds**, per the OpenAPI spec's
+        ``MinTsQuery`` / ``MaxTsQuery``.
+        """
         self._require_auth("/portfolio/orders")
         async for order in self.paginate(
             "/portfolio/orders",
@@ -545,8 +551,53 @@ class KalshiRestClient:
             max_pages=max_pages,
             ticker=ticker,
             status=status,
+            min_ts=min_ts,
+            max_ts=max_ts,
         ):
             yield order
+
+    async def find_order_by_client_id(
+        self,
+        client_order_id: str,
+        *,
+        ticker: str | None = None,
+        min_ts: int | None = None,
+        max_pages: int | None = 5,
+    ) -> dict[str, Any] | None:
+        """Find an order the exchange may hold under one of our own IDs.
+
+        This is the read half of the no-retry rule. A write that times out or
+        500s may still have reached the matching engine, so :meth:`request`
+        raises rather than re-POSTing — and the only safe way to learn what
+        actually happened is to ask the exchange what it has under the
+        ``client_order_id`` we generated before sending. A second POST would
+        resolve the ambiguity by creating a second order.
+
+        **The filter is applied here, not by the API.** ``GET
+        /portfolio/orders`` takes ``ticker``, ``event_tickers``, ``min_ts``,
+        ``max_ts`` and ``status`` and nothing else — checked against
+        ``docs.kalshi.com/openapi.yaml`` on 2026-07-28 — so the match is made
+        locally over the returned pages. ``client_order_id`` is a *required*
+        field on the Order schema, so every row can be tested.
+
+        Narrow it with ``ticker`` and ``min_ts`` whenever the caller knows
+        them: unfiltered, this walks the account's whole recent order history
+        and stops at ``max_pages`` regardless, at which point a miss means
+        "not found in the pages we looked at", not "does not exist".
+
+        Returns ``None`` when no order carries that ID in the pages scanned.
+        A ``None`` is therefore *not* proof the order was never placed, and a
+        caller must not treat it as one.
+        """
+        wanted = (client_order_id or "").strip()
+        if not wanted:
+            return None
+        async for order in self.get_orders(
+            ticker=ticker, min_ts=min_ts, max_pages=max_pages
+        ):
+            if str(order.get("client_order_id") or "").strip() == wanted:
+                return order
+        return None
 
     async def get_fills(
         self,

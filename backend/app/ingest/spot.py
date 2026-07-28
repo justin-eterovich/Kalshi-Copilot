@@ -10,6 +10,26 @@ Freshness is the property that matters. A stale reference compared against a
 live market manufactures an edge in whichever direction the market has
 already moved, so every observation is timestamped and consumers check the
 age rather than trusting the newest row.
+
+**This is not the settlement source, and the difference is a real basis.**
+Kalshi's crypto markets settle on a **CF Benchmarks** index — the Bitcoin
+Real-Time Index (BRTI) for BTC, ETHUSD_RTI for ETH — and usually on the
+*simple average of the sixty seconds* of that index before a stated instant.
+What is polled here is one exchange's **last trade**. Three differences, all
+in the same direction:
+
+1. Different publisher: one venue's tape versus a multi-venue index.
+2. Different statistic: an instantaneous print versus a 60-second mean.
+3. Different instrument on two of the three sources — Binance quotes BTC**USDT**,
+   which is a stablecoin pair, not USD.
+
+Near a strike this basis is the same size as the edge being claimed, so the
+detector that reads these rows treats a *decisive* margin as a precondition
+rather than pricing the last basis point. The weather engine refuses markets
+on exactly this ground (`KXTEMPNYCH` settles on The Weather Company, so NWS
+data there is a proxy for a different source); the crypto path does not refuse,
+because a decisive move is still decisive under any of these measures — but
+nothing here should ever be described as "the settlement price".
 """
 
 from __future__ import annotations

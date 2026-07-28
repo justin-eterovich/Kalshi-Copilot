@@ -19,8 +19,9 @@ from app.core.fees import (
     load_fee_schedule,
     series_of,
 )
-from app.core.redis import HEARTBEAT_KEY, get_redis
+from app.core.redis import HEARTBEAT_KEY, get_kill_switch, get_redis
 from app.db.base import get_engine
+from app.detectors.base import enabled_detector_names
 from app.settings import get_settings
 
 router = APIRouter()
@@ -75,9 +76,15 @@ async def system() -> dict[str, Any]:
         # Both interlocks. Even when armed, every order still needs per-trade
         # approval in the UI — there is no auto-trade path.
         "live_trading_armed": settings.live_trading_armed,
-        "kill_switch": config.risk.kill_switch,
+        # The effective switch, config floor OR the runtime flag in Redis.
+        # Reporting only the config file made the header disagree with what
+        # the executor would actually do.
+        "kill_switch": await get_kill_switch() or config.risk.kill_switch,
+        "kill_switch_config_floor": config.risk.kill_switch,
         "credentials_present": settings.credentials_present(),
-        "enabled_detectors": config.detectors.enabled_names(),
+        # Includes the weather engine, which is configured outside the
+        # `detectors:` block and so was invisible here while it scanned.
+        "enabled_detectors": enabled_detector_names(config),
         "heartbeats": heartbeats,
         "fees": {
             "verified_on": schedule.verified_on,
@@ -87,6 +94,13 @@ async def system() -> dict[str, Any]:
             "series_listed": len(schedule.series),
             "fee_free_series": fee_free,
             "default_is_safe": schedule.default_is_safe,
+            # Broken out because the two sides genuinely differ: listed maker
+            # multipliers reach 1 against a documented default of 0, so an
+            # unlisted series is safe to price as a taker and refused as a
+            # maker. One combined flag reads as "the fee table is unsafe",
+            # which is not what it means.
+            "default_taker_is_safe": schedule.default_taker_is_safe,
+            "default_maker_is_safe": schedule.default_maker_is_safe,
         },
         "endpoints": {"rest": settings.rest_url, "ws": settings.ws_url},
     }
@@ -118,6 +132,14 @@ async def fee_quote(
     fn = taker_fee_cents if is_taker else maker_fee_cents
 
     try:
+        # Checked here, before anything is priced. Neither `taker_fee_cents`
+        # nor `maker_fee_cents` raises on an unverified table — only
+        # `price_ticket` did — so this handler's fail-closed promise below was
+        # unreachable: the ticket UI rendered fees from a table nobody had
+        # checked while POST /api/proposals refused with a 409, which reads as
+        # a bug rather than as the policy it is.
+        if not schedule.is_verified:
+            raise UnverifiedFeeSchedule()
         series = series_of(ticker)
         fee = fn(price_dollars, contracts, series, schedule)
     except (UnverifiedFeeSchedule, UnknownSeries) as exc:

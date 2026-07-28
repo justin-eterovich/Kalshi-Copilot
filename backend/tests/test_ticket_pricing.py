@@ -250,6 +250,96 @@ class TestValidation:
             quote(config, action="hodl")
 
 
+class TestFairPriceValidation:
+    """``fair_price`` gets the same domain check as ``limit_price``.
+
+    It did not, for a whole milestone, thirty-two lines below the identical
+    guard in the same function — so ``fair_price="56"``, the obvious operator
+    slip for 56c, was priced as a $56 fair value and returned HTTP 200 with a
+    claimed **+$55.97/contract** edge on a contract quoted at 1.8c. That number
+    is then written to ``proposed_trades.net_edge_cents`` and the audit log,
+    where it becomes the "claimed edge" the report card grades the detector
+    against.
+    """
+
+    @pytest.mark.parametrize("bad", ["56", "999999", "-1", "0", "1", "1.5", "-0.5"])
+    def test_a_fair_value_outside_zero_to_one_is_rejected(
+        self, config: Config, bad: str
+    ) -> None:
+        with pytest.raises(ValueError, match="between 0 and 1"):
+            quote(config, fair_price=bad)
+
+    def test_the_headline_regression(self, config: Config) -> None:
+        """The exact live repro: 1 contract at 1.8c with a fair value of "56".
+
+        Must raise. Returning ~5597c of edge is the failure this pins.
+        """
+        with pytest.raises(ValueError):
+            quote(
+                config,
+                ticker="KXMLB-26-HOU",
+                limit_price="0.018",
+                contracts="1",
+                fair_price="56",
+            )
+
+    def test_the_message_says_what_56_actually_means(self, config: Config) -> None:
+        """The refusal has to teach, or the operator retypes the same thing."""
+        with pytest.raises(ValueError) as exc:
+            quote(config, fair_price="56")
+        assert "56" in str(exc.value)
+
+    def test_the_boundaries_are_strict(self, config: Config) -> None:
+        """A fair value of exactly 0 or 1 asserts certainty.
+
+        Nothing here may manufacture the last cents of edge out of an
+        assumption of settlement — the stale-quote detector caps fair at 0.98
+        for the same reason.
+        """
+        with pytest.raises(ValueError):
+            quote(config, fair_price="0")
+        with pytest.raises(ValueError):
+            quote(config, fair_price="1")
+
+    def test_an_ordinary_fair_value_still_prices(self, config: Config) -> None:
+        """The guard must not over-refuse: 0.56 is the documented wire form."""
+        q = quote(config, limit_price="0.50", fair_price="0.56", contracts="100")
+        assert q.fair_price == Decimal("0.56")
+        # 6c gross, less the 1.75c per-contract fee.
+        assert q.net_edge_cents == Decimal("4.25")
+
+    def test_a_sub_cent_fair_value_is_still_accepted(self, config: Config) -> None:
+        """Tick size varies per market, so sub-cent fair values are real."""
+        q = quote(config, limit_price="0.018", fair_price="0.0195", contracts="1")
+        assert q.fair_price == Decimal("0.0195")
+
+    def test_a_non_finite_fair_value_is_refused(self, config: Config) -> None:
+        """NaN reached Postgres through this argument. It parses before it is
+        range-checked, so the money layer is what has to stop it."""
+        from app.core.money import MoneyParseError
+
+        with pytest.raises(MoneyParseError):
+            quote(config, fair_price="NaN")
+        with pytest.raises(MoneyParseError):
+            quote(config, fair_price="Infinity")
+
+    def test_a_non_finite_limit_price_is_refused_too(self, config: Config) -> None:
+        from app.core.money import MoneyParseError
+
+        with pytest.raises(MoneyParseError):
+            quote(config, limit_price="NaN")
+
+    def test_a_non_finite_contract_count_is_refused(self, config: Config) -> None:
+        from app.core.money import MoneyParseError
+
+        with pytest.raises(MoneyParseError):
+            quote(config, contracts="NaN")
+
+    def test_omitting_fair_price_is_still_legal(self, config: Config) -> None:
+        """``None`` means "no fair value supplied", not "zero"."""
+        assert quote(config, fair_price=None).net_edge_cents is None
+
+
 class TestSerialisation:
     def test_money_serialises_as_strings(self, config: Config) -> None:
         """A price that becomes a JS number loses the precision the backend

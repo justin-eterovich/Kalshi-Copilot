@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -187,6 +188,27 @@ def analyse(text: str) -> None:
     print("-" * 70)
 
 
+def _engine_rounding_increment() -> Decimal | None:
+    """The increment ``app/core/fees.py`` actually rounds a fee up to.
+
+    Read from the engine rather than restated here, so the two cannot drift
+    into agreeing with each other while disagreeing with the PDF. Returns
+    ``None`` when the package is not importable — running the script from a
+    bare checkout with no dependencies should report the problems it *can*
+    see rather than crashing.
+    """
+    for candidate in (REPO_ROOT / "backend", REPO_ROOT):
+        if (candidate / "app" / "__init__.py").is_file():
+            if str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+            break
+    try:
+        from app.core.fees import CENTICENT
+    except Exception:
+        return None
+    return CENTICENT
+
+
 def schedule_problems() -> list[str]:
     """Reasons the schedule is not safe to mark verified.
 
@@ -214,6 +236,25 @@ def schedule_problems() -> list[str]:
     for key in ("base_taker_rate", "base_maker_rate", "rounding_increment_dollars"):
         if formula.get(key) is None:
             problems.append(f"formula.{key} is unset")
+
+    # ...and the rounding increment has to be the one the engine actually
+    # rounds to. Requiring it merely to be *set* was a guard inspecting a value
+    # with no effect: `app/core/fees.py` hardcodes the centicent, so an
+    # operator who edited this key because the PDF had changed got a
+    # verification pass and no behaviour change. That is the same shape as the
+    # `"categories:"` bug the docstring above warns about — a check that
+    # passes while looking at the wrong thing.
+    increment = formula.get("rounding_increment_dollars")
+    engine_increment = _engine_rounding_increment()
+    if increment is not None and engine_increment is not None:
+        if Decimal(str(increment)) != engine_increment:
+            problems.append(
+                f"formula.rounding_increment_dollars is {increment}, but "
+                f"app/core/fees.py rounds fees up to {engine_increment}. One "
+                f"of the two is wrong, and every fee in the system comes from "
+                f"the code, not from this file — fix fees.CENTICENT to match "
+                f"the PDF rather than changing this line alone"
+            )
 
     defaults = data.get("defaults") or {}
     for key in ("taker_multiplier", "maker_multiplier"):
@@ -246,24 +287,72 @@ def mark_verified(revision: str | None) -> None:
         )
         sys.exit(1)
 
-    text = SCHEDULE_PATH.read_text(encoding="utf-8")
+    import yaml  # already proven importable by schedule_problems()
+
+    original = SCHEDULE_PATH.read_text(encoding="utf-8")
+    before = yaml.safe_load(original) or {}
     today = dt.date.today().isoformat()
 
+    # The edit is textual because the file is hand-maintained and heavily
+    # commented, and round-tripping it through a YAML dumper would delete
+    # every explanation in it. But a regex is a text slice, and this file's
+    # own history is the argument against trusting one — so the write is
+    # *verified* below instead of assumed.
     text, n = re.subn(
-        r"^(\s*verified_on:).*$", rf"\1 {today}", text, count=1, flags=re.M
+        r"^(\s*verified_on:).*$", rf"\1 {today}", original, count=1, flags=re.M
     )
     if not n:
         print("! could not find `verified_on:` in the schedule file", file=sys.stderr)
         sys.exit(1)
 
     if revision:
-        text = re.sub(
+        text, n = re.subn(
             r"^(\s*schedule_revision:).*$",
             rf'\1 "{revision}"',
             text,
             count=1,
             flags=re.M,
         )
+        if not n:
+            print(
+                "! could not find `schedule_revision:` in the schedule file",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    # Re-parse and compare before committing the write to disk. Two things are
+    # checked: that the stamp landed on `meta`, and that *nothing else* moved.
+    # An anchored `verified_on:` can match a line in some other block — the
+    # `"categories:"` incident was exactly this failure, one nesting level up —
+    # and a stamp applied to the wrong key would clear the fail-closed warning
+    # while leaving the schedule unverified.
+    after = yaml.safe_load(text) or {}
+    meta = after.get("meta") or {}
+    problems: list[str] = []
+    if str(meta.get("verified_on")) != today:
+        problems.append(
+            "meta.verified_on did not change — the stamp landed somewhere else"
+        )
+    if revision and str(meta.get("schedule_revision")) != revision:
+        problems.append("meta.schedule_revision did not change")
+
+    stripped_before = {k: v for k, v in before.items() if k != "meta"}
+    stripped_after = {k: v for k, v in after.items() if k != "meta"}
+    if stripped_before != stripped_after:
+        problems.append(
+            "the edit changed something outside `meta` — rates, defaults or "
+            "the series table are not the same document any more"
+        )
+
+    if problems:
+        print(
+            "! refusing to write: the stamp did not land where it was aimed:\n"
+            + "".join(f"    - {item}\n" for item in problems)
+            + "  The file on disk is unchanged. Edit `meta.verified_on` by "
+            "hand.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     SCHEDULE_PATH.write_text(text, encoding="utf-8")
     print(f"-> marked verified on {today}")

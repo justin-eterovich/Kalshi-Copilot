@@ -50,7 +50,7 @@ striking result here is a reason to go look at the sample, not a finding.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from app.core.statistics import wilson_interval
@@ -66,6 +66,7 @@ __all__ = [
     "Observation",
     "bucket_for",
     "calibrate",
+    "calibrate_counts",
     "significant",
     "wilson_interval",
 ]
@@ -152,10 +153,30 @@ def calibrate(observations: Sequence[Observation]) -> list[BucketStat]:
         if obs.settled_yes:
             yeses[obs.price_bucket_cents] += 1
 
+    return calibrate_counts(
+        {bucket: (n, yeses[bucket]) for bucket, n in totals.items()}
+    )
+
+
+def calibrate_counts(counts: Mapping[int, tuple[int, int]]) -> list[BucketStat]:
+    """:func:`calibrate` from pre-aggregated ``{bucket: (samples, yes)}``.
+
+    The same arithmetic, entered one level up. A caller reading from Postgres
+    can ``GROUP BY price_bucket_cents`` and hand the two numbers straight
+    over — the alternative was fetching one row per market *ever recorded* and
+    counting them in Python, a query bounded by nothing at all on a table that
+    only grows. The interval formula stays here either way; a second copy of
+    it in a caller is a second answer to the same question.
+    """
     stats: list[BucketStat] = []
-    for bucket in sorted(totals):
-        n = totals[bucket]
-        yes = yeses[bucket]
+    for bucket in sorted(counts):
+        n, yes = counts[bucket]
+        if not MIN_BUCKET_CENTS <= bucket <= MAX_BUCKET_CENTS:
+            continue
+        if n <= 0 or yes < 0 or yes > n:
+            # Not a countable bucket. Repairing it would mean inventing a
+            # denominator, and this file does not do that.
+            continue
         interval = wilson_interval(yes, n)
         if interval is None:
             # Unreachable given the counting above, but the alternative to a

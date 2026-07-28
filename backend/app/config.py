@@ -116,7 +116,6 @@ class BitcoinConfig(_Base):
     ewma_lambda: float = Field(0.94, gt=0, lt=1)
     vol_lookback_minutes: int = Field(1440, ge=1)
     min_net_edge_cents: float = Field(2.0, ge=0)
-    use_deribit_implied: bool = False
 
 
 class WeatherConfig(_Base):
@@ -179,7 +178,6 @@ class NotificationsConfig(_Base):
 
 
 class BacktestConfig(_Base):
-    pessimistic_fills: bool = True
     report_card_min_trades: int = Field(20, ge=1)
 
 

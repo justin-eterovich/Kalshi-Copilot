@@ -21,7 +21,7 @@
 import { useEffect, useState } from "react";
 import {
   api,
-  asDollars,
+  asCentsAmount,
   asSignedCents,
   routeLabel,
   type DetectorReport,
@@ -128,6 +128,12 @@ export default function ReportCard() {
                 <th className="num">95% interval</th>
                 <th className="num">total</th>
                 <th className="num">max dd</th>
+                <th
+                  className="num"
+                  title="already paid — the realised figures are net of this"
+                >
+                  fees
+                </th>
                 <th>verdict</th>
               </tr>
             </thead>
@@ -165,11 +171,21 @@ export default function ReportCard() {
                     <td className={untested ? "num muted" : "num"}>
                       {interval(r)}
                     </td>
+                    {/* This is a cents panel throughout — mean, interval and
+                        claimed edge all are. Routing these two through a
+                        dollars formatter rendered a real -0.25¢ loss as
+                        "-$0.00" and a real drawdown as "$0.00", in the same
+                        row whose mean correctly read "-0.08¢". One row
+                        contradicting itself, in the panel that decides
+                        whether a detector sees real money. */}
                     <td className="num">
-                      {r.trades === 0 ? "—" : asDollars(r.total_pnl_cents)}
+                      {r.trades === 0 ? "—" : asSignedCents(r.total_pnl_cents)}
                     </td>
                     <td className="num muted">
-                      {r.trades === 0 ? "—" : asDollars(r.max_drawdown_cents)}
+                      {r.trades === 0 ? "—" : asCentsAmount(r.max_drawdown_cents)}
+                    </td>
+                    <td className="num muted">
+                      {asCentsAmount(r.fees_paid_cents)}
                     </td>
                     <td>
                       <span className={pill.cls}>{pill.text}</span>
@@ -182,20 +198,21 @@ export default function ReportCard() {
         </div>
       )}
 
-      {/* The pill is a glance; this is the actual conclusion, in words, for
-          anything that has traded at all. A verdict with no sentence behind
-          it invites the reader to supply their own. */}
-      {rows.some((r) => r.trades > 0) && (
+      {/* The pill is a glance; this is the actual conclusion, in words. A
+          verdict with no sentence behind it invites the reader to supply
+          their own — and the gate used to be `trades > 0`, which dropped the
+          sentence for exactly the rows that had nothing else: an untraded
+          detector shows a funnel, a grey "untested" pill and dashes in every
+          money cell. That is the row most in need of prose, not least. */}
+      {rows.length > 0 && (
         <ul className="rules">
-          {rows
-            .filter((r) => r.trades > 0)
-            .map((r) => (
-              <li key={`${r.detector}-${r.route}-why`}>
-                <span className="mono">{r.detector}</span>{" "}
-                <span className="muted">({routeLabel(r.route)})</span> —{" "}
-                {r.headline}
-              </li>
-            ))}
+          {rows.map((r) => (
+            <li key={`${r.detector}-${r.route}-why`}>
+              <span className="mono">{r.detector}</span>{" "}
+              <span className="muted">({routeLabel(r.route)})</span> —{" "}
+              {r.headline}
+            </li>
+          ))}
         </ul>
       )}
 

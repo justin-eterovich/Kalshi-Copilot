@@ -10,7 +10,7 @@
  * only for bar widths, where a rounded pixel count is the point.
  */
 
-import { asDollars, type RiskResponse } from "./api";
+import { absCents, asDollars, moneySign, type RiskResponse } from "./api";
 
 /**
  * Parse a cents string for arithmetic.
@@ -20,6 +20,10 @@ import { asDollars, type RiskResponse } from "./api";
  * goes through `asDollars`, which formats the string as it arrived. Zero on
  * anything unparseable, so a missing figure draws an empty bar rather than
  * a NaN-wide one.
+ *
+ * The rule above was violated once, quietly: the day's loss was negated
+ * through this function and the resulting float was handed straight to the
+ * meter's caption. `absCents` keeps that a string.
  */
 function num(cents: string | null | undefined): number {
   const value = Number(cents);
@@ -80,9 +84,10 @@ export default function RiskPanel({ risk }: { risk: RiskResponse | null }) {
   }
 
   // The daily limit is a loss, so it fills from zero as the day goes against
-  // you and stays empty while the day is profitable.
-  const netCents = num(state.daily_net_cents);
-  const lossUsed = netCents < 0 ? String(-netCents) : "0";
+  // you and stays empty while the day is profitable. The magnitude is taken
+  // off the string, not off a parsed float — this figure is displayed.
+  const lossUsed =
+    moneySign(state.daily_net_cents) < 0 ? absCents(state.daily_net_cents) : "0";
 
   return (
     <section className="panel" style={{ marginBottom: 12 }}>

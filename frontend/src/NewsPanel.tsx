@@ -15,7 +15,7 @@
  */
 
 import { Link } from "react-router-dom";
-import { asDollars, type CatalystRow, type NewsState } from "./api";
+import { asUsd, type CatalystRow, type NewsState } from "./api";
 
 function countdown(minutes: number): string {
   if (minutes <= 0) return "closed";
@@ -108,22 +108,35 @@ export default function NewsPanel({ news }: { news: NewsState | null }) {
       )}
 
       <h3 className="sub">Headlines</h3>
-      {!budget.enabled ? (
+      {/* Independent statements, not an if/else chain. As a chain only the
+          first branch ever rendered, so "the headline engine is off" sat
+          immediately above a table of thirty headlines and the reason there
+          were feeds-configured-zero headlines at all never showed. Each of
+          these is separately true or not. */}
+      {!budget.enabled && (
         <p className="muted">
-          The headline engine is off (<code>news.headlines.enabled</code>).
+          LLM triage is off (<code>news.headlines.enabled</code>). Headlines
+          below are still collected and listed — they simply carry no score,
+          direction or sentiment.
         </p>
-      ) : !budget.has_api_key ? (
+      )}
+      {budget.enabled && !budget.has_api_key && (
         <p className="muted">
           Enabled, but no <code>ANTHROPIC_API_KEY</code> is configured — triage
           refuses rather than running. Headlines are still collected.
         </p>
-      ) : news.feeds_configured === 0 ? (
+      )}
+      {news.feeds_configured === 0 && (
         <p className="muted">
-          No feeds configured. <code>news.headlines.rss_feeds</code> ships
-          empty: each feed is a decision about what this system reads, and a
-          wider feed is mostly more noise.
+          No RSS feeds are configured right now, so nothing new is being
+          collected. <code>news.headlines.rss_feeds</code> ships empty: each
+          feed is a decision about what this system reads, and a wider feed is
+          mostly more noise.
         </p>
-      ) : null}
+      )}
+      {news.headlines.length === 0 && (
+        <p className="muted">Nothing collected yet.</p>
+      )}
 
       {news.headlines.length > 0 && (
         <div className="table-scroll">
@@ -139,7 +152,7 @@ export default function NewsPanel({ news }: { news: NewsState | null }) {
             <tbody>
               {news.headlines.map((h) => (
                 <tr key={`${h.source}-${h.title}-${h.published_at}`}>
-                  <td className="muted">
+                  <td className="muted" title={h.published_at}>
                     {new Date(h.published_at).toLocaleString()}
                   </td>
                   <td className="mono">{h.source}</td>
@@ -167,9 +180,11 @@ export default function NewsPanel({ news }: { news: NewsState | null }) {
       <div className="stats" style={{ marginTop: 10 }}>
         <div className="stat">
           <span className="stat-label">llm spend today</span>
+          {/* These arrive in dollars. Multiplying to cents in JS just to
+              divide back by 100 inside the formatter was two float
+              operations on a value that arrived correct. */}
           <span className="stat-value">
-            {asDollars(String(Number(budget.spent_usd) * 100))} /{" "}
-            {asDollars(String(Number(budget.budget_usd) * 100))}
+            {asUsd(budget.spent_usd)} / {asUsd(budget.budget_usd)}
           </span>
         </div>
         <div className="stat">

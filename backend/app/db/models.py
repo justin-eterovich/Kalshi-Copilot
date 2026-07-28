@@ -444,6 +444,14 @@ class Order(Base):
     )
     #: Client-supplied UUID: makes retries idempotent so a network blip can
     #: never double-place an order.
+    #:
+    #: ``unique=True`` is load-bearing, not decoration. The ID is derived
+    #: deterministically from ``(proposal_id, leg_seq, proposal.created_at)``
+    #: in ``executor._client_order_id``, so this constraint is what stops a
+    #: second approval of the same proposal from inserting a second order
+    #: even if the application-level row lock is somehow bypassed. It was a
+    #: fresh ``uuid4()`` per attempt, which made the constraint unreachable
+    #: and let one proposal fill twice.
     client_order_id: Mapped[str] = mapped_column(
         String(64), nullable=False, unique=True
     )

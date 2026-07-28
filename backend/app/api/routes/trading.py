@@ -31,7 +31,7 @@ from decimal import Decimal
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -39,6 +39,7 @@ from app.backtest import report
 from app.config import Config, get_config
 from app.core.fees import UnknownSeries, UnverifiedFeeSchedule
 from app.core.logging import get_logger
+from app.core.redis import get_kill_switch, set_kill_switch
 from app.db.base import session_scope
 from app.db.models import (
     AuditLog,
@@ -63,7 +64,13 @@ from app.news.calendar import KNOWN_CATALYSTS, catalyst_for
 from app.settings import Settings, get_settings
 from app.trading import proposals as prop
 from app.trading import risk
-from app.trading.executor import ExecutionError, Executor, fill_view, order_view
+from app.trading.executor import (
+    LIVE_ORDER_STATUSES,
+    ExecutionError,
+    Executor,
+    fill_view,
+    order_view,
+)
 from app.trading.interlocks import InterlockError, posture
 from app.trading.positions import position_view
 from app.trading.settlements import settlement_view
@@ -127,9 +134,16 @@ class TicketRequest(BaseModel):
 
 
 class ApproveRequest(BaseModel):
-    """Per-trade approval. ``confirm`` is never defaulted true."""
+    """Per-trade approval. ``confirm`` is never defaulted true.
 
-    confirm: bool = False
+    ``StrictBool``, not ``bool``: pydantic's lax coercion accepted ``"true"``,
+    ``"yes"``, ``"on"``, ``"1"``, ``1`` and ``1.0`` as consent, and each of
+    those placed a real order. Nothing meaning "no" ever produced consent, so
+    this was hardening rather than a hole — but the one field standing between
+    a malformed request and a live order should read exactly one value.
+    """
+
+    confirm: StrictBool = False
     #: Required on the live route only: the operator types the market ticker.
     #: A misclick cannot produce it.
     confirmation_phrase: str | None = None
@@ -189,6 +203,13 @@ async def trading_state(
         "pending_proposals": pending,
         "working_orders": working,
     }
+    # `posture` only knows the config file. The switch that an operator can
+    # actually reach at runtime lives in Redis, and the header must show the
+    # one that is really in force — a dashboard reading "safe" while the
+    # runtime flag is set would be the exact failure this endpoint exists to
+    # prevent.
+    state["kill_switch"] = await get_kill_switch() or config.risk.kill_switch
+    state["kill_switch_config_floor"] = config.risk.kill_switch
 
     # Balance is a live call and entirely optional; the page must render
     # without it rather than fail because a key is missing.
@@ -258,12 +279,106 @@ async def quote_ticket(
     }
 
 
+class KillSwitchRequest(BaseModel):
+    """Engage or release the runtime kill switch."""
+
+    engaged: StrictBool
+    #: Deliberate action, same shape as an approval. Never defaulted true.
+    confirm: StrictBool = False
+
+
+@router.post("/kill-switch")
+async def set_kill_switch_route(
+    session: SessionDep,
+    request: Request,
+    settings: SettingsDep,
+    config: ConfigDep,
+    body: KillSwitchRequest = Body(...),
+) -> dict[str, Any]:
+    """The emergency stop.
+
+    This exists because there was previously **no way to engage the kill
+    switch on a running system**. It lived only in ``config.yaml``, read
+    through an ``lru_cache``d loader, with no endpoint and no UI control — so
+    firing it meant editing a file and restarting containers. Worse, its two
+    halves run in different processes, so restarting only ``api`` left resting
+    orders working while the dashboard reported "engaged".
+
+    Engaging does two things and reports both, because "it says engaged" and
+    "the orders are gone" are different claims:
+
+    1. Sets the shared flag, which halts new proposals and every approval in
+       every process immediately.
+    2. Cancels every working order now, rather than waiting for the worker's
+       next sweep.
+    """
+    if not body.confirm:
+        raise HTTPException(
+            400,
+            detail={
+                "error": "not_confirmed",
+                "message": (
+                    "the kill switch requires an explicit confirmation, in "
+                    "both directions. Releasing it re-arms trading."
+                ),
+            },
+        )
+
+    await set_kill_switch(body.engaged)
+
+    canceled: list[int] = []
+    failed: list[dict[str, Any]] = []
+    if body.engaged:
+        executor = _executor(request, settings, config)
+        working = (
+            await session.execute(
+                select(Order).where(Order.status.in_(LIVE_ORDER_STATUSES))
+            )
+        ).scalars().all()
+        for order in working:
+            try:
+                await executor.cancel(
+                    session,
+                    order,
+                    reason="kill switch engaged",
+                    actor="operator",
+                )
+                canceled.append(order.id)
+            except (KalshiApiError, ExecutionError) as exc:
+                # Report rather than swallow: an order this did not manage to
+                # cancel is the single most important thing the operator needs
+                # to know right now.
+                failed.append({"order_id": order.id, "error": str(exc)})
+                log.error("kill switch could not cancel order %s: %s", order.id, exc)
+
+    await prop.audit(
+        session,
+        kind="kill_switch.engaged" if body.engaged else "kill_switch.released",
+        ticker=None,
+        actor="operator",
+        payload={
+            "engaged": body.engaged,
+            "canceled_orders": canceled,
+            "failed_cancels": failed,
+        },
+    )
+    await session.commit()
+
+    return {
+        "kill_switch": body.engaged or config.risk.kill_switch,
+        "config_floor": config.risk.kill_switch,
+        "canceled_orders": len(canceled),
+        "canceled_order_ids": canceled,
+        "failed_cancels": failed,
+    }
+
+
 @router.post("/proposals", status_code=201)
 async def create_proposal(
     session: SessionDep, config: ConfigDep, ticket: TicketRequest = Body(...)
 ) -> dict[str, Any]:
     """Create a pending proposal. **Nothing is sent to any exchange here.**"""
-    if config.risk.kill_switch:
+    if await get_kill_switch() or config.risk.kill_switch:
         raise HTTPException(
             409,
             detail={
@@ -335,8 +450,11 @@ async def list_proposals(
     # expire_stale above mutated rows; land it now rather than at teardown.
     await session.commit()
 
+    # One query for every row's legs, not one per row: this endpoint is polled
+    # continuously and returns up to `limit` (500) proposals.
+    legs_by_proposal = await prop.legs_for(session, [p.id for p in rows])
     views = [
-        prop.proposal_view(p, await prop.legs_of(session, p.id))
+        prop.proposal_view(p, legs_by_proposal.get(p.id, []))
         for p in rows
     ]
     views.sort(key=lambda v: (v["status"] != "pending", v["created_at"] or ""))

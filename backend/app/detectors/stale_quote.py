@@ -29,11 +29,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Final
 
 from app.core.money import parse_dollars
 
 __all__ = [
     "StrikeVerdict",
+    "BARRIER_SERIES",
+    "is_path_dependent",
     "resolve_strike",
     "decisive_fair_price",
     "reference_symbol_for",
@@ -59,6 +62,16 @@ REFERENCE_PREFIXES: dict[str, str] = {
     "KXXRP": "XRP-USD",
 }
 
+#: Series that settle on the running maximum over a window, not on the level
+#: at close. Their structured fields are indistinguishable from an ordinary
+#: level market — `KXBTCMAXMON-BTC-26JUL31-7000000` reports
+#: `strike_type: "greater"`, `floor_strike: 70000` — and only the rules text
+#: says "is ever above". Refused outright: this detector compares spot to a
+#: strike, and that comparison does not answer a barrier's question.
+BARRIER_SERIES: frozenset[str] = frozenset(
+    {"KXBTCMAXMON", "KXBTCMAXY", "KXBTCMAX100"}
+)
+
 ONE = Decimal(1)
 HUNDRED = Decimal(100)
 
@@ -74,21 +87,81 @@ class StrikeVerdict:
     margin_pct: Decimal
 
 
+#: Phrases that mark a market as **path-dependent** — settled on whether the
+#: underlying ever touched a level, not on where it ends up.
+#:
+#: Kalshi's structured fields cannot express this. `KXBTCMAXMON-BTC-26JUL31-
+#: 7000000` reports `strike_type: "greater"` and `floor_strike: 70000` exactly
+#: like a terminal-value market, and only the rules text says "is **ever
+#: above** $70000.00". Its own title disagrees with its rules ("trimmed mean
+#: be above"), so the title is no help either.
+#:
+#: Deliberately specific. Bare "maximum"/"minimum"/"high of" would match
+#: ordinary settlement prose ("the maximum payout is $1") and refuse markets
+#: this detector can price perfectly well — over-refusing is safe, but a veto
+#: that fires on everything is the same as no detector.
+_PATH_DEPENDENT_PHRASES: Final = (
+    "ever above",
+    "ever below",
+    "ever at or above",
+    "ever at or below",
+    "ever reach",
+    "ever trade",
+    "ever exceed",
+    "at any point",
+    "at any time",
+    "highest price",
+    "lowest price",
+)
+
+
+def is_path_dependent(rules_primary: str | None) -> bool:
+    """Whether the settlement rules describe a barrier rather than a level.
+
+    ``P(max_{t<=T} S_t > K)`` is not ``P(S_T > K)`` and the gap is the entire
+    contract once the barrier has been touched: spot back at 65,000 under a
+    70,000 barrier that already printed is a market correctly quoted near
+    0.98, which a terminal-value model prices at 0.02 and reports as +96c of
+    edge — the direction of maximum confidence and maximum wrongness.
+
+    This is the same failure as pricing an ETH strike against BTC spot: every
+    number arithmetically correct, describing a different question. The
+    weather engine already refuses what it cannot classify from `rules_primary`
+    for exactly this reason; the crypto path parsed no rules text at all.
+    """
+    if not rules_primary:
+        return False
+    text = rules_primary.casefold()
+    return any(phrase in text for phrase in _PATH_DEPENDENT_PHRASES)
+
+
 def resolve_strike(
     *,
     strike_type: str | None,
     floor_strike: Decimal | None,
     cap_strike: Decimal | None,
     spot: Decimal,
+    rules_primary: str | None,
 ) -> StrikeVerdict | None:
     """Evaluate a strike against spot.
 
     Returns ``None`` for strike types this cannot evaluate — ``custom`` above
     all, which carries its own rules text and must never be guessed at. An
     unrecognised strike type is not an invitation to assume ``greater``.
+
+    ``rules_primary`` is a **required** argument with no default. A default of
+    ``None`` would mean a caller that forgot it silently gets barrier markets
+    priced as terminal-value ones, which is the bug this parameter exists to
+    prevent.
     """
     if spot <= 0:
         return None
+
+    # Refuse the barrier families before looking at the structured fields,
+    # which describe them as if they were ordinary level markets.
+    if is_path_dependent(rules_primary):
+        return None
+
     kind = (strike_type or "").strip().lower()
 
     def pct(boundary: Decimal) -> Decimal:
@@ -169,11 +242,26 @@ def reference_symbol_for(ticker: str | None) -> str | None:
     Matching is on the **series** — the segment before the first hyphen —
     rather than on a substring of the whole ticker, so a strike or date that
     happens to contain "BTC" cannot pull a market into the wrong feed.
+
+    It is a **prefix** match on that series, not an exact lookup, which is
+    weaker than `station_for_series` and weaker than this docstring used to
+    claim. Every series live today under each prefix is genuinely that asset
+    — the suspicious-looking `KXSOLE` (10,100 markets) really is Solana — so
+    it mis-routes nothing at present. But it is how a series nobody reviewed
+    gets swept in automatically, which is exactly how the barrier families
+    below arrived, so new series inherit a reference feed rather than being
+    refused until someone asserts one.
     """
     if not ticker:
         return None
     series = ticker.split("-", 1)[0].strip().upper()
     if not series:
+        return None
+    if series in BARRIER_SERIES:
+        # Belt and braces behind the rules-text veto in `is_path_dependent`:
+        # these settle on the running maximum, so no spot-versus-strike
+        # comparison answers the question they ask, whatever their
+        # `strike_type` says.
         return None
     for prefix, symbol in REFERENCE_PREFIXES.items():
         if series.startswith(prefix):

@@ -15,11 +15,14 @@ import ReportCard from "./ReportCard";
 import RiskPanel from "./RiskPanel";
 import {
   api,
-  asCents,
+  asCentsAmount,
   asClock,
+  asCount,
   asDollars,
   asSignedCents,
+  asUsd,
   centsNum,
+  moneySign,
   routeLabel,
   type AuditEntry,
   type FillRow,
@@ -40,6 +43,38 @@ const WORKING = new Set(["pending", "resting", "partially_filled"]);
 
 function Empty({ children }: { children: React.ReactNode }) {
   return <p className="muted">{children}</p>;
+}
+
+/** Sign class for a money cell, with zero as its own answer. */
+function pnlClass(cents: string | null | undefined): string {
+  const sign = moneySign(cents);
+  return sign > 0 ? "num up" : sign < 0 ? "num down" : "num";
+}
+
+/**
+ * The undervalued screener's score, surfaced as a value.
+ *
+ * It reached the operator only as prose inside the rationale string, which is
+ * the part most likely to be cut. It is an *ordering for attention* — not
+ * cents, not a probability, and a 70 is not twice a 35 — so it is rendered
+ * with that caveat attached rather than as a bare figure.
+ */
+function evidenceScore(evidence: Record<string, unknown> | null): string {
+  const value = evidence?.score;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value.toFixed(1);
+  }
+  if (typeof value === "string" && value !== "") return value;
+  return "—";
+}
+
+/** Trader-language view of a signed position: "12.00" NO, not "-12.00". */
+function heldSide(netContracts: string): { size: string; side: string } {
+  const negative = netContracts.trim().startsWith("-");
+  return {
+    size: asCount(negative ? netContracts.trim().slice(1) : netContracts),
+    side: negative ? "no" : "yes",
+  };
 }
 
 export default function Trades() {
@@ -162,8 +197,9 @@ export default function Trades() {
 
       {state?.kill_switch && (
         <div className="banner">
-          <strong>Kill switch engaged.</strong> No new proposals, and working
-          orders are being cancelled.
+          <strong>Kill switch engaged.</strong> No new proposals, and resting
+          orders were cancelled. Release it from the control in the header
+          when you are ready to trade again.
         </div>
       )}
 
@@ -193,9 +229,7 @@ export default function Trades() {
         {state?.balance?.dollars && (
           <div className="stat">
             <span className="stat-label">balance</span>
-            <span className="stat-value">
-              ${Number(state.balance.dollars).toFixed(2)}
-            </span>
+            <span className="stat-value">{asUsd(state.balance.dollars)}</span>
           </div>
         )}
         <div className="stat">
@@ -217,10 +251,24 @@ export default function Trades() {
           </span>
         </div>
 
+        {/* The tab has to be open for any of this to reach you. Web Push
+            needs a secure context and this dashboard is plain HTTP on a LAN
+            address by design, so alerting is title, favicon and audio — all
+            in-tab. On the live evidence that is not a footnote: 259 of 262
+            set-arb proposals so far have expired without a decision. */}
+        <p className="muted" style={{ marginBottom: 10 }}>
+          Alerts fire only while this tab is open — title, tab badge and a
+          ping. There is no background notification: the Push API needs HTTPS
+          and the dashboard is deliberately plain HTTP on the LAN. A proposal
+          you are not here for expires undecided.
+        </p>
+
         {pending.length === 0 ? (
           <Empty>
             Nothing awaiting a decision. Open a market and use the trade ticket
-            to queue one; detectors start filling this queue in M4.
+            to queue one. Detectors ship disabled — enable them one at a time
+            in <code>config.yaml</code> and let the report card earn your trust
+            before the queue fills itself.
           </Empty>
         ) : (
           <div className="approvals">
@@ -248,7 +296,7 @@ export default function Trades() {
                   <tr>
                     <th>ticker</th>
                     <th>side</th>
-                    <th className="num">price</th>
+                    <th className="num">price ¢</th>
                     <th className="num">filled</th>
                     <th>status</th>
                     <th />
@@ -267,7 +315,7 @@ export default function Trades() {
                       </td>
                       <td className="num">{centsNum(o.limit_price, 2)}</td>
                       <td className="num">
-                        {o.filled_contracts}/{o.contracts}
+                        {asCount(o.filled_contracts)}/{asCount(o.contracts)}
                       </td>
                       <td>{o.status}</td>
                       <td>
@@ -301,9 +349,16 @@ export default function Trades() {
                     <th>ticker</th>
                     <th>side</th>
                     <th className="num">size</th>
-                    <th className="num">avg</th>
+                    <th className="num">avg ¢</th>
                     <th className="num">unreal.</th>
                     <th className="num">real.</th>
+                    {/* Hard constraint: every P&L shown must be net of fees.
+                        This column was declared, returned by the API and
+                        rendered by nothing, so a position 21¢ down on fees
+                        read as 6/100ths of a cent down. */}
+                    <th className="num" title="already spent — subtract it from realised">
+                      fees
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -317,27 +372,19 @@ export default function Trades() {
                       <td className={p.side === "yes" ? "up" : "down"}>
                         {p.side}
                       </td>
-                      <td className="num">{p.contracts}</td>
+                      <td className="num">{asCount(p.contracts)}</td>
                       <td className="num">{centsNum(p.avg_price, 2)}</td>
-                      <td
-                        className={
-                          p.unrealized_pnl_cents === null
-                            ? "num"
-                            : Number(p.unrealized_pnl_cents) >= 0
-                              ? "num up"
-                              : "num down"
-                        }
-                      >
+                      <td className={pnlClass(p.unrealized_pnl_cents)}>
                         {p.unrealized_pnl_cents === null
                           ? "—"
                           : asDollars(p.unrealized_pnl_cents)}
                       </td>
-                      <td
-                        className={
-                          Number(p.realized_pnl_cents) >= 0 ? "num up" : "num down"
-                        }
-                      >
+                      <td className={pnlClass(p.realized_pnl_cents)}>
                         {asDollars(p.realized_pnl_cents)}
+                      </td>
+                      <td className="num muted">
+                        {moneySign(p.fees_paid_cents) > 0 ? "−" : ""}
+                        {asCentsAmount(p.fees_paid_cents)}
                       </td>
                     </tr>
                   ))}
@@ -361,7 +408,7 @@ export default function Trades() {
                     <th>time</th>
                     <th>ticker</th>
                     <th>side</th>
-                    <th className="num">price</th>
+                    <th className="num">price ¢</th>
                     <th className="num">size</th>
                     <th className="num">fee</th>
                   </tr>
@@ -369,14 +416,19 @@ export default function Trades() {
                 <tbody>
                   {fills.map((f) => (
                     <tr key={f.id}>
-                      <td className="muted">{f.ts ? asClock(f.ts) : "—"}</td>
+                      <td className="muted" title={f.ts ?? undefined}>
+                        {f.ts ? asClock(f.ts) : "—"}
+                      </td>
                       <td className="mono">{f.ticker}</td>
                       <td className={f.action === "buy" ? "up" : "down"}>
                         {f.action} {f.side}
                       </td>
                       <td className="num">{centsNum(f.price, 2)}</td>
-                      <td className="num">{f.contracts}</td>
-                      <td className="num">{asDollars(f.fee_cents)}</td>
+                      <td className="num">{asCount(f.contracts)}</td>
+                      {/* The exchange bills fractional cents. Rendered as
+                          dollars these read "$0.00" — a real, billed fee
+                          showing as no fee at all. */}
+                      <td className="num">{asCentsAmount(f.fee_cents)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -419,42 +471,58 @@ export default function Trades() {
           </Empty>
         ) : (
           <div className="table-scroll">
-            <table>
+            {/* className="table" was missing here and only here. Without it
+                none of the table styling applies and `.table .num` never
+                matches, so every numeric column loses its right alignment and
+                tabular figures. Invisible until the first resolution. */}
+            <table className="table">
               <thead>
                 <tr>
                   <th>market</th>
                   <th>route</th>
                   <th>result</th>
                   <th className="num">held</th>
-                  <th className="num">avg</th>
-                  <th className="num">paid</th>
+                  <th className="num">avg ¢ (YES)</th>
+                  <th className="num">paid ¢</th>
                   <th className="num">P&amp;L</th>
+                  <th className="num">fee</th>
                   <th>when</th>
                 </tr>
               </thead>
               <tbody>
-                {settlements.map((s) => (
-                  <tr key={`${s.ticker}-${s.route}`}>
-                    <td>
-                      <Link to={`/market/${s.ticker}`}>{s.ticker}</Link>
-                    </td>
-                    <td>{routeLabel(s.route)}</td>
-                    <td>{s.result ?? "—"}</td>
-                    <td className="num">{s.net_contracts}</td>
-                    {/* Both are YES prices in dollars, not cents figures —
-                        asDollars would divide them by 100 a second time. */}
-                    <td className="num">{asCents(s.avg_price)}</td>
-                    <td className="num">{asCents(s.settled_yes_value)}</td>
-                    <td
-                      className={
-                        Number(s.realized_pnl_cents) < 0 ? "num bad" : "num ok"
-                      }
-                    >
-                      {asSignedCents(s.realized_pnl_cents)}
-                    </td>
-                    <td>{s.settled_at ? asClock(s.settled_at) : "—"}</td>
-                  </tr>
-                ))}
+                {settlements.map((s) => {
+                  const held = heldSide(s.net_contracts);
+                  return (
+                    <tr key={`${s.ticker}-${s.route}`}>
+                      <td>
+                        <Link to={`/market/${s.ticker}`}>{s.ticker}</Link>
+                      </td>
+                      <td>{routeLabel(s.route)}</td>
+                      <td>{s.result ?? "—"}</td>
+                      {/* Positions are stored signed in YES-equivalents, but
+                          "-12.00" is not how a trader reads a holding — the
+                          positions table above already says "12 NO" and this
+                          was the one place the internal convention leaked. */}
+                      <td className="num">
+                        {held.size}{" "}
+                        <span className={held.side === "yes" ? "up" : "down"}>
+                          {held.side}
+                        </span>
+                      </td>
+                      {/* Both are YES *prices* in dollars, not cents money —
+                          a cents formatter would divide them by 100 again. */}
+                      <td className="num">{centsNum(s.avg_price, 2)}</td>
+                      <td className="num">{centsNum(s.settled_yes_value, 2)}</td>
+                      <td className={pnlClass(s.realized_pnl_cents)}>
+                        {asSignedCents(s.realized_pnl_cents)}
+                      </td>
+                      <td className="num muted">{asCentsAmount(s.fee_cents)}</td>
+                      <td title={s.settled_at ?? undefined}>
+                        {s.settled_at ? asClock(s.settled_at) : "—"}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -483,6 +551,12 @@ export default function Trades() {
                   <th>ticker</th>
                   <th>side</th>
                   <th className="num">net edge</th>
+                  <th
+                    className="num"
+                    title="an ordering for attention — not cents, not a probability, and a 70 is not twice a 35"
+                  >
+                    score
+                  </th>
                   <th className="num">conf</th>
                   <th className="num">seen</th>
                   <th>why</th>
@@ -491,7 +565,7 @@ export default function Trades() {
               <tbody>
                 {signals.map((sg) => (
                   <tr key={sg.id}>
-                    <td className="muted">
+                    <td className="muted" title={sg.created_at ?? undefined}>
                       {sg.created_at ? asClock(sg.created_at) : "—"}
                     </td>
                     <td className="mono">{sg.detector}</td>
@@ -509,14 +583,16 @@ export default function Trades() {
                       )}
                     </td>
                     <td className={sg.side === "yes" ? "up" : "down"}>{sg.side}</td>
-                    <td
-                      className={
-                        Number(sg.net_edge_cents) > 0 ? "num up" : "num"
-                      }
-                    >
-                      {Number(sg.net_edge_cents) === 0
+                    <td className={pnlClass(sg.net_edge_cents)}>
+                      {moneySign(sg.net_edge_cents) === 0
                         ? "—"
                         : asSignedCents(sg.net_edge_cents)}
+                    </td>
+                    <td
+                      className="num muted"
+                      title="an ordering for attention — not cents, not a probability"
+                    >
+                      {evidenceScore(sg.evidence)}
                     </td>
                     <td className="num">{(sg.confidence * 100).toFixed(0)}%</td>
                     {/* Repeats fold into the row instead of adding one, so a
@@ -531,7 +607,13 @@ export default function Trades() {
                     >
                       {sg.seen_count > 1 ? `${sg.seen_count}×` : "—"}
                     </td>
-                    <td className="audit-detail">{sg.rationale}</td>
+                    {/* Wraps rather than truncating. The caveat that stops a
+                        99.4 being read as a 99.4% chance sits at the END of
+                        the rationale, so an ellipsis always ate exactly the
+                        part that mattered. */}
+                    <td className="audit-detail" title={sg.rationale ?? undefined}>
+                      {sg.rationale}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -549,7 +631,10 @@ export default function Trades() {
       <section className="panel" style={{ marginTop: 12 }}>
         <h2>Audit trail</h2>
         <p className="muted">
-          Append-only. Every proposal, decision, order, and fill.
+          Append-only. Every proposal, decision, order, and fill. Times on this
+          page are your browser's local clock — the daily loss limit resets on
+          the <strong>UTC</strong> day, so the two can differ; hover a time for
+          the exact timestamp.
         </p>
         {audit.length === 0 ? (
           <Empty>Nothing recorded yet.</Empty>
@@ -568,12 +653,14 @@ export default function Trades() {
               <tbody>
                 {audit.map((entry) => (
                   <tr key={entry.id}>
-                    <td className="muted">
+                    <td className="muted" title={entry.ts ?? undefined}>
                       {entry.ts ? asClock(entry.ts) : "—"}
                     </td>
                     <td className="mono">{entry.kind}</td>
                     <td className="mono">{entry.ticker ?? "—"}</td>
                     <td>{entry.actor}</td>
+                    {/* An append-only record you cannot read is not a record.
+                        This column was ellipsised to one line. */}
                     <td className="audit-detail">
                       {entry.payload ? JSON.stringify(entry.payload) : ""}
                     </td>

@@ -114,7 +114,20 @@ API's own signed `position_fp`.
 - **Writes are never retried.** A `POST` that times out may still have
   reached the matching engine, so `rest.py` raises on write timeouts and 5xx
   rather than retrying. 429 is safe to retry (rejected, not executed).
-  Recovery is reconciliation by client order ID, never a second POST.
+  Recovery is reconciliation by client order ID, never a second POST — and
+  for three milestones that sentence was written in three places and
+  implemented in none. The order was marked REJECTED, which is not a live
+  status, so no sweep revisited it, and `reconcile_order` returns early
+  without an exchange order ID, which is exactly the timed-out case. It now
+  lives in `maintenance.recover_orphaned_orders`, which **adopts** what the
+  exchange holds rather than re-placing it.
+- **`GET /portfolio/orders` has no `client_order_id` filter.** Its parameters
+  are `ticker`, `event_tickers`, `min_ts`, `max_ts`, `status`, `limit`,
+  `cursor`, `subaccount` — checked against the OpenAPI spec on 2026-07-28.
+  `client_order_id` *is* a required field on the returned Order object, so the
+  match is made locally over recent pages. A miss therefore means "not in the
+  pages we looked at", not "never placed", and the recovery pass must not
+  treat one as proof.
 - **The WebSocket requires auth even for public market-data channels.** REST
   public market data does not. This is why the market page reads through to
   REST: it works with no key at all.
@@ -185,7 +198,28 @@ API's own signed `position_fp`.
   market quoted at 26c. Every number was arithmetically right and they
   described different assets. 1,762 markets were affected. Only the **series
   ticker** says what a market tracks — see `reference_symbol_for()` in
-  `app/detectors/stale_quote.py`, which refuses rather than defaulting.
+  `app/detectors/stale_quote.py`, which refuses rather than defaulting. The
+  detector's *selection* now uses the same ticker prefixes that guard names,
+  not `category`: category is copied onto Market from the parent Event by a
+  backfill, so 7,216 active markets were invisible to it at any given moment,
+  and it is the field this file already says must not decide anything.
+- **Crypto markets settle on a CF Benchmarks index, not on an exchange print.**
+  BTC settles on the BRTI, ETH on ETHUSD_RTI, and usually as the *simple
+  average of the sixty seconds* before a stated instant. `ingest/spot.py` polls
+  one venue's **last trade** — different publisher, different statistic, and on
+  the Binance source a different instrument (BTC**USDT**). Near a strike that
+  basis is the size of the edge being claimed. It is a reference for deciding
+  whether spot has decisively cleared a level; never call it the settlement
+  price.
+- **A `ticker` websocket message is a partial snapshot.** `normalize_ticker`
+  emits only the fields that arrived and parsed, so a batch of rows for a
+  multi-row upsert is heterogeneous by nature — and `insert().values(rows)`
+  takes its columns from the *first* row while an `ON CONFLICT` set built from
+  the union of the rows' keys can name a column the INSERT never supplied.
+  `_update_tickers` pads every row to a fixed column list and coalesces on
+  conflict, so an absent field keeps what is stored. "Absent" must never read
+  as "cleared": a NULLed `yes_bid` drops the market out of every detector query
+  that requires a two-sided book.
 - **A websocket `seq` counts the SUBSCRIPTION, not the market.** One
   `orderbook_delta` subscription covers every ticker in it and numbers all
   their messages from one counter, so a single market's deltas are *not*
@@ -241,6 +275,21 @@ A guard that silently inspects the wrong thing is worse than no guard. One
 did exactly that (`--mark-verified` split on `"categories:"`, which also
 matches inside `maker_free_categories:`) and happily marked an unverified
 schedule as verified. Parse structured data; do not slice strings.
+
+**And a guard that inspects a value with no effect is the same bug wearing a
+better suit.** `--mark-verified` also required `formula.rounding_increment_dollars`
+to be *set*, while `fees.py` hardcodes `CENTICENT` and never reads the key: an
+operator changing it because the PDF had changed got a verification pass and
+no behaviour change. It now compares the two and refuses on a mismatch. Ask
+what a check would *fail* on before adding it.
+
+**A refusal that returns `None` is not a refusal, it is a disappearance.**
+`propose_finding` dropped every single-leg finding with a bare `return None`,
+so an enabled detector that had found an edge, sized it with Kelly and named
+its binding cap looked identical to one that had found nothing — for three
+milestones. It now raises `single_leg_unsupported`, which the worker counts
+and prints. There is still no single-leg proposal path: set arbitrage is the
+only detector whose output can reach the approval queue.
 
 The same shape shows up in **tri-state fields**. `Market.result` is `''` for
 an open market, not NULL — 153,808 rows — so `is not None` calls every open
@@ -349,10 +398,17 @@ docker compose run --rm --no-deps api python scripts/backtest.py --days 30
 **`compose run api pytest` tests the image, not your working tree.** Only
 `config.yaml`, `data/` and `secrets/` are bind-mounted; `app/` and `tests/`
 are baked in at build time. Without the `--build` above, a green suite is
-green for the code you last built — it silently ran 1,292 tests against the
-previous milestone while 1,547 existed on disk. Either build first, or bind-
-mount the source (`-v ./backend:/app` plus `config.yaml`, `data/`, `scripts/`,
-since those live above `backend/`).
+green for the code you last built — the run that exposed this reported 1,292
+tests while the tree on disk held several hundred more. Either build first, or
+bind-mount the source (`-v ./backend:/app` plus `config.yaml`, `data/`,
+`scripts/`, since those live above `backend/`).
+
+**Compare the collected count against the tree, not against a number in this
+file.** At `1ee5cd3` that was **1,438 test functions** on disk, collecting
+**~1,557** cases once `parametrize` is expanded. Any figure written here goes
+stale within a milestone, which makes it useless as the tripwire it is being
+offered as; `python -m pytest tests/ --collect-only -q | tail -1` is the
+number that cannot be wrong.
 
 **Actually run the stack and look at the result.** Every milestone so far has
 surfaced bugs that passed tests and lint: hypertables silently not created,
@@ -387,6 +443,24 @@ Branch: `claude/kalshi-copilot-build-bgyv2d`
   block trades, which are yours alone. It is registered as a detector that
   logs a refusal when enabled, because one silently missing from the registry
   looks identical to one that runs and finds nothing. Do not add scraping.
+- **`ingest.scanner.max_markets` and `series_filter` are read by nothing.**
+  The ticker channel is subscribed with no market list — i.e. every market on
+  the exchange — which is deliberate (the screener ranks against the whole
+  catalog) but makes both keys a lie: an operator capping the scanner at 500
+  still gets 149,000. Ingest now logs a warning saying so at startup. Resolve
+  it in one direction or the other: delete both keys, or subscribe narrowly
+  and accept that the screener's percentile then describes the subscription.
+  Same question, smaller stakes, for `set_arbitrage.require_full_depth`,
+  `resolution_sniper.min_source_confidence`, `backtest.pessimistic_fills` and
+  `bitcoin.use_deribit_implied` — all documented in `config.yaml`, none read.
+  Note two of those would *weaken* a refusal if they were wired as written
+  (partial-depth set arb, a friendlier backtest fill model), so deleting is
+  the right direction for those.
+- **The weather engine is enabled outside the `detectors:` block**, so
+  `DetectorsConfig.enabled_names()` cannot see it and it was missing from
+  `/api/system` and the worker's boot log while it scanned. Use
+  `detectors.base.enabled_detector_names(config)`, which adds it; `app/main.py`
+  still prints the narrow list.
 - **Only BTC has a spot feed.** ETH/SOL/XRP markets are correctly refused by
   the stale-quote detector, which is ~1,353 markets it can see and cannot
   price. Adding feeds means adding to `SPOT_SOURCES` and polling per symbol.
@@ -407,6 +481,22 @@ Branch: `claude/kalshi-copilot-build-bgyv2d`
   `ingest/catalog.py` had a third instance, loading all 217,258 tickers into a
   Python set every sync to detect new listings; Postgres reports that for free
   via `RETURNING (xmax = 0)`.
+
+  **A cap also needs an `ORDER BY` and a log line.** Every `MAX_*_ROWS` in the
+  detectors truncated in silence and in whatever order Postgres returned:
+  measured, the undervalued screener discarded **68,110 of 88,110** eligible
+  markets, and because its score is a volume percentile *relative to the rows
+  it got*, which 23% arrived decided every rank it emitted. Deterministic
+  ordering also has to point the right way — a flow detector fetching the tape
+  `ORDER BY ts LIMIT n` throws away the recent end, which is the only end that
+  matters. Cap deliberately, order towards what the query is for, and say so
+  when the cap binds (`_warn_if_capped` in `detectors/runner.py`).
+
+  The same applies to a *pending-work* queue. `backfill_outcomes` ordered by
+  id and skipped rows whose market resolved `void` — so those permanently
+  unfillable rows sat at the head forever, and once they exceeded the cap no
+  newer observation would ever have been resolved again. Push the "can this
+  row ever be finished?" test into SQL so the head of the queue always moves.
 - **No detector has signalled on a genuine edge yet.** The full path was
   exercised by dropping `min_net_edge_cents` negative so set-arb would
   propose regardless — 42 multi-leg proposals from live books, one approved
@@ -465,6 +555,12 @@ Branch: `claude/kalshi-copilot-build-bgyv2d`
 - **An equity curve for `max_drawdown` must start at zero**, before the first
   trade. Otherwise the first trade's result *is* the opening peak and an
   opening loss reports no drawdown at all — an error that only ever flatters.
+  `report.py` got this right with a comment explaining why, and `engine.py`
+  did not: `replay()` appends one point *after* the fills at each instant and
+  no pre-trade point, so a run that paid 1.75c of fees reported "max drawdown:
+  0c". Knowing the rule is not the same as applying it at every call site —
+  `stats.max_drawdown` takes a caller-supplied curve, so every caller has to
+  prepend `starting_equity_cents`.
 - Notifications are **first-party only** (PWA Web Push, audio, favicon
   badge). The original spec mentioned ntfy/Telegram once in a milestone list;
   that contradicts two more detailed sections and was resolved as a drafting

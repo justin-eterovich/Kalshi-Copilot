@@ -43,6 +43,7 @@ live loss must certainly not be offset by a paper gain.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -112,6 +113,70 @@ def position_cost_cents(net_contracts: Decimal, avg_price: Decimal) -> Decimal:
         return Decimal(0)
     per_contract = avg_price if net_contracts > 0 else ONE - avg_price
     return abs(net_contracts) * per_contract * HUNDRED
+
+
+async def market_exposure_cents(
+    session: AsyncSession,
+    *,
+    route: str,
+    tickers: Sequence[str],
+    event_ticker: str | None = None,
+    exclude_proposal_id: int | None = None,
+) -> Decimal:
+    """Capital already committed to these markets, in cents.
+
+    Position cost basis plus every pending proposal that touches the same
+    markets. This is what ``risk.max_pct_per_market`` is supposed to be
+    measured against: the config calls it "5% of bankroll in any single
+    market", and the limit was previously computed from a single proposal's
+    own ``max_loss_cents`` with no query at all — so eight individually
+    compliant proposals put 39.79% of bankroll into one ticker and every one
+    of them reported itself inside the cap.
+
+    Pending proposals count because they are one click from being positions,
+    and the whole point of a per-market cap is to bound what one market can
+    cost you. Cost basis rather than mark-to-market, for the reason in
+    :func:`position_cost_cents`.
+    """
+    if not tickers:
+        return Decimal(0)
+
+    open_positions = (
+        await session.execute(
+            select(Position.net_contracts, Position.avg_price).where(
+                Position.route == route,
+                Position.ticker.in_(tickers),
+                Position.net_contracts != 0,
+            )
+        )
+    ).all()
+    held = sum(
+        (
+            position_cost_cents(net or Decimal(0), avg or Decimal(0))
+            for net, avg in open_positions
+        ),
+        Decimal(0),
+    )
+
+    # Same matching shape as the duplicate guard: a proposal is "for" a market
+    # either directly or through its event.
+    match = ProposedTrade.ticker.in_(tickers)
+    if event_ticker:
+        match = match | (ProposedTrade.event_ticker == event_ticker)
+    conditions = [ProposedTrade.status == ProposalStatus.PENDING, match]
+    if exclude_proposal_id is not None:
+        # At approval time the proposal under consideration is still PENDING
+        # and therefore already inside this sum. Callers that then add its
+        # `max_loss_cents` on top would count it twice — the same trap
+        # `check_exposure` documents for `pending_cents`.
+        conditions.append(ProposedTrade.id != exclude_proposal_id)
+    queued = (
+        await session.execute(
+            select(ProposedTrade.max_loss_cents).where(*conditions)
+        )
+    ).scalars().all()
+
+    return held + sum((p or Decimal(0) for p in queued), Decimal(0))
 
 
 def consecutive_losses(realized: list[Decimal]) -> int:
@@ -407,6 +472,9 @@ async def guard_approval(
     *,
     max_loss_cents: Decimal | None,
     now: datetime | None = None,
+    tickers: Sequence[str] = (),
+    event_ticker: str | None = None,
+    proposal_id: int | None = None,
 ) -> RiskState | None:
     """Run every portfolio limit ahead of an approval.
 
@@ -423,6 +491,33 @@ async def guard_approval(
     check_exposure(
         state, config, additional_cents=max_loss_cents or Decimal(0)
     )
+
+    # The per-market cap, re-checked here and not only at creation. This
+    # module's own docstring says the executor's enforcement is the one that
+    # matters — it is the only function that can cause an order to exist, so
+    # it is the only place a check cannot be sidestepped — and until now this
+    # limit was the one that was never re-run. A proposal can sit in the queue
+    # while other proposals for the same market are approved ahead of it, so
+    # the number that was compliant at creation need not be at approval.
+    if tickers:
+        committed = await market_exposure_cents(
+            session,
+            route=route,
+            tickers=tickers,
+            event_ticker=event_ticker,
+            exclude_proposal_id=proposal_id,
+        )
+        projected = committed + (max_loss_cents or Decimal(0))
+        limit = state.bankroll_cents * Decimal(str(config.risk.max_pct_per_market))
+        if state.bankroll_cents > 0 and projected > limit:
+            raise RiskError(
+                "exceeds_market_limit",
+                f"this market would reach "
+                f"{projected / state.bankroll_cents:.2%} of bankroll "
+                f"({committed / HUNDRED:.2f} USD already committed); "
+                f"risk.max_pct_per_market is "
+                f"{config.risk.max_pct_per_market:.2%}.",
+            )
     return state
 
 

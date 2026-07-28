@@ -16,12 +16,43 @@ from typing import Any
 from app.core.money import parse_count, parse_dollars
 
 __all__ = [
+    "TICKER_UPDATE_COLUMNS",
     "normalize_market",
     "normalize_event",
     "normalize_series",
     "normalize_trade",
     "normalize_ticker",
 ]
+
+#: Price columns a ``ticker`` websocket message can carry, and the wire keys
+#: each is read from.
+_TICKER_PRICE_FIELDS: dict[str, tuple[str, ...]] = {
+    "last_price": ("price_dollars",),
+    "yes_bid": ("yes_bid_dollars",),
+    "yes_ask": ("yes_ask_dollars",),
+}
+
+#: Count columns a ``ticker`` message can carry.
+_TICKER_COUNT_FIELDS: dict[str, tuple[str, ...]] = {
+    "volume": ("volume_fp",),
+    "open_interest": ("open_interest_fp",),
+    "yes_bid_size": ("yes_bid_size_fp",),
+    "yes_ask_size": ("yes_ask_size_fp",),
+}
+
+#: Every ``markets`` column :func:`normalize_ticker` is allowed to emit.
+#:
+#: Exported because the flush that writes these rows needs a **fixed** column
+#: list. `normalize_ticker` returns a *variable* key set — a field appears only
+#: if it arrived and parsed — and a multi-row INSERT built from heterogeneous
+#: dicts takes its columns from the first row while an ``ON CONFLICT`` set
+#: built from the union of every row's keys can name a column the INSERT never
+#: supplied. Deriving the list here, from the same maps that produce the rows,
+#: is what stops the two drifting apart.
+TICKER_UPDATE_COLUMNS: tuple[str, ...] = (
+    *_TICKER_PRICE_FIELDS,
+    *_TICKER_COUNT_FIELDS,
+)
 
 
 def _dt(value: Any) -> datetime | None:
@@ -198,23 +229,12 @@ def normalize_ticker(raw: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     update: dict[str, Any] = {"ticker": ticker}
-    field_map = {
-        "last_price": ("price_dollars",),
-        "yes_bid": ("yes_bid_dollars",),
-        "yes_ask": ("yes_ask_dollars",),
-    }
-    for column, keys in field_map.items():
+    for column, keys in _TICKER_PRICE_FIELDS.items():
         value = _price(raw, *keys)
         if value is not None:
             update[column] = value
 
-    count_map = {
-        "volume": ("volume_fp",),
-        "open_interest": ("open_interest_fp",),
-        "yes_bid_size": ("yes_bid_size_fp",),
-        "yes_ask_size": ("yes_ask_size_fp",),
-    }
-    for column, keys in count_map.items():
+    for column, keys in _TICKER_COUNT_FIELDS.items():
         value = _count(raw, *keys)
         if value is not None:
             update[column] = value

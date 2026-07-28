@@ -90,6 +90,14 @@ class BacktestResult:
             lines.append("Replay not run: coverage refused.")
             return lines
         r = self.replay
+        # The opening balance is prepended, before the first observation.
+        # `replay` appends one point *after* the fills at each instant, so
+        # without this leading point `max_drawdown` takes the first
+        # observation's result as its starting peak and a run that opened with
+        # a loss reports no drawdown at all — an error that only ever flatters.
+        # `report.py:611` prepends the same point for the same reason; this
+        # call site had missed it.
+        curve = [r.starting_equity_cents, *(e for _, e in r.equity_curve)]
         lines += [
             "",
             f"observations replayed: {r.observations}",
@@ -97,8 +105,7 @@ class BacktestResult:
             f"settlements: {r.settlements}, unsettled at end: {len(r.unsettled)}",
             f"realised P&L: {r.realized_pnl_cents}c "
             f"(fees {r.fees_paid_cents}c)",
-            f"max drawdown: "
-            f"{stats.max_drawdown([e for _, e in r.equity_curve])}c",
+            f"max drawdown: {stats.max_drawdown(curve)}c",
             "",
             self.headline,
         ]

@@ -8,12 +8,15 @@ Design notes:
 - **Book snapshots are throttled** per market. Persisting every delta would
   write thousands of rows a second for no analytical gain; the detectors care
   about the book *now* (held in memory) and a periodic record for backtests.
-- **A sequence gap invalidates the book.** The consumer marks it stale and
-  puts the ticker in ``resync_needed`` instead of applying deltas to a book it
-  can no longer trust. Clearing that set is `_book_heal_loop`'s job in
-  ``ingest/main.py`` — for three milestones nothing read it at all, and a
-  book that went stale stayed stale for the life of the process, silently
-  writing no snapshots.
+- **A sequence gap invalidates every book on that subscription.** ``seq``
+  counts the subscription, not the market, so the gap is detected in
+  ``kalshi/ws.py`` and arrives here as a synthetic ``__resync__`` that marks
+  all of them stale at once. What this module still refuses on its own is a
+  delta it cannot apply — one before any snapshot, or a replayed ``seq`` —
+  which puts that ticker in ``resync_needed`` rather than guessing state.
+  Clearing that set is `_book_heal_loop`'s job in ``ingest/main.py`` — for
+  three milestones nothing read it at all, and a book that went stale stayed
+  stale for the life of the process, silently writing no snapshots.
 
 Writes are batched and flushed on a timer so a busy market cannot turn every
 message into its own transaction.
@@ -29,13 +32,18 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.logging import get_logger
 from app.core.redis import CH_TICKS, get_redis
 from app.db.models import Candle, Market, OrderbookSnap, Tape
-from app.ingest.normalize import normalize_ticker, normalize_trade
+from app.ingest.normalize import (
+    TICKER_UPDATE_COLUMNS,
+    normalize_ticker,
+    normalize_trade,
+)
 from app.kalshi.orderbook import OrderBook
 
 log = get_logger(__name__)
@@ -304,14 +312,37 @@ class StreamProcessor:
     async def _update_tickers(
         session: AsyncSession, updates: dict[str, dict[str, Any]]
     ) -> None:
-        rows = [{"ticker": t, **vals} for t, vals in updates.items()]
+        # Every row carries the *same* columns, always, even when the ticker
+        # message that produced it carried only two of them.
+        #
+        # `normalize_ticker` emits a variable key set — a field appears only if
+        # it arrived and parsed — and the scanner subscribes every active
+        # market, so a batch of heterogeneous rows is the normal case rather
+        # than an edge one. A multi-row `insert().values(rows)` takes its
+        # column list from the *first* row, while an `ON CONFLICT` set built
+        # from the union of every row's keys can name a column the INSERT never
+        # supplied. Padding to a fixed list removes that mismatch by
+        # construction: there is nothing left for a union to disagree about.
+        #
+        # The padding is NULL, so the upsert coalesces: a column this message
+        # did not carry keeps whatever is stored rather than being blanked. A
+        # ticker message is a partial snapshot, never a statement that a quote
+        # has gone away, so "absent" must not read as "cleared" — a NULLed
+        # yes_bid would silently drop the market out of every detector query
+        # that requires a two-sided book.
+        rows = [
+            {"ticker": t, **{c: vals.get(c) for c in TICKER_UPDATE_COLUMNS}}
+            for t, vals in updates.items()
+        ]
         for chunk in _chunks(rows, MAX_BATCH):
             stmt = insert(Market).values(chunk)
-            columns = {k for row in chunk for k in row if k != "ticker"}
             await session.execute(
                 stmt.on_conflict_do_update(
                     index_elements=[Market.ticker],
-                    set_={c: stmt.excluded[c] for c in columns},
+                    set_={
+                        c: func.coalesce(stmt.excluded[c], Market.__table__.c[c])
+                        for c in TICKER_UPDATE_COLUMNS
+                    },
                 )
             )
 

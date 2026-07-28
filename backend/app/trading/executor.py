@@ -32,7 +32,7 @@ import json
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Final
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,7 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Config
 from app.core.logging import get_logger
 from app.core.money import format_count, parse_count, parse_dollars
-from app.core.redis import CH_ORDERS, get_redis
+from app.core.redis import CH_ORDERS, get_kill_switch, get_redis
 from app.db.models import (
     Fill,
     Order,
@@ -73,6 +73,35 @@ LIVE_ORDER_STATUSES = (
     OrderStatus.RESTING,
     OrderStatus.PARTIALLY_FILLED,
 )
+
+#: Namespace for deterministic client order IDs. Arbitrary but fixed — it only
+#: has to be stable across restarts of this deployment.
+_COID_NAMESPACE: Final = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")
+
+
+def _client_order_id(proposal: ProposedTrade, seq: int) -> str:
+    """A client order ID that is the same every time for the same leg.
+
+    README calls client-supplied order IDs the reason "a network retry cannot
+    double-place". That was not true while this was ``uuid.uuid4()`` per
+    placement attempt: two approvals of one proposal produced two different
+    IDs, so the exchange had no basis to reject the second and duly filled
+    both.
+
+    Deriving it from ``(proposal_id, leg_seq)`` makes the exchange itself the
+    last line of defence behind the row lock in ``approve_and_execute``.
+    ``created_at`` is folded in so that a rebuilt database — which restarts
+    the proposal ID sequence — cannot mint an ID that collides with a real
+    historical order still known to the exchange.
+    """
+    created = getattr(proposal, "created_at", None)
+    if proposal.id is None or created is None:
+        # Not yet persisted: nothing stable to derive from, and a random ID is
+        # strictly better than a colliding one.
+        return str(uuid.uuid4())
+    return str(
+        uuid.uuid5(_COID_NAMESPACE, f"{proposal.id}:{seq}:{created.isoformat()}")
+    )
 
 _TIF_WIRE = {"gtc": TIF_GTC, "ioc": TIF_IOC}
 
@@ -155,11 +184,42 @@ class Executor:
             ExecutionError: placement itself failed. The proposal is marked
                 FAILED and the order row records why.
         """
+        # Take a row lock on the proposal BEFORE any check reads its status.
+        #
+        # Every guard below is `if status is not PENDING: refuse`, evaluated
+        # against whatever this session last read. Without a lock two
+        # concurrent approvals both read PENDING, both pass, and both place —
+        # verified against the live demo exchange: one proposal, two distinct
+        # exchange order IDs, two fills, two contracts where the operator
+        # authorised one. A double-click is inside the window, which spans the
+        # whole exchange round-trip.
+        #
+        # `populate_existing` is load-bearing. `proposal` is already in the
+        # identity map, and without it SQLAlchemy hands back the stale
+        # in-memory attributes and the lock protects nothing.
+        #
+        # The lock is held across placement until the caller commits. That is
+        # deliberate: a concurrent approver blocks, then re-reads APPROVED and
+        # is refused by `check_execution` below. Holding one row for the
+        # duration of an exchange round-trip is the cheap side of this trade.
+        if proposal.id is not None:
+            locked = (
+                await session.execute(
+                    select(ProposedTrade)
+                    .where(ProposedTrade.id == proposal.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalars().one_or_none()
+            if locked is not None:
+                proposal = locked
+
         route = check_execution(
             proposal,
             self._settings,
             self._config,
             confirmed=confirmed,
+            kill_switch=await get_kill_switch(),
             confirmation_phrase=confirmation_phrase,
         )
 
@@ -169,14 +229,27 @@ class Executor:
         # an order to exist, so it is the only place a check cannot be
         # sidestepped. A refusal leaves the proposal pending — the limits are
         # all temporary, and the trade may be fine in an hour.
+        leg_tickers = (
+            await session.execute(
+                select(ProposalLeg.ticker).where(
+                    ProposalLeg.proposal_id == proposal.id
+                )
+            )
+        ).scalars().all()
+        if not leg_tickers and proposal.ticker:
+            leg_tickers = [proposal.ticker]
+
         await risk.guard_approval(
             session,
             self._config,
             self._settings,
             max_loss_cents=proposal.max_loss_cents,
+            tickers=leg_tickers,
+            event_ticker=proposal.event_ticker,
+            proposal_id=proposal.id,
         )
 
-        existing = await self._live_order_for(session, proposal)
+        existing = await self._existing_order_for(session, proposal)
         if existing is not None:
             # A double-click, or a retry after a UI timeout. Returning the
             # order that already exists is the whole point of recording it
@@ -254,16 +327,26 @@ class Executor:
             return ProposalStatus.EXECUTED
         return ProposalStatus.PARTIAL
 
-    async def _live_order_for(
+    async def _existing_order_for(
         self, session: AsyncSession, proposal: ProposedTrade
     ) -> Order | None:
+        """Any order this proposal has already caused to exist.
+
+        Deliberately unfiltered by status. This used to select only
+        ``LIVE_ORDER_STATUSES`` (pending/resting/partially_filled), which
+        excludes ``FILLED`` — the normal outcome for a taker order on a liquid
+        book — so the guard did not fire in precisely the common case.
+
+        ``REJECTED`` counts too, and that is the important one: a write that
+        timed out is recorded REJECTED but **may still have reached the
+        matching engine**. Treating it as licence to place again is the
+        double-submit this codebase refuses to do anywhere else. If an order
+        row exists at all, recovery is reconciliation, never a second POST.
+        """
         return (
             await session.execute(
                 select(Order)
-                .where(
-                    Order.proposal_id == proposal.id,
-                    Order.status.in_(LIVE_ORDER_STATUSES),
-                )
+                .where(Order.proposal_id == proposal.id)
                 .order_by(Order.id.desc())
                 .limit(1)
             )
@@ -308,7 +391,7 @@ class Executor:
                 leg_id=leg.id,
                 # The idempotency key. Generated and persisted before anything
                 # leaves the process, so a crash mid-flight is recoverable.
-                client_order_id=str(uuid.uuid4()),
+                client_order_id=_client_order_id(proposal, leg.seq),
                 ticker=leg.ticker,
                 side=leg.side,
                 action=leg.action,
@@ -360,16 +443,44 @@ class Executor:
         except InterlockError:
             raise
         except Exception as exc:  # noqa: BLE001 - recorded, then re-raised
+            # A definite refusal and an ambiguous one are different facts and
+            # must not be flattened into REJECTED together.
+            #
+            # A 4xx is the exchange saying "I did not accept this". A network
+            # error or a 5xx says nothing at all: the order may well have
+            # reached the matching engine, which is exactly why writes are
+            # never retried. Marking those REJECTED asserts something we do
+            # not know, and REJECTED is a terminal state the order sweep never
+            # revisits — so a live order could sit on the book with a local
+            # row claiming it was refused.
+            #
+            # Ambiguous failures stay PENDING so the reconciliation pass can
+            # look them up by client order ID and find out what actually
+            # happened.
+            status_code = getattr(exc, "status", None)
+            ambiguous = not (
+                isinstance(status_code, int) and 400 <= status_code < 500
+            )
             for order in orders:
                 if order.status is OrderStatus.PENDING:
-                    order.status = OrderStatus.REJECTED
                     order.error = str(exc)[:2000]
+                    if not ambiguous:
+                        order.status = OrderStatus.REJECTED
             await proposals.audit(
                 session,
-                kind="order.failed",
+                kind="order.submit_ambiguous" if ambiguous else "order.failed",
                 ticker=proposal.ticker,
                 actor="system",
-                payload={"proposal_id": proposal.id, "error": str(exc)[:500]},
+                payload={
+                    "proposal_id": proposal.id,
+                    "error": str(exc)[:500],
+                    "status": status_code,
+                    "resolution": (
+                        "left PENDING for reconciliation by client order ID"
+                        if ambiguous
+                        else "definitively rejected by the exchange"
+                    ),
+                },
             )
             log.exception("proposal %s placement failed: %s", proposal.id, exc)
             raise ExecutionError("placement_failed", str(exc)) from exc
@@ -528,7 +639,13 @@ class Executor:
                 price=to_yes_price(order.side, avg_price_yes),
                 contracts=filled,
                 fee_cents=fee_cents,
-                exchange_fill_id=f"{order.exchange_order_id}-immediate",
+                # Keyed off the client order ID, not the exchange's. The
+                # exchange ID is absent whenever the create response omits
+                # `order_id`, and this then read literally "None-immediate" —
+                # identical for every such fill, so `uq_fill_id` collided on
+                # the second one and the fill was lost. The client order ID is
+                # ours, always present, and unique per leg by construction.
+                exchange_fill_id=f"{order.client_order_id}-immediate",
                 is_taker=True,
             )
 
@@ -628,11 +745,22 @@ class Executor:
                     order.exchange_order_id, market_ticker=order.ticker
                 )
             except KalshiApiError as exc:
-                if exc.status not in (404, 400):
+                # 404 is evidence the order is gone. 400 is not — it means the
+                # exchange rejected the *request*, and says nothing about
+                # whether the order is still resting. Treating it as "already
+                # gone" marked the order CANCELED locally while it stayed live
+                # on the book, and `sweep_orders` never revisits a CANCELED
+                # order, so nothing would ever correct it.
+                #
+                # That matters most under the kill switch, whose entire promise
+                # is that resting orders are gone. Re-raise so the caller
+                # reports a cancel it could not confirm rather than claiming
+                # one it did not achieve.
+                if exc.status != 404:
                     raise
                 log.info(
-                    "order %s already gone at the exchange (%s); treating the "
-                    "cancel as done", order.id, exc.status,
+                    "order %s already gone at the exchange (404); treating the "
+                    "cancel as done", order.id,
                 )
 
         order.status = OrderStatus.CANCELED

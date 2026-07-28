@@ -13,7 +13,9 @@ import pytest
 
 from app.detectors.resolution_sniper import assess
 from app.detectors.stale_quote import (
+    BARRIER_SERIES,
     decisive_fair_price,
+    is_path_dependent,
     parse_spot,
     reference_is_fresh,
     reference_symbol_for,
@@ -30,6 +32,7 @@ class TestResolveStrike:
         v = resolve_strike(
             strike_type="greater", floor_strike=Decimal(60000),
             cap_strike=None, spot=Decimal(63000),
+            rules_primary=None,
         )
         assert v is not None and v.yes is True
         # Margin is relative to spot: how far spot must fall to reach the
@@ -40,6 +43,7 @@ class TestResolveStrike:
         v = resolve_strike(
             strike_type="greater", floor_strike=Decimal(60000),
             cap_strike=None, spot=Decimal(57000),
+            rules_primary=None,
         )
         assert v is not None and v.yes is False
 
@@ -47,6 +51,7 @@ class TestResolveStrike:
         v = resolve_strike(
             strike_type="greater", floor_strike=Decimal(60000),
             cap_strike=None, spot=Decimal(60000),
+            rules_primary=None,
         )
         assert v is not None and v.yes is False
         assert v.margin_pct == 0
@@ -55,6 +60,7 @@ class TestResolveStrike:
         v = resolve_strike(
             strike_type="greater_or_equal", floor_strike=Decimal(60000),
             cap_strike=None, spot=Decimal(60000),
+            rules_primary=None,
         )
         assert v is not None and v.yes is True
 
@@ -62,6 +68,7 @@ class TestResolveStrike:
         v = resolve_strike(
             strike_type="less", floor_strike=None,
             cap_strike=Decimal(60000), spot=Decimal(57000),
+            rules_primary=None,
         )
         assert v is not None and v.yes is True
 
@@ -69,6 +76,7 @@ class TestResolveStrike:
         v = resolve_strike(
             strike_type="between", floor_strike=Decimal(59000),
             cap_strike=Decimal(61000), spot=Decimal(60000),
+            rules_primary=None,
         )
         assert v is not None and v.yes is True
 
@@ -77,6 +85,7 @@ class TestResolveStrike:
         v = resolve_strike(
             strike_type="between", floor_strike=Decimal(59000),
             cap_strike=Decimal(61000), spot=Decimal(60900),
+            rules_primary=None,
         )
         assert v is not None
         assert v.margin_pct < Decimal(1)
@@ -85,6 +94,7 @@ class TestResolveStrike:
         v = resolve_strike(
             strike_type="between", floor_strike=Decimal(59000),
             cap_strike=Decimal(61000), spot=Decimal(62000),
+            rules_primary=None,
         )
         assert v is not None and v.yes is False
 
@@ -93,6 +103,7 @@ class TestResolveStrike:
         assert resolve_strike(
             strike_type="custom", floor_strike=Decimal(60000),
             cap_strike=None, spot=Decimal(63000),
+            rules_primary=None,
         ) is None
 
     def test_an_unknown_strike_type_is_refused(self) -> None:
@@ -100,18 +111,21 @@ class TestResolveStrike:
         assert resolve_strike(
             strike_type="somethingnew", floor_strike=Decimal(60000),
             cap_strike=None, spot=Decimal(63000),
+            rules_primary=None,
         ) is None
 
     def test_a_missing_boundary_is_refused(self) -> None:
         assert resolve_strike(
             strike_type="greater", floor_strike=None,
             cap_strike=None, spot=Decimal(63000),
+            rules_primary=None,
         ) is None
 
     def test_a_nonpositive_spot_is_refused(self) -> None:
         assert resolve_strike(
             strike_type="greater", floor_strike=Decimal(60000),
             cap_strike=None, spot=Decimal(0),
+            rules_primary=None,
         ) is None
 
 
@@ -126,6 +140,7 @@ class TestDecisiveFairPrice:
         v = resolve_strike(
             strike_type="greater", floor_strike=Decimal(60000),
             cap_strike=None, spot=Decimal("60120"),
+            rules_primary=None,
         )
         assert v is not None
         assert decisive_fair_price(v, min_margin_pct=Decimal(1)) is None
@@ -134,6 +149,7 @@ class TestDecisiveFairPrice:
         v = resolve_strike(
             strike_type="greater", floor_strike=Decimal(60000),
             cap_strike=None, spot=Decimal(66000),
+            rules_primary=None,
         )
         assert v is not None
         assert decisive_fair_price(v, min_margin_pct=Decimal(1)) == Decimal("0.98")
@@ -142,6 +158,7 @@ class TestDecisiveFairPrice:
         v = resolve_strike(
             strike_type="greater", floor_strike=Decimal(60000),
             cap_strike=None, spot=Decimal(54000),
+            rules_primary=None,
         )
         assert v is not None
         assert decisive_fair_price(v, min_margin_pct=Decimal(1)) == Decimal("0.02")
@@ -152,6 +169,7 @@ class TestDecisiveFairPrice:
         v = resolve_strike(
             strike_type="greater", floor_strike=Decimal(60000),
             cap_strike=None, spot=Decimal(120000),
+            rules_primary=None,
         )
         assert v is not None
         fair = decisive_fair_price(v, min_margin_pct=Decimal(1))
@@ -329,3 +347,176 @@ class TestReferenceSymbol:
 
     def test_the_series_is_the_segment_before_the_first_hyphen(self) -> None:
         assert reference_symbol_for("kxethd-26jul2706-t1969.99") == "ETH-USD"
+
+
+# ---------------------------------------------------------------------------
+# Barrier markets: right asset, wrong statistic
+#
+# `KXBTCMAXMON-BTC-26JUL31-7000000` is a live market whose structured fields
+# are indistinguishable from an ordinary level market — `strike_type:
+# "greater"`, `floor_strike: 70000` — and whose rules text says "is *ever
+# above* $70000.00". Its own title disagrees ("trimmed mean be above"), so the
+# title is no help either; only the rules carry the word that matters.
+#
+# P(max S_t > K) is not P(S_T > K), and the gap is the whole contract once the
+# barrier has been touched: spot back at 65,000 under a 70,000 barrier that
+# already printed is a market correctly quoted near 0.98, which a
+# terminal-value model prices at 0.02 and reports as +96c of edge — the
+# direction of maximum confidence and maximum wrongness.
+#
+# Same shape as the ETH-priced-against-BTC bug: every number arithmetically
+# correct, describing a different question.
+# ---------------------------------------------------------------------------
+
+
+class TestPathDependence:
+    #: The real rules text, from the live market.
+    LIVE_BARRIER_RULES = (
+        "If the price of BTC after issuance and through 11:59 PM ET on "
+        "Jul 31, 2026 is ever above $70000.00, then the market resolves to Yes."
+    )
+    #: An ordinary terminal-value market, for contrast.
+    LIVE_LEVEL_RULES = (
+        "If the price of BTC is above $70000.00 at 5pm ET on Jul 31, 2026, "
+        "then the market resolves to Yes."
+    )
+
+    def test_the_live_barrier_rules_are_path_dependent(self) -> None:
+        assert is_path_dependent(self.LIVE_BARRIER_RULES) is True
+
+    def test_the_live_level_rules_are_not(self) -> None:
+        """The veto must not fire on the markets this detector can price."""
+        assert is_path_dependent(self.LIVE_LEVEL_RULES) is False
+
+    @pytest.mark.parametrize(
+        "phrase",
+        [
+            "is ever above $70000.00",
+            "is ever below $50000.00",
+            "is ever at or above $70000.00",
+            "is ever at or below $50000.00",
+            "does the price ever reach $70000.00",
+            "if it ever trades above $70000.00",
+            "should the price ever exceed $70000.00",
+            "at any point during the month",
+            "at any time before expiration",
+            "the highest price of BTC during the window",
+            "the lowest price of BTC during the window",
+        ],
+    )
+    def test_each_barrier_phrase_is_caught(self, phrase: str) -> None:
+        assert is_path_dependent(f"Rules: {phrase}, then the market resolves.")
+
+    def test_matching_is_case_insensitive(self) -> None:
+        assert is_path_dependent("IS EVER ABOVE $70000.00")
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "The maximum payout is $1 per contract.",
+            "The minimum tick is $0.01.",
+            "Settles to the high of the day as reported by the exchange.",
+            "If the price of BTC is above $70000.00 at 5pm ET.",
+            "This market has a maximum of 1000 contracts per order.",
+        ],
+    )
+    def test_ordinary_settlement_prose_is_not_refused(self, text: str) -> None:
+        """Over-refusing is safe; a veto that fires on everything is the same
+        as no detector.
+
+        Bare "maximum"/"minimum"/"high of" would match all of these — which is
+        why the phrase list is deliberately specific.
+        """
+        assert is_path_dependent(text) is False
+
+    @pytest.mark.parametrize("value", [None, ""])
+    def test_missing_rules_are_not_treated_as_path_dependent(
+        self, value: str | None
+    ) -> None:
+        """`None` here means "no rules text", not "unknown shape".
+
+        The refusal that matters is `resolve_strike`'s, and a market with no
+        rules text is refused elsewhere on other grounds — making this True
+        would veto every market whose rules the catalog has not synced yet.
+        """
+        assert is_path_dependent(value) is False
+
+
+class TestBarrierMarketsAreRefused:
+    def test_resolve_strike_refuses_a_barrier(self) -> None:
+        """Even though every structured field says it is an ordinary
+        `greater` market comfortably clear of its strike."""
+        assert resolve_strike(
+            strike_type="greater",
+            floor_strike=Decimal(70000),
+            cap_strike=None,
+            spot=Decimal(65000),
+            rules_primary=TestPathDependence.LIVE_BARRIER_RULES,
+        ) is None
+
+    def test_the_same_market_without_the_barrier_wording_resolves(self) -> None:
+        """The contrast that makes the test above mean something: only the
+        rules text differs."""
+        verdict = resolve_strike(
+            strike_type="greater",
+            floor_strike=Decimal(70000),
+            cap_strike=None,
+            spot=Decimal(65000),
+            rules_primary=TestPathDependence.LIVE_LEVEL_RULES,
+        )
+        assert verdict is not None
+        assert verdict.yes is False
+
+    def test_the_veto_runs_before_the_structured_fields_are_read(self) -> None:
+        """A barrier with a strike type this function cannot evaluate anyway
+        still returns None — the refusal is not accidental."""
+        assert resolve_strike(
+            strike_type="between",
+            floor_strike=Decimal(60000),
+            cap_strike=Decimal(80000),
+            spot=Decimal(70000),
+            rules_primary=TestPathDependence.LIVE_BARRIER_RULES,
+        ) is None
+
+    def test_rules_primary_is_required_with_no_default(self) -> None:
+        """The fail-closed property.
+
+        A default of `None` would mean a caller that forgot the argument
+        silently gets barrier markets priced as terminal-value ones — which is
+        the entire bug this parameter exists to prevent.
+        """
+        with pytest.raises(TypeError):
+            resolve_strike(  # type: ignore[call-arg]
+                strike_type="greater",
+                floor_strike=Decimal(70000),
+                cap_strike=None,
+                spot=Decimal(65000),
+            )
+
+    def test_the_barrier_series_are_refused_a_reference_feed(self) -> None:
+        """Belt and braces behind the rules-text veto: no spot-versus-strike
+        comparison answers the question these markets ask, whatever their
+        `strike_type` says."""
+        assert (
+            reference_symbol_for("KXBTCMAXMON-BTC-26JUL31-7000000") is None
+        )
+
+    @pytest.mark.parametrize("series", sorted(BARRIER_SERIES))
+    def test_every_barrier_series_is_refused(self, series: str) -> None:
+        assert reference_symbol_for(f"{series}-BTC-26JUL31-7000000") is None
+
+    def test_the_barrier_series_would_otherwise_match_the_btc_prefix(self) -> None:
+        """Which is how they arrived in the detector in the first place.
+
+        `reference_symbol_for` is a *prefix* match on the series, so a series
+        nobody reviewed inherits a reference feed rather than being refused
+        until someone asserts one.
+        """
+        assert all(s.startswith("KXBTC") for s in BARRIER_SERIES)
+
+    def test_a_non_barrier_btc_series_still_resolves(self) -> None:
+        """The refusal is a named list, not a blanket."""
+        assert reference_symbol_for("KXBTCD-26JUL2706-T59699.99") == "BTC-USD"
+
+    def test_the_refusal_is_case_insensitive(self) -> None:
+        assert reference_symbol_for("kxbtcmaxmon-btc-26jul31-7000000") is None

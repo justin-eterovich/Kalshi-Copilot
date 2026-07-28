@@ -151,6 +151,8 @@ export interface TradingState {
   trading_mode: string;
   live_trading_armed: boolean;
   kill_switch: boolean;
+  /** `config.yaml` pins it on, so it cannot be released from the UI. */
+  kill_switch_config_floor?: boolean;
   credentials_present: boolean;
   /** simulated | demo_exchange | live_exchange, or null when refused. */
   execution_route: string | null;
@@ -168,6 +170,19 @@ export interface TradingState {
     portfolio_value_cents: number | null;
   };
   balance_error?: string;
+}
+
+/** What the emergency stop actually did. */
+export interface KillSwitchResult {
+  /** The state the server settled on — not the state that was requested. */
+  kill_switch: boolean;
+  /** True when `config.yaml` pins it on; a runtime release cannot clear it. */
+  config_floor: boolean;
+  canceled_orders: number;
+  canceled_order_ids: number[];
+  /** Orders the cancel could not reach. When this is non-empty it is the most
+   *  urgent thing on the screen: those orders are still live. */
+  failed_cancels: { order_id: number; error: string }[];
 }
 
 export interface TicketQuote {
@@ -199,10 +214,25 @@ export interface ProposalLeg {
   ticker: string;
   side: string;
   action: string;
+  /** The price on the **traded** side — 0.30 for "buy NO at 30¢". */
   limit_price: string;
   contracts: string;
   fair_price: string | null;
   est_fee_cents: string | null;
+  /**
+   * The literal wire form, which is what actually reaches the exchange.
+   *
+   * Kalshi quotes one book from the YES side, so "buy NO at 30¢" goes out as
+   * an **ask at 0.70**. Nothing downstream catches an inversion — the fee
+   * formula P(1-P) is symmetric, so a flipped direction produces the same
+   * fee, the same notional and a plausible confirmation — which makes the
+   * human reading this card the only guard there is.
+   *
+   * Optional because the API did not always send it; the card says so
+   * plainly rather than quietly showing one less check.
+   */
+  book_side?: string | null;
+  wire_price?: string | null;
 }
 
 export interface Proposal {
@@ -643,6 +673,17 @@ export const api = {
       reason: reason ?? null,
     }),
 
+  /**
+   * Engage or release the kill switch at runtime.
+   *
+   * Returns the state the server actually settled on plus how many resting
+   * orders it cancelled, so the UI reports what happened rather than what it
+   * asked for. Never assume the request succeeded — an emergency stop that
+   * *looks* engaged and is not is worse than no control at all.
+   */
+  killSwitch: (engaged: boolean) =>
+    postJson<KillSwitchResult>("/api/kill-switch", { engaged, confirm: true }),
+
   orders: (ticker?: string) =>
     getJson<{ orders: OrderRow[] }>(`/api/orders?${qs({ ticker, limit: 50 })}`),
 
@@ -673,41 +714,193 @@ export const api = {
 };
 
 // ---------------------------------------------------------------------------
-// Formatting. All input is a decimal string; none of it becomes a number
-// before display.
+// Formatting.
+//
+// Money arrives as a decimal string and is formatted by moving the decimal
+// point along the digits, not by parsing it into a JS number. The comment that
+// used to sit here claimed exactly that while the code beneath it did the
+// opposite, and that is how the canonical 1.75¢ fee — one contract at 50¢, the
+// number CLAUDE.md's units section exists to protect — reached the screen as
+// "$0.02", and a real billed fee of 0.04¢ as "$0.00".
+//
+// Two rules follow, and neither is cosmetic:
+//
+//   1. Rounding happens on the digit string, half-up. `Number()` survives only
+//      as a fallback for a payload this parser does not recognise (exponent
+//      notation, say), so an odd value still renders instead of vanishing.
+//   2. **A non-zero amount never renders as zero.** Precision is extended
+//      until a significant digit survives, down to the centicent ($0.0001)
+//      that the fee schedule rounds to. Money that rounds away to nothing is
+//      the one display error that only ever flatters.
 // ---------------------------------------------------------------------------
+
+interface Dec {
+  neg: boolean;
+  /** Integer digits, no leading zeros, never empty. */
+  int: string;
+  /** Fraction digits, possibly empty. */
+  frac: string;
+}
+
+const PLAIN_DECIMAL = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/;
+
+/** Cents are never shown finer than a centicent — nothing is billed finer. */
+const MAX_CENT_DP = 4;
+
+function parseDec(raw: string): Dec | null {
+  const s = raw.trim();
+  if (!PLAIN_DECIMAL.test(s)) return null;
+  const signed = s.charAt(0) === "+" || s.charAt(0) === "-";
+  const body = signed ? s.slice(1) : s;
+  const dot = body.indexOf(".");
+  const int = dot === -1 ? body : body.slice(0, dot);
+  const frac = dot === -1 ? "" : body.slice(dot + 1);
+  return {
+    neg: s.charAt(0) === "-",
+    int: int.replace(/^0+(?=\d)/, "") || "0",
+    frac,
+  };
+}
+
+/**
+ * Parse, falling back to `Number` for anything the strict grammar rejects.
+ *
+ * Postgres NUMERIC columns serialise as plain fixed-point, so the fallback
+ * should never fire on our own money. It exists so that a computed Decimal
+ * that came out as "1E-8" degrades to an approximate figure rather than a
+ * dash.
+ */
+function toDec(raw: string): Dec | null {
+  const strict = parseDec(raw);
+  if (strict) return strict;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
+  return parseDec(value.toFixed(8));
+}
+
+function isZero(d: Dec): boolean {
+  return !/[1-9]/.test(d.int + d.frac);
+}
+
+/** Move the decimal point `places` to the left. Negative shifts right. */
+function shift(d: Dec, places: number): Dec {
+  let digits = d.int + d.frac;
+  const point = d.int.length - places;
+  if (point > digits.length) digits += "0".repeat(point - digits.length);
+  const int = point > 0 ? digits.slice(0, point) : "0";
+  const frac = point > 0 ? digits.slice(point) : "0".repeat(-point) + digits;
+  return {
+    neg: d.neg,
+    int: int.replace(/^0+(?=\d)/, "") || "0",
+    frac,
+  };
+}
+
+/** Add one to a run of digits, carrying left. "099" -> "100". */
+function bumpDigits(digits: string): string {
+  const out = digits.split("");
+  let i = out.length - 1;
+  for (; i >= 0; i--) {
+    if (out[i] === "9") {
+      out[i] = "0";
+    } else {
+      out[i] = String(Number(out[i]) + 1);
+      break;
+    }
+  }
+  return i < 0 ? `1${out.join("")}` : out.join("");
+}
+
+/** Half-up rounding to `dp` fraction digits, on the digits themselves. */
+function round(d: Dec, dp: number): Dec {
+  if (d.frac.length <= dp) {
+    return { neg: d.neg, int: d.int, frac: d.frac.padEnd(dp, "0") };
+  }
+  const kept = d.int + d.frac.slice(0, dp);
+  const digits = d.frac.charAt(dp) >= "5" ? bumpDigits(kept) : kept;
+  const cut = digits.length - dp;
+  return { neg: d.neg, int: digits.slice(0, cut), frac: digits.slice(cut) };
+}
+
+/** Group the integer part in threes: "65264" -> "65,264". */
+function group(int: string): string {
+  return int.replace(/\B(?=(\d{3})+$)/g, ",");
+}
+
+function render(d: Dec, dp: number): string {
+  const r = round(d, dp);
+  const body = dp > 0 ? `${r.int}.${r.frac}` : r.int;
+  // No "-0.00": a signed zero is a nonsense figure and reads as a real one.
+  return r.neg && !isZero(r) ? `-${body}` : body;
+}
+
+/** Round to `dp`, going finer rather than letting a real amount read as zero. */
+function renderSignificant(d: Dec, dp: number, maxDp: number): string {
+  if (isZero(d)) return render(d, dp);
+  for (let p = dp; p < maxDp; p++) {
+    if (!isZero(round(d, p))) return render(d, p);
+  }
+  return render(d, maxDp);
+}
+
+/** True when the amount is real but finer than `maxDp` can show at all. */
+function tooSmall(d: Dec, maxDp: number): boolean {
+  return !isZero(d) && isZero(round(d, maxDp));
+}
+
+function trimZeros(text: string): string {
+  if (!text.includes(".")) return text;
+  return text.replace(/0+$/, "").replace(/\.$/, "");
+}
 
 /** Render a dollar-string price as cents, e.g. "0.4200" -> "42.0¢". */
 export function asCents(dollars: string | null | undefined, dp = 1): string {
-  if (dollars === null || dollars === undefined || dollars === "") return "—";
-  const value = Number(dollars) * 100;
-  if (!Number.isFinite(value)) return "—";
-  return `${value.toFixed(dp)}¢`;
+  const value = centsNum(dollars, dp);
+  return value === "—" ? value : `${value}¢`;
 }
 
 /** Bare cents number without the symbol, for dense table columns. */
 export function centsNum(dollars: string | null | undefined, dp = 1): string {
   if (dollars === null || dollars === undefined || dollars === "") return "—";
-  const value = Number(dollars) * 100;
-  if (!Number.isFinite(value)) return "—";
-  return value.toFixed(dp);
+  const d = toDec(dollars);
+  if (d === null) return "—";
+  return render(shift(d, -2), dp);
+}
+
+/**
+ * An amount that already arrived in cents, rendered in cents.
+ *
+ * This is the honest formatter for a fee: the schedule rounds to a centicent
+ * and one contract at 50¢ costs 1.75¢, which no dollars-with-two-decimals
+ * rendering can express.
+ */
+export function asCentsAmount(
+  cents: string | null | undefined,
+  dp = 2,
+): string {
+  if (cents === null || cents === undefined || cents === "") return "—";
+  const d = toDec(cents);
+  if (d === null) return "—";
+  if (tooSmall(d, MAX_CENT_DP)) return `${d.neg ? "-" : ""}<0.0001¢`;
+  return `${renderSignificant(d, dp, MAX_CENT_DP)}¢`;
 }
 
 /** Render a contract count compactly: 15234 -> "15.2k".
  *
- * Kalshi supports fractional contracts down to 0.01, so small sizes keep
- * their decimals — rounding 0.66 to "1" or 0.4 to "0" would misreport a real
- * print as nothing.
+ * Kalshi supports fractional contracts down to 0.01, so a fractional size
+ * keeps its decimals at every magnitude — rounding 0.66 to "1", 0.4 to "0" or
+ * a real 484.69-lot print to "485" all misreport what actually traded.
  */
 export function asCount(count: string | null | undefined): string {
   if (count === null || count === undefined || count === "") return "—";
-  const value = Number(count);
-  if (!Number.isFinite(value)) return "—";
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
-  if (value === 0) return "0";
-  if (value < 10 && !Number.isInteger(value)) return value.toFixed(2);
-  return value.toFixed(0);
+  const d = toDec(count);
+  if (d === null) return "—";
+  if (isZero(d)) return "0";
+  // `int` carries no leading zeros, so its length is the magnitude.
+  const magnitude = d.int === "0" ? 0 : d.int.length;
+  if (magnitude >= 7) return `${render(shift(d, 6), 1)}M`;
+  if (magnitude >= 4) return `${render(shift(d, 3), 1)}k`;
+  return trimZeros(render(d, 2));
 }
 
 /** Human-readable time until close. */
@@ -719,13 +912,38 @@ export function asTimeToClose(hours: number | null): string {
   return `${Math.round(hours / 24)}d`;
 }
 
-/** Render a cents-string as money: "5175.00" -> "$51.75". */
+function usd(d: Dec): string {
+  const r = round(d, 2);
+  const body = `$${group(r.int)}.${r.frac}`;
+  return r.neg && !isZero(r) ? `-${body}` : body;
+}
+
+/**
+ * Render a cents-string as money: "5175.00" -> "$51.75".
+ *
+ * **Under a dollar the figure is rendered in cents instead**, and that is the
+ * whole point of this function. Dollars-at-two-decimals cannot express what
+ * the exchange actually bills: a 1.75¢ fee came out as "$0.02" — the exact
+ * number CLAUDE.md's units section says is wrong — a 0.54¢ worst case as
+ * "$0.01", and a real 0.04¢ fee as "$0.00". The rule is one line: use the
+ * unit that can carry the value. Above a dollar the sub-cent tail is noise
+ * and dollars read better; below one, it is the value.
+ */
 export function asDollars(cents: string | null | undefined): string {
   if (cents === null || cents === undefined || cents === "") return "—";
-  const value = Number(cents) / 100;
-  if (!Number.isFinite(value)) return "—";
-  const sign = value < 0 ? "-" : "";
-  return `${sign}$${Math.abs(value).toFixed(2)}`;
+  const d = toDec(cents);
+  if (d === null) return "—";
+  // `int` carries no leading zeros, so a length of 2 or less is under 100¢.
+  if (!isZero(d) && d.int.length <= 2) return asCentsAmount(cents);
+  return usd(shift(d, 2));
+}
+
+/** Money that arrived already in dollars (the LLM budget, account balance). */
+export function asUsd(dollars: string | null | undefined): string {
+  if (dollars === null || dollars === undefined || dollars === "") return "—";
+  const d = toDec(dollars);
+  if (d === null) return "—";
+  return usd(d);
 }
 
 /** A cents figure with an explicit sign, for P&L and edges. */
@@ -734,9 +952,39 @@ export function asSignedCents(
   dp = 2,
 ): string {
   if (cents === null || cents === undefined || cents === "") return "—";
-  const value = Number(cents);
-  if (!Number.isFinite(value)) return "—";
-  return `${value >= 0 ? "+" : ""}${value.toFixed(dp)}¢`;
+  const d = toDec(cents);
+  if (d === null) return "—";
+  if (tooSmall(d, MAX_CENT_DP)) return `${d.neg ? "-" : "+"}<0.0001¢`;
+  const text = renderSignificant(d, dp, MAX_CENT_DP);
+  return `${text.startsWith("-") ? "" : "+"}${text}¢`;
+}
+
+/**
+ * Magnitude of a money string, still a string.
+ *
+ * A meter that fills with a loss wants the loss as a positive quantity;
+ * negating it through `Number` put a float round trip in front of a figure
+ * the operator reads as today's P&L.
+ */
+export function absCents(cents: string | null | undefined): string {
+  if (cents === null || cents === undefined || cents === "") return "0";
+  const d = toDec(cents);
+  if (d === null) return "0";
+  return d.frac ? `${d.int}.${d.frac}` : d.int;
+}
+
+/**
+ * Sign of a money string: -1, 0 or 1.
+ *
+ * For picking a CSS class, never for display. Zero is its own answer on
+ * purpose — a realised P&L of exactly zero rendered in the green reserved for
+ * gains, which it is not.
+ */
+export function moneySign(cents: string | null | undefined): -1 | 0 | 1 {
+  if (cents === null || cents === undefined || cents === "") return 0;
+  const d = toDec(cents);
+  if (d === null || isZero(d)) return 0;
+  return d.neg ? -1 : 1;
 }
 
 /** Human label for an execution route. */

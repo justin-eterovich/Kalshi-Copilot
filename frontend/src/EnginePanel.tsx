@@ -14,13 +14,27 @@
  * assumption nobody checked.
  */
 
-import type { EngineState } from "./api";
+import { asUsd, type EngineState, type ReferenceFeed } from "./api";
 
 function age(seconds: number | null): string {
   if (seconds === null) return "never";
   if (seconds < 90) return `${seconds.toFixed(0)}s ago`;
   if (seconds < 5400) return `${(seconds / 60).toFixed(0)}m ago`;
   return `${(seconds / 3600).toFixed(1)}h ago`;
+}
+
+/**
+ * Why this feed is or is not usable.
+ *
+ * "No feed — markets refused" used to be printed for both cases, including on
+ * a row showing a price and a source. Never having had an ETH price and
+ * holding an eight-hour-old BTC price are different problems with different
+ * fixes, and the row's own columns contradicted the sentence.
+ */
+function usability(f: ReferenceFeed): { text: string; cls: string } {
+  if (f.fresh) return { text: "fresh", cls: "up" };
+  if (f.price === null) return { text: "no feed — markets refused", cls: "muted" };
+  return { text: `stale ${age(f.age_sec)} — markets refused`, cls: "warn" };
 }
 
 export default function EnginePanel({ engine }: { engine: EngineState | null }) {
@@ -59,17 +73,23 @@ export default function EnginePanel({ engine }: { engine: EngineState | null }) 
             </tr>
           </thead>
           <tbody>
-            {engine.reference_feeds.map((f) => (
-              <tr key={f.symbol}>
-                <td className="mono">{f.symbol}</td>
-                <td className="num">{f.price ?? "—"}</td>
-                <td className="muted">{f.source ?? "—"}</td>
-                <td className="muted">{age(f.age_sec)}</td>
-                <td className={f.fresh ? "up" : "muted"}>
-                  {f.fresh ? "fresh" : "no feed — markets refused"}
-                </td>
-              </tr>
-            ))}
+            {engine.reference_feeds.map((f) => {
+              const usable = usability(f);
+              return (
+                <tr key={f.symbol}>
+                  <td className="mono">{f.symbol}</td>
+                  {/* A dollars-per-coin quantity, and the only money in the
+                      app that reached the screen unformatted — eight decimal
+                      places, in a column of cents. */}
+                  <td className="num" title={f.price ?? undefined}>
+                    {asUsd(f.price)}
+                  </td>
+                  <td className="muted">{f.source ?? "—"}</td>
+                  <td className="muted">{age(f.age_sec)}</td>
+                  <td className={usable.cls}>{usable.text}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>

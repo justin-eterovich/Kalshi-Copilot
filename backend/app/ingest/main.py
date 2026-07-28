@@ -141,9 +141,28 @@ async def _stream_loop(stop: asyncio.Event) -> None:
 
     if config.ingest.scanner.enabled:
         # Ticker-level coverage for everything else. Omitting market_tickers
-        # subscribes to all markets, which is exactly what the screener wants.
+        # subscribes to all markets, which is exactly what the screener wants:
+        # it ranks a market against the whole exchange, and a percentile
+        # computed over a subscribed subset is a percentile of that subset.
         ws.subscribe(["ticker"])
+        scanner = config.ingest.scanner
         log.info("scanner: ticker-level coverage for all markets")
+        if scanner.max_markets or scanner.series_filter:
+            # Said out loud because the config claims otherwise. Neither key is
+            # read by anything, so an operator who set `max_markets: 500` to
+            # cut ingest load still gets every market on the exchange — a
+            # setting that appears to work and does nothing is worse than one
+            # that is absent. Which side is wrong is an operator decision
+            # (subscribe narrowly, or delete the keys), so this reports rather
+            # than picking one.
+            log.warning(
+                "ingest.scanner.max_markets=%d and series_filter=%s are NOT "
+                "applied: the ticker channel is subscribed with no market "
+                "list, i.e. every market on the exchange. Nothing in the "
+                "backend reads either key.",
+                scanner.max_markets,
+                scanner.series_filter or "[]",
+            )
 
     flusher = asyncio.create_task(processor.run_flusher(stop))
     reporter = asyncio.create_task(_report_stats(processor, stop))
