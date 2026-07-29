@@ -468,6 +468,61 @@ export interface DetectorReport {
   unattributed: number;
 }
 
+/**
+ * One (detector, route) pair as the gate measured it.
+ *
+ * `ci_low_cents` is the field that decides anything — the bootstrap interval's
+ * lower bound. `mean_cents` is shown beside it and is never the basis for a
+ * decision: on a 20-trade binary sample the point estimate is the number that
+ * lies, which is the whole reason the verdict exists.
+ */
+export interface AutonomyPair {
+  detector: string;
+  route: string;
+  verdict: DetectorReport["verdict"];
+  trades: number;
+  ci_low_cents: string | null;
+  mean_cents: string;
+}
+
+export interface AutonomyEvidence {
+  computed_at: string;
+  min_trades: number;
+  coverage_usable: boolean;
+  coverage_refusals: string[];
+  pairs: AutonomyPair[];
+}
+
+/**
+ * Whether the machine may trade, and when it may not, why.
+ *
+ * `kill_switch` and `disarmed_reason` are **two different stops** and the panel
+ * must never blur them: the kill switch halts everything including manual
+ * approvals and cancels resting orders; the latch stops only the machine.
+ */
+export interface AutonomyState {
+  enabled: boolean;
+  env_armed: boolean;
+  live_armed: boolean;
+  routes: { simulated: boolean; demo_exchange: boolean; live_exchange: boolean };
+  kill_switch: boolean;
+  /** Non-null means latched off, and the string says what tripped it. */
+  disarmed_reason: string | null;
+  requires_manual_rearm: boolean;
+  min_proposal_age_sec: number;
+  decision_interval_sec: number;
+  /** Null until the worker's refresh loop has published one. */
+  evidence: AutonomyEvidence | null;
+  budget: {
+    max_trades_per_hour: number;
+    max_trades_per_detector_per_hour: number;
+    max_daily_risk_cents: number;
+    max_open_positions: number;
+    max_working_orders: number;
+    repeat_cooldown_sec: number;
+  };
+}
+
 export interface ReportCardResponse {
   min_trades: number;
   window_days: number;
@@ -708,6 +763,22 @@ export const api = {
   news: () => getJson<NewsState>("/api/news"),
 
   reportCard: () => getJson<ReportCardResponse>("/api/report-card"),
+
+  autonomy: () => getJson<AutonomyState>("/api/autonomy"),
+
+  /** Stop the machine. Confirmed but not typed — a stop must be fast. */
+  disarmAutonomy: () =>
+    postJson<{ disarmed: boolean; reason: string | null }>(
+      "/api/autonomy/disarm",
+      { confirm: true },
+    ),
+
+  /** Clear the latch. Typed, because resuming is never urgent. */
+  rearmAutonomy: (phrase: string) =>
+    postJson<{ disarmed: boolean; reason: string | null }>(
+      "/api/autonomy/rearm",
+      { confirm: true, phrase },
+    ),
 
   settlements: () =>
     getJson<{ settlements: SettlementRow[] }>("/api/settlements?limit=50"),

@@ -1,4 +1,5 @@
-import type { Health, SystemStatus } from "./api";
+import AutonomyPanel from "./AutonomyPanel";
+import type { AutonomyState, Health, SystemStatus } from "./api";
 
 /**
  * Build progress.
@@ -22,6 +23,7 @@ const MILESTONES: [string, string, boolean][] = [
   ["M7", "Weather engine", true],
   ["M8", "News + catalyst engine", true],
   ["M9", "Backtester + hardening", true],
+  ["M10", "Autonomy gate", true],
 ];
 
 function Row({ k, children }: { k: string; children: React.ReactNode }) {
@@ -49,10 +51,19 @@ function Pill({
 export default function SystemPanel({
   system,
   health,
+  autonomy,
+  onChanged,
 }: {
   system: SystemStatus | null;
   health: Health | null;
+  autonomy: AutonomyState | null;
+  onChanged: () => void;
 }) {
+  const machineArmed =
+    (autonomy?.enabled ?? false) &&
+    (autonomy?.env_armed ?? false) &&
+    Object.values(autonomy?.routes ?? {}).some(Boolean);
+
   return (
     <div>
       {/* The fee-unverified banner used to live here, on the third tab. It is
@@ -69,6 +80,8 @@ export default function SystemPanel({
       )}
 
       <div className="grid">
+        <AutonomyPanel state={autonomy} onChanged={onChanged} />
+
         <section className="panel">
           <h2>Services</h2>
           {health &&
@@ -102,6 +115,20 @@ export default function SystemPanel({
               <Row k="kill switch">
                 <Pill ok={!system.kill_switch} warn={system.kill_switch}>
                   {system.kill_switch ? "engaged" : "off"}
+                </Pill>
+              </Row>
+              {/* Repeated from the autonomy panel above on purpose. This is
+                  the card an operator scans for "is anything armed", and a
+                  posture summary that omits the one switch letting the system
+                  trade unattended is answering a different question than the
+                  one being asked of it. */}
+              <Row k="autonomous">
+                <Pill ok={!machineArmed} warn={machineArmed}>
+                  {machineArmed
+                    ? autonomy?.disarmed_reason
+                      ? "armed, latched off"
+                      : "ARMED"
+                    : "off"}
                 </Pill>
               </Row>
               <Row k="credentials">

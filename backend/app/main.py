@@ -12,13 +12,13 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api import ws
 from app.api.routes import health, markets, trading
-from app.detectors.base import enabled_detector_names
 from app.config import get_config
 from app.core.fees import load_fee_schedule
 from app.core.logging import configure_logging, get_logger
 from app.core.redis import close_redis
 from app.db.base import dispose_engine
 from app.db.bootstrap import init_db
+from app.detectors.base import enabled_detector_names
 from app.ingest.backfill import Backfiller
 from app.kalshi.client import build_rest_client
 from app.settings import get_settings

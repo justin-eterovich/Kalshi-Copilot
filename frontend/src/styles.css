@@ -1325,3 +1325,42 @@ h3.sub {
     width: auto;
   }
 }
+
+/* ---------------------------------------------------------------------------
+   Autonomy panel
+   ---------------------------------------------------------------------------
+   The panels are titled with h2 at 10px caps; the two stops inside the
+   autonomy panel need a rung below that so "Stop the machine" and "Kill
+   switch" read as siblings of each other rather than of the panel title. */
+.panel h3 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Autonomy answers "can this spend money without me", so it gets the full
+   width above the smaller status panels rather than a 260px column beside
+   them — the evidence table does not fit in one and the two stops must sit
+   side by side to be told apart. */
+.grid > .autonomy {
+  grid-column: 1 / -1;
+}
+
+/* The two stops. Separated rather than merely adjacent: they do different
+   things and an operator in a hurry must not read them as one control. */
+.autonomy .split > div {
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 10px 12px;
+}
+
+.autonomy .split .btn {
+  margin-top: 8px;
+}
+
+.autonomy .input {
+  margin: 6px 0;
+  width: 100%;
+}

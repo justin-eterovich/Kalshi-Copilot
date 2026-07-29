@@ -40,6 +40,10 @@ RUN pip install --upgrade pip && pip install '.[dev]'
 COPY backend/app ./app
 COPY backend/tests ./tests
 COPY scripts ./scripts
+# The shipped defaults. `config.yaml` is bind-mounted over the top at runtime
+# and is gitignored, so this is the only copy of the safe posture the image
+# has — and the one test_config.py asserts against inside the container.
+COPY config.example.yaml ./config.example.yaml
 COPY --from=frontend /build/dist ./frontend
 
 # Signature timestamps are validated server-side, so run as a normal user but
