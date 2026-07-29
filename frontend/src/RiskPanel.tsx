@@ -10,7 +10,13 @@
  * only for bar widths, where a rounded pixel count is the point.
  */
 
-import { absCents, asDollars, moneySign, type RiskResponse } from "./api";
+import {
+  absCents,
+  asClock,
+  asDollars,
+  moneySign,
+  type RiskResponse,
+} from "./api";
 
 /**
  * Parse a cents string for arithmetic.
@@ -103,9 +109,7 @@ export default function RiskPanel({ risk }: { risk: RiskResponse | null }) {
                 state.daily_net_cents,
               )}, at or past the daily loss limit. Clears at 00:00 UTC.`
             : `${state.consecutive_losses} consecutive losing closes. Cooling off until ${
-                state.cooldown_until
-                  ? new Date(state.cooldown_until).toLocaleTimeString()
-                  : "—"
+                state.cooldown_until ? asClock(state.cooldown_until) : "—"
               }.`}
         </div>
       )}

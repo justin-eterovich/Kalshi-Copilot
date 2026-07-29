@@ -46,16 +46,38 @@ body {
   min-height: 100%;
 }
 
+/* Wraps at every width, not only below 640px.
+   This was one non-wrapping row of a brand, three tabs, the kill switch and
+   up to four pills. Between the 640px breakpoint and roughly 900px it
+   overflowed and the overflow was simply clipped: at 768 the health pill —
+   the systemic up/down indicator, and the last child — was cut off at the
+   viewport edge. A status bar whose failure mode is dropping the status is
+   the wrong failure mode, so it wraps instead of overflowing at any width. */
 header.topbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 16px;
+  row-gap: 8px;
   padding: 10px 16px;
   background: var(--bg-panel);
   border-bottom: 1px solid var(--border);
   position: sticky;
   top: 0;
   z-index: 10;
+}
+
+/* The cluster wraps as a unit and stays right-aligned when it does, rather
+   than each pill breaking off on its own and leaving a ragged row. Its own
+   `flex-wrap` is the second line of defence: at a width where even the
+   cluster does not fit, the pills wrap inside it instead of being clipped. */
+.topbar-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px 10px;
+  margin-left: auto;
 }
 
 .brand {
@@ -331,9 +353,99 @@ input.input {
 
 /* ---- table --------------------------------------------------------- */
 
+/* Scroll affordance, not just scrollability.
+   `overflow-x: auto` alone made several tables silently incomplete. Measured:
+   the Positions table is 562px inside a 492px panel and the 70px it hides is
+   exactly the `fees paid` column — the one carrying the caveat on the number
+   next to it. At 768px the screener hides `attention` and `closes` the same
+   way. Overlay scrollbars are invisible until you already know to scroll, so
+   the operator saw a complete-looking table that was not one.
+
+   **The edge marker lightens; it does not shadow.** The first version used a
+   black shadow at 0.5 alpha, which is the reflex from light UIs and is
+   arithmetically doomed here: black over the `#101010` panel lands on #080808,
+   a difference of exactly 8 of 255 — which is what it pixel-sampled at, and
+   is invisible. A near-black ground has sixteen levels of headroom downwards
+   and two hundred and thirty-nine upwards. So the edge is a light wash plus a
+   2px bright rule, both landing near `--border-bright` (#333), which is a
+   value this palette already uses for a visible boundary.
+
+   It also must not depend on the scrollbar. `::-webkit-scrollbar` with an
+   explicit height is kept below because it opts desktop Chromium out of
+   overlay mode, but it reserved 0px in the headless harness and may reserve
+   0px elsewhere, so it is a bonus and never the signal.
+
+   The show/hide is the two-layer background trick: the panel-coloured cover
+   gradients are attached `local` and scroll WITH the content, sliding over the
+   markers, which are attached `scroll` and pinned to the box. At either end
+   the cover lands on the marker and it disappears. No JS, no resize observer,
+   correct on first paint. The covers are 44px against 20px of marker and hold
+   full opacity for their first 40%, because a cover the same width as what it
+   hides only ever half-hides it.
+
+   The rgba() literals must track --bg-panel; a named `transparent` fades
+   through black in some engines and reads as a smudge. */
 .table-scroll {
   overflow-x: auto;
   border: 1px solid var(--border);
+  background:
+    /* covers */
+    linear-gradient(to right, #101010 40%, rgba(16, 16, 16, 0)) left center,
+    linear-gradient(to left, #101010 40%, rgba(16, 16, 16, 0)) right center,
+    /* hard rule at the very edge */
+    linear-gradient(var(--border-bright), var(--border-bright)) left center,
+    linear-gradient(var(--border-bright), var(--border-bright)) right center,
+    /* soft wash inward */
+    linear-gradient(to right, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0))
+      left center,
+    linear-gradient(to left, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0))
+      right center;
+  background-repeat: no-repeat;
+  background-size:
+    44px 100%,
+    44px 100%,
+    2px 100%,
+    2px 100%,
+    20px 100%,
+    20px 100%;
+  background-attachment: local, local, scroll, scroll, scroll, scroll;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-bright) var(--bg);
+}
+
+/* Note: `.table th` keeps its own `--bg-raised` fill, so the wash shows down
+   the body rows and not across the header band. That is deliberate — the
+   header/body contrast is load-bearing on a dense grid, and the marker is
+   already unmistakable over the rows, which is where the hidden content is.
+   Do not clear the header background to "finish" the gradient. */
+
+.table-scroll::-webkit-scrollbar,
+.audit-json::-webkit-scrollbar,
+.audit-text::-webkit-scrollbar,
+.legs::-webkit-scrollbar {
+  height: 9px;
+  width: 9px;
+}
+
+.table-scroll::-webkit-scrollbar-track,
+.audit-json::-webkit-scrollbar-track,
+.audit-text::-webkit-scrollbar-track,
+.legs::-webkit-scrollbar-track {
+  background: var(--bg);
+}
+
+.table-scroll::-webkit-scrollbar-thumb,
+.audit-json::-webkit-scrollbar-thumb,
+.audit-text::-webkit-scrollbar-thumb,
+.legs::-webkit-scrollbar-thumb {
+  background: var(--border-bright);
+}
+
+.table-scroll::-webkit-scrollbar-thumb:hover,
+.audit-json::-webkit-scrollbar-thumb:hover,
+.audit-text::-webkit-scrollbar-thumb:hover,
+.legs::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
 }
 
 .table {
@@ -517,6 +629,54 @@ a {
   font-size: 10px;
   margin-top: 3px;
   font-variant-numeric: tabular-nums;
+}
+
+/* ---- which quote is the tradeable one -------------------------------
+   This headline and the ladder below it read two different feeds and can
+   disagree by several cents on one page load, with both previously labelled
+   as current. Neither is a bug — the summary quote is what the exchange is
+   publishing, and reconciling it server-side would mean storing a number
+   Kalshi never sent — so the UI's job is to stop them speaking with one
+   voice. The header names its feed; the book says it is the tradeable one.
+
+   Amber, and the same `crossed` word the screener uses, deliberately: an
+   operator who learned that flag on the screener should not have to learn a
+   second visual language here. */
+.quote-source {
+  font-size: 10px;
+  margin-top: 4px;
+  color: var(--text-faint);
+  letter-spacing: 0.03em;
+}
+
+.quote-source strong {
+  color: var(--text-dim);
+  font-weight: 500;
+}
+
+/* `null` is not `false`: one side of the quote is missing, so it was never
+   checked for crossing. Muted rather than amber — unknown is not a warning. */
+.quote-flag {
+  margin-left: 6px;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+/* Sits directly above the ladder, because that is the panel being read at the
+   moment the two numbers disagree. */
+.quote-source-note {
+  font-size: 11px;
+  margin: 0 0 8px;
+  padding-left: 7px;
+  border-left: 2px solid var(--border-bright);
+}
+
+.quote-source-note strong {
+  color: var(--text-dim);
+  font-weight: 500;
 }
 
 .up {
@@ -723,6 +883,31 @@ a {
   color: var(--text-dim);
 }
 
+.score-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Small words, not colour alone.
+   Colour is never the sole carrier of meaning here (an operator may not see
+   it, and amber on a dense numeric grid is easy to skim past), so a crossed
+   book and a book with no bid each say so in a word. Both are amber because
+   both mean "this number is not describing a market you can trade", which is
+   a caution and not an error. */
+.crossed-flag,
+.score-flag {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--warn);
+  white-space: nowrap;
+}
+
+.crossed-flag {
+  margin-left: 6px;
+}
+
 .table tr.self td {
   background: var(--bg-raised);
   color: var(--text);
@@ -785,6 +970,24 @@ a {
 .ticket .field .input {
   width: 100%;
   min-width: 0;
+}
+
+/* The seeded limit price came from the summary quote, and that quote is
+   crossed. Amber, not red: the ticket still works and nothing is refused —
+   this is "check the book first", not a failure. */
+.ticket-warn {
+  margin: 0 0 10px;
+  padding: 6px 8px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-dim);
+  background: var(--bg);
+  border-left: 2px solid var(--warn);
+}
+
+.ticket-warn strong {
+  color: var(--warn);
+  font-weight: 500;
 }
 
 .ticket-seg {
@@ -950,12 +1153,87 @@ a {
    ellipsis ate precisely the part that mattered, every time, with no title
    attribute and no way to reach the rest. The same class truncated the audit
    trail's payload column, where the whole point is a record you can read. */
+/* A floor, because this is the only column in its table that can give.
+   The detector-signals table is nine columns, eight of them `nowrap`. Auto
+   table layout squeezes whatever is compressible before it will overflow, and
+   `overflow-wrap: anywhere` above puts this cell's *min-content* width at a
+   single character — so the browser believed 41px was a legal width for a
+   207-character rationale. Measured: below ~1100px this column went 228x123
+   to 41x1063 and the page went from 24,952px to 59,591px, most of it blank
+   with isolated floating text.
+
+   220px is deliberately just under the 228px the column gets at 1440, so
+   nothing changes at full width; below that the table stops collapsing and
+   scrolls sideways inside `.table-scroll` instead, which is what the rest of
+   this file already does with wide content. */
 .audit-detail {
   color: var(--text-faint);
   font-size: 11px;
+  min-width: 220px;
   max-width: 520px;
   white-space: normal;
   overflow-wrap: anywhere;
+}
+
+/* And a ceiling, so no single rationale can own the page.
+   A `max-height` on a `<td>` is ignored, so the cap has to live on a block
+   inside it — same shape as `.audit-json` below. Capped, not truncated: the
+   caveat that stops a score of 99.4 being read as a 99.4% chance sits at the
+   END of the rationale, so it has to stay reachable. 13em clears the ~123px a
+   typical rationale occupies, so only a genuinely long one scrolls. */
+.audit-text {
+  /* Belt and braces on the floor above. A block child's min-width feeds the
+     column's min-content contribution directly, which does not depend on how
+     the table layout algorithm chooses to read `min-width` on a `<td>`. Kept
+     under the cell's 220px so the two cannot fight. */
+  min-width: 200px;
+  max-height: 13em;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-bright) var(--bg);
+}
+
+/* Indented JSON, nothing hidden.
+   `white-space: pre-wrap` so long string values wrap instead of forcing the
+   audit table wider than the page, and a capped height so one 40-line
+   payload cannot push every row after it below the fold. Capped, not
+   truncated — the overflow scrolls and the scrollbar is drawn (see
+   `.table-scroll` above for why that distinction matters here). */
+.audit-json {
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  /* Same floor as `.audit-text`, same reason: `overflow-wrap: anywhere` puts
+     this block's min-content width at one character, so without it the audit
+     trail's payload column is one `nowrap` sibling away from the collapse
+     that hit the detector-signals table. */
+  min-width: 200px;
+  max-height: 14em;
+  overflow: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-bright) var(--bg);
+}
+
+/* One folded run of repeated proposals in Recent decisions. */
+.decision-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* Deliberately not `.muted`: this line is the only thing saying that one card
+   stands for forty, so it has to survive the 0.55 opacity the decided card
+   next to it wears. */
+.repeat-note {
+  margin: 0;
+  padding: 3px 7px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-dim);
+  background: var(--bg);
+  border-left: 2px solid var(--warn);
 }
 
 /* Legs of a multi-leg proposal. Shown in full because approving a set
@@ -970,6 +1248,8 @@ a {
   background: var(--bg);
   margin-bottom: 8px;
   overflow-x: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-bright) var(--bg);
 }
 
 .legs-head {
@@ -1191,10 +1471,25 @@ h3.sub {
    sideways. Wide content scrolls inside its own container instead.
    ========================================================================== */
 
-/* No tablet tier on purpose. Between roughly 640px and 1100px the auto-fit
-   grids already do the right thing — `.split-3` drops to two columns because
-   three would be under its 300px minimum — and an explicit breakpoint there
-   would only override a correct answer with a worse one. */
+/* No tablet tier — but this comment used to claim more than that, and the
+   part it claimed was wrong.
+
+   What is still true: between roughly 640px and 1100px the auto-fit *grids*
+   do degrade on their own, because `.split-3` drops to two columns when three
+   would breach its 300px minimum. An explicit breakpoint for them would only
+   override a correct answer with a worse one.
+
+   What was false: "the auto-fit grids already do the right thing" was read as
+   covering the whole layout, and tables are not grids. A table with eight
+   `nowrap` columns and one wrappable one has exactly one place to give, and
+   auto table layout will squeeze it to its min-content width — one character,
+   where `overflow-wrap: anywhere` is set — before it will overflow. The
+   detector-signals rationale measured 41px wide and 1063px tall at 768,
+   taking `/trades` from 24,952px to 59,591px.
+
+   The fix is a `min-width` floor on `.audit-detail`, not a breakpoint,
+   because that column must not collapse at ANY width — including the ones
+   between the breakpoints, which is exactly where this went unnoticed. */
 
 @media (max-width: 640px) {
   body {
@@ -1213,6 +1508,14 @@ h3.sub {
      the space the wrapped items need. */
   .spacer {
     display: none;
+  }
+
+  /* Same reasoning for the cluster's own `margin-left: auto`: on a phone the
+     status wraps under a left-aligned brand, and right-aligning it there just
+     puts a gap down the middle of a 390px screen. */
+  .topbar-status {
+    margin-left: 0;
+    justify-content: flex-start;
   }
 
   main {
@@ -1251,6 +1554,11 @@ h3.sub {
     max-width: 150px;
   }
 
+  /* The `max-width` goes; the `min-width` stays. They are opposite hazards:
+     a fixed max-width wider than the viewport pushes the body sideways, while
+     the min-width stops the column collapsing to one character. It is
+     contained by `.table-scroll`'s `overflow-x`, so it never reaches the
+     body. Do not "simplify" this to `width: auto`. */
   .audit-detail {
     max-width: none;
   }

@@ -41,6 +41,16 @@ import { useLiveFeed } from "./useLiveFeed";
 
 const WORKING = new Set(["pending", "resting", "partially_filled"]);
 
+/** A run of identical decided proposals, shown as one card plus a count. */
+interface DecisionGroup {
+  /** The most recent of the run — the one actually rendered. */
+  lead: Proposal;
+  count: number;
+  /** When the run started, so "×47" reads as a duration and not a mystery. */
+  since: string | null;
+  sinceMs: number;
+}
+
 function Empty({ children }: { children: React.ReactNode }) {
   return <p className="muted">{children}</p>;
 }
@@ -68,6 +78,39 @@ function evidenceScore(evidence: Record<string, unknown> | null): string {
   return "—";
 }
 
+/**
+ * One sentence about detector state, from `/api/system` rather than from a
+ * string literal.
+ *
+ * `null` is "not known yet" and stays silent on purpose: the bug being fixed
+ * here was copy that asserted a state it had not checked, and asserting the
+ * opposite state without checking is the same bug.
+ *
+ * `/api/system` reports `enabled_detector_names(config)`, the wide list —
+ * the one that includes the weather engine, which is enabled outside the
+ * `detectors:` block and is invisible to `DetectorsConfig.enabled_names()`.
+ */
+function DetectorNote({ names }: { names: string[] | null }) {
+  if (names === null) return null;
+  if (names.length === 0) {
+    return (
+      <>
+        {" "}
+        No detector is enabled right now — turn them on one at a time in{" "}
+        <code>config.yaml</code> and let the report card earn your trust first.
+      </>
+    );
+  }
+  return (
+    <>
+      {" "}
+      {names.length} detector{names.length === 1 ? " is" : "s are"} enabled (
+      <span className="mono">{names.join(", ")}</span>) — they propose only
+      when they find an edge that survives fees, and most scans find none.
+    </>
+  );
+}
+
 /** Trader-language view of a signed position: "12.00" NO, not "-12.00". */
 function heldSide(netContracts: string): { size: string; side: string } {
   const negative = netContracts.trim().startsWith("-");
@@ -90,6 +133,23 @@ export default function Trades() {
   const [engine, setEngine] = useState<EngineState | null>(null);
   const [news, setNews] = useState<NewsState | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  /**
+   * Which detectors are actually running.
+   *
+   * Two empty states on this page told the operator "detectors ship
+   * disabled" unconditionally, while the Recent Decisions panel a few
+   * hundred pixels below filled with live proposals from those same
+   * detectors. The shipped default is not the current state, and copy that
+   * asserts one as the other is the failure mode CLAUDE.md warns about — a
+   * comment that is load-bearing right up until it is wrong.
+   *
+   * Fetched once, not on the 3s poll: enablement comes from `config.yaml`,
+   * which is read at boot, so it cannot change while this page is open.
+   * `null` means "not yet known" and says nothing either way — an empty
+   * array would claim "none enabled", which is a different fact.
+   */
+  const [detectors, setDetectors] = useState<string[] | null>(null);
 
   // Null until the first poll lands — an empty set here would be read as "the
   // queue was empty last time" and would swallow the first alert.
@@ -142,6 +202,13 @@ export default function Trades() {
     return () => clearInterval(id);
   }, [load]);
 
+  useEffect(() => {
+    api
+      .system()
+      .then((s) => setDetectors(s.enabled_detectors))
+      .catch(() => setDetectors(null));
+  }, []);
+
   // Leaving the page must clear the badge; a stale "(3)" in the tab strip is
   // worse than none, because it is the thing being trusted at a glance.
   useEffect(() => () => setBadge(0), []);
@@ -173,10 +240,45 @@ export default function Trades() {
     () => proposals.filter((p) => p.status === "pending"),
     [proposals],
   );
-  const decided = useMemo(
-    () => proposals.filter((p) => p.status !== "pending").slice(0, 20),
-    [proposals],
-  );
+  /**
+   * Decided proposals, folded by (source, market, shape, outcome).
+   *
+   * A detector re-derives the same edge on every scan, so an undecided
+   * proposal expiring on its TTL is immediately followed by an identical one
+   * — the re-proposal loop CLAUDE.md documents under Autonomy. Unfolded, this
+   * panel was hundreds of visually identical `expired` cards and most of a
+   * 24,000px page, which is how the *interesting* rows — an approval, a
+   * rejection — got buried under the boring ones.
+   *
+   * Folding is display only. Nothing is dropped from the audit trail, the
+   * repeat count is shown rather than hidden, and pending proposals are
+   * excluded before the fold ever runs: a decision that is still waiting on a
+   * human must never be collapsed into another card. Status is part of the
+   * key for the same reason — an `approved` never folds into an `expired`.
+   */
+  const decided = useMemo(() => {
+    const groups = new Map<string, DecisionGroup>();
+    for (const p of proposals) {
+      if (p.status === "pending") continue;
+      const key = `${p.source}|${p.ticker}|${p.leg_count}|${p.status}`;
+      const at = p.created_at ? Date.parse(p.created_at) : NaN;
+      const group = groups.get(key);
+      if (!group) {
+        groups.set(key, { lead: p, count: 1, since: p.created_at, sinceMs: at });
+        continue;
+      }
+      group.count += 1;
+      // Ids are monotonic, so the highest is the most recent.
+      if (p.id > group.lead.id) group.lead = p;
+      if (!Number.isNaN(at) && (Number.isNaN(group.sinceMs) || at < group.sinceMs)) {
+        group.since = p.created_at;
+        group.sinceMs = at;
+      }
+    }
+    // Insertion order is API order, which is newest-first, so the most
+    // recently active group stays at the top.
+    return [...groups.values()].slice(0, 20);
+  }, [proposals]);
   const working = useMemo(
     () => orders.filter((o) => WORKING.has(o.status)),
     [orders],
@@ -266,9 +368,8 @@ export default function Trades() {
         {pending.length === 0 ? (
           <Empty>
             Nothing awaiting a decision. Open a market and use the trade ticket
-            to queue one. Detectors ship disabled — enable them one at a time
-            in <code>config.yaml</code> and let the report card earn your trust
-            before the queue fills itself.
+            to queue one.
+            <DetectorNote names={detectors} />
           </Empty>
         ) : (
           <div className="approvals">
@@ -351,13 +452,33 @@ export default function Trades() {
                     <th className="num">size</th>
                     <th className="num">avg ¢</th>
                     <th className="num">unreal.</th>
-                    <th className="num">real.</th>
+                    {/* Labelled gross, because it is.
+                        `realized_pnl_cents` is booked only when a fill
+                        *reduces* a position, priced against avg_price; fees
+                        are booked on *every* fill, including ones that only
+                        open. The two therefore count different sets of fills
+                        and `real. − fees` is not a net figure for this
+                        position — it would charge a still-open position's
+                        entry fees against a closed one's proceeds. The old
+                        header said "subtract it from realised", which was
+                        arithmetic the operator should not perform.
+                        A genuinely net per-position figure is a backend
+                        change, not something to fake in the browser. */}
+                    <th
+                      className="num"
+                      title="Realised P&amp;L from price movement only, GROSS of fees — see the note under this table for why it is not netted here."
+                    >
+                      real. (gross)
+                    </th>
                     {/* Hard constraint: every P&L shown must be net of fees.
                         This column was declared, returned by the API and
                         rendered by nothing, so a position 21¢ down on fees
                         read as 6/100ths of a cent down. */}
-                    <th className="num" title="already spent — subtract it from realised">
-                      fees
+                    <th
+                      className="num"
+                      title="Every fee this book has paid on this market, opening fills included. Not a correction to the realised column — the two count different fills."
+                    >
+                      fees paid
                     </th>
                   </tr>
                 </thead>
@@ -391,6 +512,26 @@ export default function Trades() {
                 </tbody>
               </table>
             </div>
+          )}
+          {positions.length > 0 && (
+            /* The fees column is the last of seven and lives past the right
+               edge of this panel at common widths, so the caveat has to be
+               stated in prose too — a tooltip on a header nobody can see is
+               not a disclosure. (`.table-scroll` now shows a scrollbar and a
+               fade, so the column is at least reachable.) */
+            <p className="muted" style={{ marginTop: 8 }}>
+              <strong>real.</strong> is gross of fees, and{" "}
+              <strong>fees paid</strong> is not its correction. A fee is
+              charged the instant a fill happens — including fills that only{" "}
+              <em>open</em> a position — while realised P&amp;L is booked only
+              when a fill <em>reduces</em> one. Subtracting one column from the
+              other charges a still-open position's entry fees against a closed
+              position's proceeds, so this panel does not do it and neither
+              should you. The net figures the system does compute are{" "}
+              <strong>Risk → today's realised P&amp;L after fees</strong> above
+              (portfolio-wide, per UTC day) and the report card's per-detector
+              expectancy below.
+            </p>
           )}
         </section>
       </div>
@@ -438,18 +579,33 @@ export default function Trades() {
         </section>
 
         <section className="panel">
-          <h2>Recent decisions</h2>
+          <div className="panel-head">
+            <h2>Recent decisions</h2>
+            <span className="muted">
+              repeats folded — a detector re-proposes the same edge every scan
+            </span>
+          </div>
           {decided.length === 0 ? (
             <Empty>No decisions recorded yet.</Empty>
           ) : (
             <div className="approvals compact">
-              {decided.map((p) => (
-                <ApprovalCard
-                  key={p.id}
-                  proposal={p}
-                  state={state}
-                  onDecided={load}
-                />
+              {decided.map((g) => (
+                <div key={g.lead.id} className="decision-group">
+                  <ApprovalCard
+                    proposal={g.lead}
+                    state={state}
+                    onDecided={load}
+                  />
+                  {g.count > 1 && (
+                    <p className="repeat-note">
+                      ×{g.count} identical — same market, same source, same
+                      outcome
+                      {g.since ? `, since ${asClock(g.since)}` : ""}. Showing
+                      the most recent; every one is still its own row in the
+                      audit trail.
+                    </p>
+                  )}
+                </div>
               ))}
             </div>
           )}
@@ -538,8 +694,8 @@ export default function Trades() {
         </div>
         {signals.length === 0 ? (
           <Empty>
-            Nothing yet. Detectors ship disabled; enable one at a time in{" "}
-            <code>config.yaml</code> and let the report card earn your trust.
+            Nothing recorded yet.
+            <DetectorNote names={detectors} />
           </Empty>
         ) : (
           <div className="table-scroll">
@@ -612,7 +768,11 @@ export default function Trades() {
                         the rationale, so an ellipsis always ate exactly the
                         part that mattered. */}
                     <td className="audit-detail" title={sg.rationale ?? undefined}>
-                      {sg.rationale}
+                      {/* The inner block exists to carry a height cap: a
+                          `max-height` on a `<td>` is ignored by the table
+                          layout algorithm, so it has to sit on a block child.
+                          Same shape as `.audit-json` in the audit trail. */}
+                      <div className="audit-text">{sg.rationale}</div>
                     </td>
                   </tr>
                 ))}
@@ -660,9 +820,24 @@ export default function Trades() {
                     <td className="mono">{entry.ticker ?? "—"}</td>
                     <td>{entry.actor}</td>
                     {/* An append-only record you cannot read is not a record.
-                        This column was ellipsised to one line. */}
+                        This column was ellipsised to one line.
+
+                        Indented rather than dumped on one: a five-leg
+                        proposal's wire form is the record most worth reading
+                        and was the least readable — one unbroken string the
+                        operator had to parse character by character to check
+                        a side against a price. Nothing is truncated or
+                        collapsed; the `<pre>` is capped in height and scrolls
+                        so a 40-line payload cannot push the next row off the
+                        screen. */}
                     <td className="audit-detail">
-                      {entry.payload ? JSON.stringify(entry.payload) : ""}
+                      {entry.payload ? (
+                        <pre className="audit-json">
+                          {JSON.stringify(entry.payload, null, 2)}
+                        </pre>
+                      ) : (
+                        ""
+                      )}
                     </td>
                   </tr>
                 ))}

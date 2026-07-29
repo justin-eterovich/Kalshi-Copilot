@@ -31,6 +31,7 @@ import { useState } from "react";
 import {
   api,
   asCentsAmount,
+  asClock,
   asSignedCents,
   routeLabel,
   type AutonomyPair,
@@ -320,7 +321,12 @@ export default function AutonomyPanel({
           <h2>Evidence</h2>
           {ev && (
             <span className="muted">
-              measured {new Date(ev.computed_at).toLocaleTimeString()}
+              {/* `asClock`, not a raw `toLocale*`: the evidence age is the
+                  one thing on this panel that says whether the gate is
+                  looking at a live report card or a dead worker's last one,
+                  and a formatter that throws would take it — and the rest of
+                  the panel — off the page entirely. */}
+              measured {asClock(ev.computed_at)}
             </span>
           )}
         </div>
