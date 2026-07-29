@@ -878,6 +878,31 @@ Add new keys to **both**: one added only to `config.yaml` never reaches a
 fresh clone, and one added only to the template is never exercised against a
 real boot. A test compares the two key sets and names anything that drifts.
 
+> **Back up `config.yaml` before switching branches.**
+>
+> ```bash
+> cp config.yaml config.yaml.bak
+> ```
+>
+> Being gitignored does **not** protect it. `.gitignore` only stops git
+> *tracking* a file — it does not stop a checkout writing over one. Every
+> branch from before the split still tracks `config.yaml`, so
+> `git checkout <older-branch>` silently replaces your live config with that
+> branch's copy, and a later `git pull` through the commit that removes it
+> deletes the file outright.
+>
+> This happened, once, on the merge that introduced the split. It was
+> recoverable only because the containers were still running and still had the
+> deleted file bind-mounted:
+>
+> ```bash
+> docker compose exec -T api cat /app/config.yaml > config.yaml
+> ```
+>
+> With the stack down there is no copy anywhere, and the fallback is rebuilding
+> your settings from `config.example.yaml` by hand. The hazard lasts until
+> every branch you still care about has the split merged in.
+
 **All detectors ship disabled.** Enable them one at a time and let the report
 card earn your trust before it earns your money.
 
