@@ -208,10 +208,24 @@ export default function SystemPanel({
               </li>
             ))}
           </ul>
+          {/* Gated on the real list, like the Detectors panel above already
+              was. This footnote said "every detector ships disabled"
+              unconditionally, directly below that panel showing six of them
+              ON — the shipped default described as if it were current state.
+              A status surface that contradicts itself on the same screen
+              teaches the operator to stop reading it. */}
           <p className="muted" style={{ marginTop: 8 }}>
-            Built and tested is not the same as running: every detector ships
-            disabled, and several engines need history before they price
-            anything.
+            Built and tested is not the same as running:{" "}
+            {system && system.enabled_detectors.length > 0 ? (
+              <>
+                {system.enabled_detectors.length} detector
+                {system.enabled_detectors.length === 1 ? " is" : "s are"}{" "}
+                enabled above
+              </>
+            ) : (
+              <>every detector ships disabled</>
+            )}
+            , and several engines need history before they price anything.
           </p>
         </section>
       </div>

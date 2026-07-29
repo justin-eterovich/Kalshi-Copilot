@@ -15,7 +15,16 @@
  */
 
 import { Link } from "react-router-dom";
-import { asUsd, type CatalystRow, type NewsState } from "./api";
+// `asClock`/`asDateTime` rather than raw `Date#toLocale*`: an invalid default
+// locale makes those throw, and a formatter that throws during render takes
+// the whole panel with it. See the note on `asClock` in api.ts.
+import {
+  asClock,
+  asDateTime,
+  asUsd,
+  type CatalystRow,
+  type NewsState,
+} from "./api";
 
 function countdown(minutes: number): string {
   if (minutes <= 0) return "closed";
@@ -88,14 +97,14 @@ export default function NewsPanel({ news }: { news: NewsState | null }) {
                     <td>{c.label}</td>
                     <td className="num muted">{c.market_count}</td>
                     <td className="muted">
-                      {new Date(c.close_time).toLocaleString()}
+                      {asDateTime(c.close_time)}
                     </td>
                     <td className={c.actionable ? "num warn" : "num muted"}>
                       {countdown(c.minutes_to_close)}
                     </td>
                     <td className="muted">
                       {c.expected_release
-                        ? new Date(c.expected_release).toLocaleTimeString()
+                        ? asClock(c.expected_release)
                         : "—"}
                     </td>
                     <td className={s.cls}>{s.text}</td>
@@ -153,7 +162,7 @@ export default function NewsPanel({ news }: { news: NewsState | null }) {
               {news.headlines.map((h) => (
                 <tr key={`${h.source}-${h.title}-${h.published_at}`}>
                   <td className="muted" title={h.published_at}>
-                    {new Date(h.published_at).toLocaleString()}
+                    {asDateTime(h.published_at)}
                   </td>
                   <td className="mono">{h.source}</td>
                   <td className="audit-detail">

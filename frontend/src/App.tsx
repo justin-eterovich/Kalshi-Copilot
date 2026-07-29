@@ -103,34 +103,42 @@ export default function App() {
 
         <span className="spacer" />
 
-        {/* The emergency stop belongs where it is reachable from every page,
-            not on the third tab. It reads the server's state and never its
-            own optimism. */}
-        <KillSwitch
-          engaged={system?.kill_switch ?? trading?.kill_switch ?? false}
-          configFloor={trading?.kill_switch_config_floor ?? false}
-          onChanged={load}
-        />
+        {/* Grouped so the status cluster wraps as one unit.
+            These were direct children of a non-wrapping flex row, so between
+            the 640px breakpoint and roughly 900px they simply ran off the
+            right edge — and the item that fell off was the LAST one, the
+            health pill. The systemic up/down indicator is the one element
+            that must never be the thing that gets clipped. */}
+        <div className="topbar-status">
+          {/* The emergency stop belongs where it is reachable from every page,
+              not on the third tab. It reads the server's state and never its
+              own optimism. */}
+          <KillSwitch
+            engaged={system?.kill_switch ?? trading?.kill_switch ?? false}
+            configFloor={trading?.kill_switch_config_floor ?? false}
+            onChanged={load}
+          />
 
-        {trading && (
-          <Pill ok={!trading.real_money} warn={trading.real_money}>
-            {routeLabel(trading.execution_route)}
-          </Pill>
-        )}
-        {system && (
-          <>
-            <Pill ok={!live} warn={live}>
-              {system.environment}
+          {trading && (
+            <Pill ok={!trading.real_money} warn={trading.real_money}>
+              {routeLabel(trading.execution_route)}
             </Pill>
-            <Pill
-              ok={system.trading_mode === "paper"}
-              warn={system.trading_mode === "live"}
-            >
-              {system.trading_mode}
-            </Pill>
-          </>
-        )}
-        {health && <Pill ok={health.status === "ok"}>{health.status}</Pill>}
+          )}
+          {system && (
+            <>
+              <Pill ok={!live} warn={live}>
+                {system.environment}
+              </Pill>
+              <Pill
+                ok={system.trading_mode === "paper"}
+                warn={system.trading_mode === "live"}
+              >
+                {system.trading_mode}
+              </Pill>
+            </>
+          )}
+          {health && <Pill ok={health.status === "ok"}>{health.status}</Pill>}
+        </div>
       </header>
 
       <main>

@@ -101,21 +101,100 @@ _MARKET_COLUMNS = (
 )
 
 
+def _has_two_sided_quote(m: Any) -> bool:
+    """Is anyone quoting both sides of this market right now?
+
+    The precondition for making any tradeability claim at all, and it is asked
+    as that question rather than as "are these fields populated", because those
+    are not the same question and this code assumed they were.
+
+    **A market nobody is quoting stores 0.000000, not NULL.** `_liquidity_score`
+    guarded with `yes_bid is None or yes_ask is None`, which inspects the wrong
+    thing and passes: 0.000000/0.000000 is two populated fields, a spread of
+    exactly zero, and therefore a *full* score. Measured on the live catalog
+    2026-07-29, that was **64,211 of 90,629 active markets** handed a
+    tradeability number — most of them a high one, since volume and open
+    interest carry half the weight and a long-dormant market can still have
+    both — for a book with no bid and no ask.
+
+    This is the tri-state trap CLAUDE.md names under "Fail closed": `''` for an
+    open `Market.result`, not NULL, so `is not None` calls every open market
+    settled. Same shape, same guard, same silence. Do not re-add an `is None`
+    test beside this one — it is a strict subset of what is asked here, and
+    having both invites the next reader to assume this one is about NULLs.
+
+    A YES price is a dollar probability, so a live quote is strictly inside
+    (0, 1): 0 means nobody will buy at any price, 1 means nobody will sell
+    below a dollar. That is the same definition `_max_spread_filters` pushes
+    into SQL, deliberately — the screener's spread *filter* and its liquidity
+    *score* disagreeing about what counts as a quote is how one of them ends up
+    ranking rows the other one hides. `TestQuoteDefinitionsAgree` in
+    `tests/test_markets_screener.py` fails if they drift.
+
+    Says nothing about whether the quote is *coherent* — a crossed book has two
+    live sides that contradict each other, and is refused separately below.
+    """
+    return all(
+        price is not None and 0 < price < 1
+        for price in (m.yes_bid, m.yes_ask)
+    )
+
+
 def _liquidity_score(m: Any) -> float | None:
-    """Rough 0-100 tradeability score.
+    """Rough 0-100 tradeability score, or ``None`` when there is nothing to score.
 
     Deliberately simple and readable rather than clever: a tight spread and
     real size are what make a market executable, and both are things the
     screener can see without a model. It ranks candidates for attention; it
     does not price anything.
+
+    Refuses rather than guessing in two cases — no two-sided quote, and a
+    crossed one. Both used to score the maximum.
     """
-    if m.yes_bid is None or m.yes_ask is None:
+    if not _has_two_sided_quote(m):
+        return None
+
+    if m.yes_bid > m.yes_ask:
+        # A crossed book is refused, not scored badly.
+        #
+        # Every finite score is a claim about tradeability and there is no true
+        # one to make here. 100 says "perfectly tight" — which is what this
+        # returned, because the `max(spread, 0.0)` below collapsed `bid > ask`
+        # into a zero spread, the tightest value the term has. 0 says
+        # "maximally wide", which a crossed book is not either. Anything
+        # between says the quote was read and understood. Measured on the live
+        # catalog 2026-07-29, `KXHORMUZNORM-26MAR17-B261101` quoted
+        # 0.620000/0.340000 — crossed by 28c — and scored **100.0**, a full
+        # green bar in a column headed LIQUIDITY.
+        #
+        # Nor is "give it the worst spread term" (`spread_score = 0.0`) an
+        # answer: volume and open interest carry the remaining 0.5 weight, so a
+        # busy crossed market would still score 50 and outrank a genuinely
+        # tight quiet one. What is wrong with a crossed book is not that it is
+        # wide, it is that its two sides contradict each other, so nothing
+        # about it can be traded at any spread.
+        #
+        # Refusing is what this function already does one branch up for a
+        # one-sided book, and what `_max_spread_filters`,
+        # `undervalued_screener.spread_cents` and
+        # `worker.calibration.midpoint_cents` all do with the same input. The
+        # row carries `quote_crossed: true` alongside, so the UI can say *why*
+        # the bar is blank rather than leaving the operator to guess.
         return None
 
     spread = float(m.yes_ask - m.yes_bid)
-    # Crossed or locked books are real — a stale quote leaves bid >= ask. They
-    # are not "infinitely liquid"; without the clamp the reciprocal below goes
-    # negative and the score runs off the scale in both directions.
+    # A locked book (bid == ask) deliberately keeps the full 1.0 spread term.
+    # It is genuinely tight and genuinely executable — that it shares a `>=`
+    # with the crossed case is an accident of arithmetic, not a shared defect,
+    # and the two are now separated on purpose rather than by side effect.
+    #
+    # `max(spread, 0.0)` is unreachable now that crossed books return above.
+    # It stays as defence, not as semantics: at a spread of exactly -0.01 the
+    # denominator is 0 and this raises ZeroDivisionError. Being the *only*
+    # guard is how the crossed book came to score the maximum in the first
+    # place — a clamp added to keep the output in range silently doubled as the
+    # answer to "how tight is this?", two lines under a comment disclaiming
+    # exactly that.
     spread_score = 1.0 / (1.0 + max(spread, 0.0) * 100)
 
     volume = float(m.volume_24h or 0)
@@ -132,9 +211,88 @@ def _liquidity_score(m: Any) -> float | None:
     return round(min(100.0, max(0.0, raw)), 1)
 
 
+def _max_spread_filters(max_spread: float) -> list[Any]:
+    """SQL for "this market's spread is at most ``max_spread`` dollars".
+
+    This was one condition — ``(yes_ask - yes_bid) <= max_spread`` — and it
+    passed the two kinds of book that cannot be executed on at *any* spread,
+    both of which then sort ahead of the real ones:
+
+    - **A crossed book** (``bid > ask``) makes the subtraction negative, so it
+      cleared every threshold including the tightest — and because the default
+      sort is by 24h volume, those rows arrived *first*. Measured 2026-07-29,
+      15 of the first 100 rows of ``max_spread=0.01`` were crossed, one of them
+      by 28c. Crossing is a stale or broken quote, not extra liquidity.
+    - **A book with no quotes at all**, which this table stores as
+      ``0.000000/0.000000`` — a spread of exactly zero, i.e. tighter than
+      anything real. Counted over the whole catalog the same day, that was
+      **64,211 of 66,547 matching rows**: 96.5% of the result set was markets
+      with no bid and no ask, against 1,638 genuinely two-sided ones and 35
+      crossed. The crossed rows were the visible symptom; the phantom ones were
+      the bulk.
+
+    So these are *excluded*, not ``abs()``-ed or clamped. ``abs()`` would stop a
+    crossed book outranking a real one but still answers the wrong question: an
+    operator setting a max spread is asking which markets are executable within
+    that spread right now, and a book crossed by half a cent is not a
+    half-cent-tight market. Exclusion is also the answer the rest of the tree
+    already gives — ``undervalued_screener.spread_cents`` and
+    ``worker.calibration.midpoint_cents`` both refuse a crossed, one-sided or
+    out-of-range book rather than transforming it, and ``spread_cents``'
+    docstring names this exact failure ("the screener would rank a crossed book
+    at the top if the subtraction were allowed to go negative"). The conditions
+    below are that contract pushed into SQL; two definitions of "spread" in one
+    codebase is how they drift.
+
+    Note this constrains only the ``max_spread`` *query*. The screener still
+    shows crossed books when nothing is filtering them out — the operator needs
+    to be able to see one — it just stops serving them as the tightest quotes
+    in the catalog.
+    """
+    return [
+        # Both sides quoted. The subtraction below is NULL for a one-sided book
+        # and so drops it anyway under SQL's three-valued logic; saying it keeps
+        # the reason visible next to the ones that are not free.
+        Market.yes_bid.isnot(None),
+        Market.yes_ask.isnot(None),
+        # A YES price is a dollar probability, so a real quote is strictly
+        # inside (0, 1). This is what excludes the 0/0 no-book rows.
+        #
+        # Same definition as `_has_two_sided_quote`, which is the Python half of
+        # it — kept in step by `TestQuoteDefinitionsAgree` rather than by hope,
+        # since SQL expressions and Python booleans cannot share an
+        # implementation.
+        Market.yes_bid > 0,
+        Market.yes_bid < 1,
+        Market.yes_ask > 0,
+        Market.yes_ask < 1,
+        # Not crossed. A locked book (bid == ask) is kept: it is tight and it is
+        # real, unlike the two cases above.
+        Market.yes_bid <= Market.yes_ask,
+        # Decimal(str(...)) rather than Decimal(float): the query parameter
+        # arrives as a float and binding it directly would compare an exact
+        # NUMERIC column against a binary approximation of 0.01.
+        (Market.yes_ask - Market.yes_bid) <= Decimal(str(max_spread)),
+    ]
+
+
 def _market_row(m: Any) -> dict[str, Any]:
     spread = (
         m.yes_ask - m.yes_bid
+        if m.yes_ask is not None and m.yes_bid is not None
+        else None
+    )
+    # Decided here, in Decimal, rather than left to the browser. The client has
+    # both prices, but only as strings — and it must keep them that way, so the
+    # obvious `Number(bid) > Number(ask)` is exactly the float parse the whole
+    # money path is built to avoid, while comparing the strings works only for
+    # as long as every price arrives at the same width.
+    #
+    # True means the pair is not a book anyone could trade against, whatever the
+    # spread arithmetic says: see `_max_spread_filters`. Both numbers should be
+    # read as unreliable, not just the one that looks wrong.
+    quote_crossed = (
+        m.yes_bid > m.yes_ask
         if m.yes_ask is not None and m.yes_bid is not None
         else None
     )
@@ -160,6 +318,7 @@ def _market_row(m: Any) -> dict[str, Any]:
         "last_price": _s(m.last_price),
         "previous_price": _s(m.previous_price),
         "spread": _s(spread),
+        "quote_crossed": quote_crossed,
         "volume": _s(m.volume),
         "volume_24h": _s(m.volume_24h),
         "open_interest": _s(m.open_interest),
@@ -206,9 +365,7 @@ async def list_markets(
         pattern = f"%{q}%"
         filters.append(Market.ticker.ilike(pattern) | Market.title.ilike(pattern))
     if max_spread is not None:
-        filters.append(
-            (Market.yes_ask - Market.yes_bid) <= Decimal(str(max_spread))
-        )
+        filters.extend(_max_spread_filters(max_spread))
     if min_volume is not None:
         filters.append(Market.volume_24h >= Decimal(str(min_volume)))
     if max_hours_to_close is not None:

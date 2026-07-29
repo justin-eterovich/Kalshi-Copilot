@@ -6,6 +6,7 @@ import TapeView from "./TapeView";
 import TradeTicket from "./TradeTicket";
 import {
   api,
+  ApiError,
   asClock,
   asCount,
   asTimeToClose,
@@ -19,15 +20,36 @@ import {
 } from "./api";
 import { FEED_STATUS_TITLE, useLiveFeed } from "./useLiveFeed";
 
+/**
+ * The API caps `lookback_hours` at 90 days for **every** period — the cap is
+ * on the window, not on the candle count, because at `period_sec=60` a
+ * 180-day window is ~259,000 rows. Nothing here may exceed it: the "1d" tab
+ * asked for 24*180 = 4320h, the API answered 422 on every market, and the
+ * catch below reported it as "Could not load candles" — a data problem that
+ * did not exist. Named as a constant so the next edit trips over the ceiling
+ * instead of the endpoint.
+ */
+const MAX_LOOKBACK_HOURS = 24 * 90;
+
 const PERIODS = [
+  // Candles per request, so a tab cannot quietly become a 250k-row fetch:
+  //   1m -> 720, 1h -> 336, 1d -> 90.
   { label: "1m", sec: 60, lookback: 12 },
   { label: "1h", sec: 3600, lookback: 24 * 14 },
-  { label: "1d", sec: 86400, lookback: 24 * 180 },
+  { label: "1d", sec: 86400, lookback: MAX_LOOKBACK_HOURS },
 ];
 
-function Row({ k, children }: { k: string; children: React.ReactNode }) {
+function Row({
+  k,
+  title,
+  children,
+}: {
+  k: string;
+  title?: string;
+  children: React.ReactNode;
+}) {
   return (
-    <div className="row">
+    <div className="row" title={title}>
       <span className="k">{k}</span>
       <span className="v">{children}</span>
     </div>
@@ -101,9 +123,17 @@ export default function MarketPage() {
           ? "No candles for this window. Kalshi returns none for markets that have never traded."
           : null,
       );
-    } catch {
+    } catch (e) {
       setCandleSource(null);
-      setChartNote("Could not load candles.");
+      // "Could not load candles" reads as "this market has no data", which
+      // sent an operator hunting for a data problem when the request itself
+      // was out of range. A 422 is the client's fault and the note has to say
+      // so, or the bug hides behind a plausible-looking empty chart.
+      setChartNote(
+        e instanceof ApiError && e.status === 422
+          ? `Chart request refused by the API (${e.message}). This is a UI bug, not missing data.`
+          : `Could not load candles${e instanceof ApiError ? ` — ${e.message}` : ""}.`,
+      );
     }
   }, [ticker, period]);
 
@@ -180,6 +210,14 @@ export default function MarketPage() {
             </span>
           </div>
         </div>
+        {/* Two sources, named as two sources.
+            This headline reads Kalshi's *summary* quote fields; the ladder
+            below reads the L2 book. They genuinely disagree — measured 6¢
+            apart on one page load — and neither is wrong to publish: the
+            summary is what the exchange is saying, and reconciling it
+            server-side would mean storing a number Kalshi never sent. So the
+            fix is to stop presenting them as one voice. Both now say which
+            feed they are, and the tradeable one says so. */}
         <div className="market-quote">
           <div className="quote-last">{centsNum(market.last_price)}¢</div>
           <div className="quote-legs">
@@ -187,9 +225,33 @@ export default function MarketPage() {
             <span className="muted"> / </span>
             <span className="down">{centsNum(market.yes_ask)}</span>
             <span className="muted"> ¢ bid/ask</span>
+            {/* Server-decided, in Decimal. Three states, and `null` is
+                "one-sided, never checked" — not "sound". */}
+            {market.quote_crossed === true && (
+              <span
+                className="crossed-flag"
+                title="Crossed: the summary bid is above the summary ask. The payload that produces this also reports negative bid sizes on this exchange, so treat BOTH numbers here as unreliable — not just the one that looks wrong. Read the order book below."
+              >
+                crossed
+              </span>
+            )}
+            {market.quote_crossed === null && (
+              <span
+                className="quote-flag"
+                title="One side of the summary quote is missing, so it was not checked for a crossed quote. Absent, not sound."
+              >
+                one-sided
+              </span>
+            )}
           </div>
           <div className="quote-age muted">
-            {quoteAt ? `quote read ${asClock(quoteAt.toISOString())}` : "loading…"}
+            {quoteAt
+              ? `summary quote read ${asClock(quoteAt.toISOString())}`
+              : "loading…"}
+          </div>
+          <div className="quote-source">
+            summary feed — trade against the{" "}
+            <strong>order book</strong> below
           </div>
         </div>
       </div>
@@ -225,7 +287,25 @@ export default function MarketPage() {
 
       <div className="split-3">
         <section className="panel">
-          <h2>Order book</h2>
+          {/* Names its feed, in the same idiom the Price and Tape panels
+              already use ("live"/"cached", "polled · 5s"). Not a green pill:
+              a status-coloured badge on this panel reads as "this market is
+              tradeable", which is a claim about the market rather than about
+              which of two feeds to believe. The ladder prints its own
+              live/cached freshness a line below. */}
+          <h2>
+            Order book <span className="muted src-tag">L2 depth</span>
+          </h2>
+          {/* Stated here rather than only in the headline above, because this
+              is the panel an operator is reading when the two numbers
+              disagree. It is not a bug on either side: two feeds, two
+              refreshes, and the summary one is the one that goes crossed. */}
+          <p className="muted quote-source-note">
+            The bid/ask in the page header is Kalshi's <strong>summary</strong>{" "}
+            quote — a different feed from this snapshot, and one that has been
+            measured 6¢ away from it on the same page load. When they disagree,
+            <strong> this book wins</strong>: it is the depth an order meets.
+          </p>
           <OrderBookLadder book={book} />
         </section>
 
@@ -253,8 +333,17 @@ export default function MarketPage() {
           <Row k="open interest">{asCount(market.open_interest)}</Row>
           {/* Same field the screener renders at 0dp with a bar; showing
               "95.5" here and "96" there is two renderings of one number on
-              one page load. */}
-          <Row k="liquidity score">
+              one page load.
+
+              Labelled "attention", not "liquidity": volume and open interest
+              carry half the weight, so a market with no bid at any price
+              scored 50.5/100 and read as "medium liquidity" to anyone
+              skimming. The formula is deliberate and correct — the word was
+              the thing overpromising. */}
+          <Row
+            k="attention score"
+            title="An ordering for attention, not a measure of tradability. 24h volume and open interest carry half the weight, so a market with no bid at all can still score around 50. Read bid/ask above for whether you can actually trade it."
+          >
             {market.liquidity_score === null
               ? "—"
               : market.liquidity_score.toFixed(0)}
@@ -310,7 +399,24 @@ export default function MarketPage() {
                     </td>
                     <td className="title">{s.yes_sub_title || s.title || "—"}</td>
                     <td className="num">{centsNum(s.yes_bid)}</td>
-                    <td className="num">{centsNum(s.yes_ask)}</td>
+                    {/* Flagged here too, and this is the table where it bites
+                        hardest: set arbitrage sums the legs' asks, so one
+                        crossed leg quietly moves the total that decides
+                        whether a set looks free. Same server flag, same word,
+                        same colour as the screener. */}
+                    <td
+                      className={s.quote_crossed === true ? "num warn" : "num"}
+                      title={
+                        s.quote_crossed === true
+                          ? "Crossed summary quote on this leg — bid above ask. Both numbers on this row are unreliable."
+                          : undefined
+                      }
+                    >
+                      {centsNum(s.yes_ask)}
+                      {s.quote_crossed === true && (
+                        <span className="crossed-flag">crossed</span>
+                      )}
+                    </td>
                     <td className="num accent">{centsNum(s.last_price)}</td>
                     <td className="num">{asCount(s.volume_24h)}</td>
                   </tr>

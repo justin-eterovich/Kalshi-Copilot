@@ -37,6 +37,19 @@ export default function PriceChart({
 
     const chart = createChart(container, {
       height,
+      // Pin the locale instead of letting the library detect one.
+      //
+      // Lightweight Charts defaults `localization.locale` to
+      // `navigator.language` and hands it straight to `Date.toLocaleString()`
+      // in its tick-mark formatter. A container with no `LANG` set resolves
+      // that to "en-US@posix" — not a valid BCP-47 tag — so every axis tick
+      // threw `RangeError: Incorrect locale information provided`, the whole
+      // canvas rendered blank with valid candle data behind it, and nothing
+      // in the DOM said the chart had failed. Only devtools showed it.
+      //
+      // The axis is UTC-keyed exchange time, not the operator's calendar, so
+      // there is nothing here worth deferring to a machine setting for.
+      localization: { locale: "en-US" },
       layout: {
         background: { type: ColorType.Solid, color: "#101010" },
         textColor: "#8a8a8a",

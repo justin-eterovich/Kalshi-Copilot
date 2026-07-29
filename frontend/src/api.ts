@@ -50,6 +50,24 @@ export interface MarketRow {
   last_price: string | null;
   previous_price: string | null;
   spread: string | null;
+  /**
+   * The summary quote is crossed — `yes_bid` is above `yes_ask`.
+   *
+   * Decided **once, on the server, in `Decimal`** (`_market_row` in
+   * `api/routes/markets.py`). Never re-derive it here: `Number(bid) >
+   * Number(ask)` is exactly the float parse this whole money path exists to
+   * avoid, and comparing the two strings only works for as long as every
+   * price happens to arrive at the same width.
+   *
+   * `null` is **not** `false`. It means one side of the quote is missing, so
+   * the question was never asked — render it as unknown. Inventing a `false`
+   * for a `null` is the same bug as copy that asserts a state nobody checked.
+   *
+   * True means *both* numbers are untrustworthy, not just the one that looks
+   * wrong: the summary payload that produces a crossed quote on this exchange
+   * also reports negative bid sizes.
+   */
+  quote_crossed: boolean | null;
   volume: string | null;
   volume_24h: string | null;
   open_interest: string | null;
@@ -621,6 +639,23 @@ async function parseError(response: Response, path: string): Promise<ApiError> {
     const d = body?.detail;
     if (typeof d === "string") {
       detail = d;
+    } else if (Array.isArray(d)) {
+      // FastAPI's request-validation errors (422) arrive as a *list* of
+      // {loc, msg, ...} objects, not the {error, message} shape our own
+      // handlers use. Falling through to the object branch below read
+      // `.error`/`.message` off an array, got undefined for both, and every
+      // 422 in the app collapsed to the generic "path -> HTTP 422" — which
+      // is how a chart tab asking for an out-of-range window ended up
+      // indistinguishable from missing data. Name the field and the reason.
+      detail = d
+        .map((item) => {
+          const where = Array.isArray(item?.loc)
+            ? item.loc.filter((p: unknown) => p !== "query" && p !== "body").join(".")
+            : "";
+          const why = typeof item?.msg === "string" ? item.msg : "invalid";
+          return where ? `${where}: ${why}` : why;
+        })
+        .join("; ");
     } else if (d && typeof d === "object") {
       code = d.error;
       detail = d.message;
@@ -1072,12 +1107,45 @@ export function routeLabel(route: string | null): string {
   }
 }
 
+/**
+ * Locale formatting that cannot take a panel down with it.
+ *
+ * `Date#toLocaleTimeString` throws `RangeError: Incorrect locale information
+ * provided` when the environment's default locale is not a valid BCP-47 tag —
+ * a container with no `LANG` set resolves `navigator.language` to
+ * `"en-US@posix"`, which Intl rejects. A formatter is called from inside
+ * render, so one throw blanks the whole component that called it and leaves
+ * nothing on the page saying why. Every locale-dependent format in this app
+ * goes through the two functions below, which fall back to a plain
+ * ISO-derived rendering rather than throwing.
+ *
+ * The fallback is deliberately the browser's *local* clock, same as the happy
+ * path — a timestamp that silently switches to UTC on some machines is worse
+ * than an ugly one.
+ */
 export function asClock(iso: string): string {
   const d = new Date(iso);
-  return d.toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
+  if (Number.isNaN(d.getTime())) return "—";
+  try {
+    return d.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+  } catch {
+    // "14:03:22 GMT+0000 (…)" -> "14:03:22", already in local time.
+    return d.toTimeString().slice(0, 8);
+  }
+}
+
+/** Date + time, same defensive contract as `asClock`. */
+export function asDateTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  try {
+    return d.toLocaleString();
+  } catch {
+    return `${d.toDateString()} ${d.toTimeString().slice(0, 8)}`;
+  }
 }

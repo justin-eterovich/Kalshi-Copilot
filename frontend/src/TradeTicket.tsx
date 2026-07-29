@@ -241,6 +241,22 @@ export default function TradeTicket({
         />
       </label>
 
+      {/* The seed comes from `suggestedPrice`, which reads the *summary*
+          quote — the same feed the market header shows and the same one that
+          goes crossed. The ticket has no book to read instead, and changing
+          what it seeds would change what price gets proposed, so it says
+          where the number came from rather than quietly substituting a
+          different one. Shown only when the server has flagged the quote as
+          crossed, so it stays a signal and not furniture. */}
+      {market.quote_crossed === true && (
+        <p className="ticket-warn">
+          The summary quote for this market is <strong>crossed</strong> (bid
+          above ask), so the price seeded above is derived from numbers the
+          exchange is publishing but nobody can trade on. Check the order book
+          before proposing.
+        </p>
+      )}
+
       <label className="field">
         <span>contracts</span>
         <input
