@@ -32,6 +32,13 @@ frontend/dist/
 # this file is where you actually turn detectors on.
 /config.yaml
 
+# There is exactly one config location and it is the repo root. A zero-byte
+# `backend/config.yaml` was committed once already (1ee5cd3, root-owned — a
+# bind-mount artifact), harmless in the container because the real file is
+# mounted over it, but a live trap for the host-run `cd backend && pytest`
+# path where nothing shadows it.
+/backend/config.yaml
+
 # ---- data & runtime ----
 pgdata/
 data/runtime/
