@@ -8,6 +8,7 @@ import Trades from "./Trades";
 import {
   api,
   routeLabel,
+  type AutonomyState,
   type Health,
   type SystemStatus,
   type TradingState,
@@ -30,6 +31,7 @@ export default function App() {
   const [system, setSystem] = useState<SystemStatus | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [trading, setTrading] = useState<TradingState | null>(null);
+  const [autonomy, setAutonomy] = useState<AutonomyState | null>(null);
   const location = useLocation();
 
   const load = useCallback(async () => {
@@ -45,6 +47,11 @@ export default function App() {
     } catch {
       /* trading state is additive; the header degrades without it */
     }
+    try {
+      setAutonomy(await api.autonomy());
+    } catch {
+      /* the panel says so itself; never guess a machine's state */
+    }
   }, []);
 
   useEffect(() => {
@@ -54,6 +61,14 @@ export default function App() {
   }, [load]);
 
   const live = system?.live_trading_armed ?? false;
+  // Both halves, because either one alone means the machine cannot act. The
+  // banner below asserts what is true of *this* deployment, and until autonomy
+  // shipped it asserted something that is no longer universally true.
+  const machineArmed =
+    (autonomy?.enabled ?? false) &&
+    (autonomy?.env_armed ?? false) &&
+    Object.values(autonomy?.routes ?? {}).some(Boolean);
+  const latched = (autonomy?.disarmed_reason ?? null) !== null;
   const pending = trading?.pending_proposals ?? 0;
   const path = location.pathname;
   const onSystem = path.startsWith("/system");
@@ -132,20 +147,38 @@ export default function App() {
           </div>
         )}
 
-        <div className={live ? "banner" : "banner safe"}>
+        {/* Two orthogonal facts, and the banner has to say both.
+            `live` is WHERE an order goes; `machineArmed` is WHO approves it.
+            This used to assert "there is no auto-trade path in this system",
+            which was true when it was written and is now a claim the operator
+            can falsify with a config edit — exactly the kind of load-bearing
+            sentence that is right until it silently is not. */}
+        <div className={live || machineArmed ? "banner" : "banner safe"}>
           {live ? (
             <>
-              <strong>Live trading armed.</strong> Real orders are possible. Every
-              single one still requires your explicit per-trade approval — there is
-              no auto-trade path in this system.
+              <strong>Live trading armed.</strong> Real orders are possible.
             </>
           ) : (
             <>
               <strong>Safe mode.</strong> No real order can reach Kalshi. Live
               trading needs <code>KALSHI_ENV=prod</code> and{" "}
-              <code>LIVE_TRADING=true</code>, and every trade is still approved by
-              hand.
+              <code>LIVE_TRADING=true</code>.
             </>
+          )}{" "}
+          {machineArmed && !latched ? (
+            <>
+              <strong>Autonomous trading is armed</strong> — orders can be placed
+              with no approval from you, if they clear the evidence gate and the
+              budget. <Link to="/system">See the gate</Link>.
+            </>
+          ) : machineArmed && latched ? (
+            <>
+              <strong>Autonomous trading is latched off</strong> after a placement
+              that needs a person. Manual approval still works.{" "}
+              <Link to="/system">See why</Link>.
+            </>
+          ) : (
+            <>Every trade is approved by hand.</>
           )}
         </div>
 
@@ -155,13 +188,23 @@ export default function App() {
           <Route path="/trades" element={<Trades />} />
           <Route
             path="/system"
-            element={<SystemPanel system={system} health={health} />}
+            element={
+              <SystemPanel
+                system={system}
+                health={health}
+                autonomy={autonomy}
+                onChanged={load}
+              />
+            }
           />
         </Routes>
       </main>
 
       <footer>
-        LAN-only. No order reaches Kalshi without your explicit per-trade approval.
+        LAN-only.{" "}
+        {machineArmed && !latched
+          ? "Autonomous trading is armed — the machine can approve trades that clear the gate."
+          : "No order reaches Kalshi without your explicit per-trade approval."}
       </footer>
     </div>
   );

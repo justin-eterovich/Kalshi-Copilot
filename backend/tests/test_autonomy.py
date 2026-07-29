@@ -693,3 +693,98 @@ class TestBudgetShape:
             cooldown_until=None,
         )
         assert all(isinstance(v, str) for v in budget.as_payload().values())
+
+
+# ---------------------------------------------------------------------------
+# The two stops, at the API boundary
+# ---------------------------------------------------------------------------
+
+
+class TestStopEndpoints:
+    """Stopping is easy and resuming is hard, and that asymmetry is the point.
+
+    An operator reaching for a stop is in a hurry by definition, so disarming
+    takes a confirm and no typing. The latch fires on a *single* ambiguous
+    submission or partial fill — states where an order may exist that this
+    system cannot see — so clearing it asserts a person has looked at the book,
+    and typing is what makes that a claim rather than a reflex.
+    """
+
+    async def test_disarming_needs_confirmation_but_no_phrase(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi import HTTPException
+
+        from app.api.routes.trading import AutonomyStopRequest, disarm_autonomy
+
+        stopped: list[str] = []
+
+        async def _disarm(reason: str) -> None:
+            stopped.append(reason)
+
+        async def _reason() -> str | None:
+            return stopped[0] if stopped else None
+
+        monkeypatch.setattr(autonomy, "disarm", _disarm)
+        monkeypatch.setattr(autonomy, "disarm_reason", _reason)
+
+        with pytest.raises(HTTPException) as exc:
+            await disarm_autonomy(AutonomyStopRequest())
+        assert exc.value.detail["error"] == "not_confirmed"
+        assert stopped == []
+
+        result = await disarm_autonomy(AutonomyStopRequest(confirm=True))
+        assert result["disarmed"] is True
+        assert len(stopped) == 1
+
+    async def test_rearming_needs_the_typed_phrase(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi import HTTPException
+
+        from app.api.routes.trading import AutonomyStopRequest, rearm_autonomy
+
+        cleared: list[bool] = []
+
+        async def _rearm() -> None:
+            cleared.append(True)
+
+        monkeypatch.setattr(autonomy, "rearm", _rearm)
+
+        for body in (
+            AutonomyStopRequest(confirm=True),
+            AutonomyStopRequest(confirm=True, phrase="yes"),
+            AutonomyStopRequest(confirm=False, phrase="REARM"),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await rearm_autonomy(body)
+            assert exc.value.detail["error"] == "confirmation_phrase_mismatch"
+        assert cleared == []
+
+        result = await rearm_autonomy(
+            AutonomyStopRequest(confirm=True, phrase="rearm")  # case-insensitive
+        )
+        assert result["disarmed"] is False
+        assert cleared == [True]
+
+    async def test_neither_endpoint_can_arm_anything(self) -> None:
+        """Clearing the latch restores a posture; it never creates one.
+
+        Asserted structurally rather than by reading the source: neither
+        endpoint takes a config or settings dependency, so it has nothing to
+        change arming *with*. `autonomous.enabled`, the route and
+        `AUTONOMOUS_TRADING` are all still required afterwards and none is
+        reachable from the dashboard — which has no auth in front of it by
+        design. The worst a request on the LAN can do is resume something an
+        operator already chose with a file edit and a restart.
+        """
+        import inspect
+
+        from app.api.routes.trading import disarm_autonomy, rearm_autonomy
+
+        for fn in (disarm_autonomy, rearm_autonomy):
+            params = inspect.signature(fn).parameters
+            assert list(params) == ["body"], (
+                f"{fn.__name__} takes {list(params)}; a config or settings "
+                "dependency here would give it something to arm with"
+            )

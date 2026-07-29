@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Final, Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, StrictBool
@@ -70,8 +70,8 @@ from app.detectors.stale_quote import REFERENCE_PREFIXES
 from app.kalshi.rest import KalshiApiError, KalshiRestClient
 from app.news.calendar import KNOWN_CATALYSTS, catalyst_for
 from app.settings import Settings, get_settings
+from app.trading import autonomy, risk
 from app.trading import proposals as prop
-from app.trading import risk
 from app.trading.executor import (
     LIVE_ORDER_STATUSES,
     ExecutionError,
@@ -1045,3 +1045,76 @@ async def list_audit(
             for row in rows
         ]
     }
+
+
+class AutonomyStopRequest(BaseModel):
+    """Latch the machine off, or clear the latch."""
+
+    #: Deliberate action, same shape as an approval. Never defaulted true.
+    confirm: StrictBool = False
+    #: Required to clear the latch, and deliberately not required to set it.
+    #: Stopping is urgent and must never be gated behind typing; resuming is
+    #: never urgent, and the asymmetry is the safety property.
+    phrase: str | None = None
+
+
+#: What an operator must type to resume unattended trading. Same device as the
+#: typed ticker on a live trade, for the same reason: it is the difference
+#: between "I clicked something" and "I meant this".
+REARM_PHRASE: Final = "REARM"
+
+
+@router.post("/autonomy/disarm")
+async def disarm_autonomy(body: AutonomyStopRequest = Body(...)) -> dict[str, Any]:
+    """Stop the machine. **Not** the kill switch.
+
+    This halts autonomous approvals and nothing else: manual approvals still
+    work, resting orders are left alone, and positions are untouched. The kill
+    switch is the other control — it halts everything including your own
+    approvals and cancels every working order.
+
+    Confirming is required but typing is not. An operator reaching for a stop
+    is in a hurry by definition, and a stop that is hard to fire is a stop that
+    does not get fired.
+    """
+    if not body.confirm:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "not_confirmed",
+                "message": "disarming is a deliberate action and is not defaulted.",
+            },
+        )
+    await autonomy.disarm("stopped by an operator from the dashboard")
+    return {"disarmed": True, "reason": await autonomy.disarm_reason()}
+
+
+@router.post("/autonomy/rearm")
+async def rearm_autonomy(body: AutonomyStopRequest = Body(...)) -> dict[str, Any]:
+    """Clear the latch and let the machine act again.
+
+    Deliberately harder than stopping. The latch fires at **one** ambiguous
+    submission or **one** partial fill — states where an order may exist that
+    this system cannot see, or a multi-leg position is no longer hedged — so
+    clearing it is a claim that a person has looked at the book and it is
+    sound. Typing the phrase is what makes that a claim rather than a reflex.
+
+    This cannot arm anything that was not already armed: ``autonomous.enabled``,
+    the route, and ``AUTONOMOUS_TRADING`` in the environment are all still
+    required, and none of them is reachable from here. It only restores a
+    posture the operator had already chosen with a file edit and a restart.
+    """
+    if not body.confirm or (body.phrase or "").strip().upper() != REARM_PHRASE:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "confirmation_phrase_mismatch",
+                "message": (
+                    f"type {REARM_PHRASE!r} to confirm. The latch fires on a "
+                    "single ambiguous or unbalanced placement, so clearing it "
+                    "asserts that a person has checked the book."
+                ),
+            },
+        )
+    await autonomy.rearm()
+    return {"disarmed": False, "reason": None}
