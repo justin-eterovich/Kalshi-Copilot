@@ -369,6 +369,19 @@ in place and lets it age out; it never writes a partial or empty one, because
 an empty snapshot refuses identically to a genuine absence of evidence and the
 operator needs to tell those apart.
 
+**Publishing needs a key, not only a channel** — and this was got wrong first
+time. The refresh loop runs in `worker`; `/api/autonomy` is served by `api`.
+Different processes, no shared memory, so the dashboard cannot read
+`cached_evidence()` and showed `evidence: null` forever. A pub/sub `publish` on
+its own does not fix it either: a subscriber that was not listening at the
+instant of the publish learns nothing, and the API is usually not listening.
+So `publish_evidence` writes **both** — `copilot:autonomy:evidence` with a TTL
+for "what is true now", and the channel for a dashboard already open. The TTL
+matters: without it a dead worker's last report card sits on screen looking
+current. `published_evidence()` returns a plain `dict`, deliberately not an
+`Evidence`, so that wiring the display path into the gate would not typecheck
+and would not run.
+
 **The budget is derived from `audit_log`, not counted.** Trades per hour, per
 detector per hour, daily risk and the repeat cooldown all come from
 `kind='proposal.approved' AND actor='autonomous'` rows. Exact across restarts,
@@ -432,10 +445,26 @@ wants is the current binding reason per pair, not the same reason 8,640 times
 a day.
 
 **On this deployment the gate refuses everything, and that is it working.**
-Coverage fails all four hard axes (79/200 markets, ~0/100 settled, 9.8h against
-a 30-day span, median gaps). Demo and live autonomy are therefore unreachable
-until the data matures — by construction, not by bug. Do not "fix" this by
-lowering a threshold; the thresholds are the product.
+Coverage fails all four hard axes — measured 2026-07-29 with the gate armed on
+`demo_exchange` in a throwaway container: `too_few_markets`,
+`window_too_short`, `too_few_settled`, `gaps_too_large`. Demo and live autonomy
+are therefore unreachable until the data matures — by construction, not by bug.
+Do not "fix" this by lowering a threshold; the thresholds are the product.
+
+The refusal ladder, measured on that run, is worth reading because each rung is
+a different reason:
+
+| proposal | refusal |
+|---|---|
+| a manual ticket | `manual_proposal` |
+| `stale_quote`, coverage enforced | `coverage_unusable` |
+| `stale_quote`, coverage waived | `insufficient_trades` |
+
+That last one is the interesting one. `stale_quote` on `demo_exchange` reads a
+bootstrap **lower bound of +61.6c** over 16 decisions — a spectacular number,
+and refused, because the floor is 20. This is precisely the case the report
+card exists for: the most persuasive figure the system can produce is also the
+one carrying the least information, and there is no override.
 
 ---
 
@@ -483,6 +512,7 @@ backend/app/
   trading/
     direction.py     ⭐ (side, action) <-> bid/ask. Never inline this.
     interlocks.py    execution routing + every safety check
+    autonomy.py      ⭐ the ONLY issuer of MachineConsent; gate + budget + latch
     risk.py          ⭐ portfolio limits: exposure, daily loss, cooldown
     sizing.py        Kelly sizing; every cap is a ceiling, never a floor
     pricing.py       fee-aware ticket costing (calls fees.py, owns no fee math)
@@ -580,8 +610,19 @@ a liquidity score of −450 on a 0–100 scale, fractional sizes rendering as
 | M7 weather engine | done (needs ~30d of history before it prices) |
 | M8 news/catalyst engine | done (LLM tier guarded, not built — no key) |
 | M9 backtester + hardening | done (refuses on today's data — by design) |
+| M10 autonomy gate | done (gate refuses on today's data — by design) |
 
 Branch: `claude/kalshi-copilot-build-bgyv2d`
+
+**The autonomy rail is now wired end to end**, and for a while it was not:
+`MachineConsent`, the interlock guards and the config validators landed before
+`app/trading/autonomy.py` existed, so nothing could mint a consent and three
+docstrings described a gate that was not there. That was safe — nothing could
+trade — but it is the failure mode this file warns about, a comment that is
+load-bearing right up until it is wrong. The pieces now are: `autonomy.py`
+issues consents, `_autonomy_sweep_loop` in `worker/main.py` is the only loop
+that approves anything, `_autonomy_evidence_loop` keeps the snapshot fresh,
+and `/api/autonomy` shows an operator the numbers and the binding reason.
 
 ### Open items for the operator
 

@@ -577,6 +577,27 @@ confidence interval's lower bound* is above zero over at least
 config loader refuses at boot if you try to lower that floor, waive coverage
 while an exchange route is armed, or turn off `require_edge_shown` on live.
 
+**Seeing why it refused.** `GET /api/autonomy` reports the arming state, both
+stops, the budget ceilings, and the evidence snapshot the gate is working from
+— every measured pair with its verdict, decision count and interval lower
+bound. There is deliberately no audit row per refusal: the gate evaluates every
+few seconds, and what you want is the current binding reason, not the same
+sentence several thousand times a day. The worker logs a one-line summary per
+sweep with a count per refusal code.
+
+On this deployment it refuses everything, and that is it working:
+
+```
+manual ticket                       -> manual_proposal
+stale_quote, coverage enforced      -> coverage_unusable
+stale_quote, coverage waived        -> insufficient_trades
+```
+
+That last one is worth staring at. `stale_quote` shows a bootstrap lower bound
+of **+61.6¢ over 16 decisions** and is refused anyway, because the floor is 20.
+The most persuasive number the system can produce is the one carrying the least
+information, and there is no override for it.
+
 **It disarms itself** on a losing streak, the daily loss limit, repeated
 placement failures, and immediately on a single ambiguous placement or a
 partially-filled multi-leg proposal. The latch has no TTL and does not clear
