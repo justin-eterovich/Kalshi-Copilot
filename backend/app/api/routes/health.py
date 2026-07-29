@@ -73,9 +73,14 @@ async def system() -> dict[str, Any]:
     return {
         "environment": settings.kalshi_env.value,
         "trading_mode": config.trading.mode,
-        # Both interlocks. Even when armed, every order still needs per-trade
-        # approval in the UI — there is no auto-trade path.
+        # Both interlocks for the *human* live path. Even when armed, an
+        # operator-approved order still needs the ticker typed back.
+        #
+        # This says nothing about the machine: autonomous live trading needs
+        # `autonomous_live_armed`, which is strictly stronger, plus the
+        # evidence gate. See /api/autonomy for that side.
         "live_trading_armed": settings.live_trading_armed,
+        "autonomous_live_armed": settings.autonomous_live_armed,
         # The effective switch, config floor OR the runtime flag in Redis.
         # Reporting only the config file made the header disagree with what
         # the executor would actually do.

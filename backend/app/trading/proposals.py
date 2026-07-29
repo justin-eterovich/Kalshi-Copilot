@@ -100,10 +100,17 @@ async def _lock_proposal_creation(session: AsyncSession) -> None:
 async def _guard_queue_depth(session: AsyncSession, config: Config) -> None:
     """Refuse to add to a queue nobody can read.
 
-    The whole safety model is a human evaluating each proposal. A detector
-    that scans every 20 seconds can produce dozens a minute — observed: 20
-    per scan across 22 watched events — and a queue that long is not reviewed,
-    it is rubber-stamped. Capping it protects the one control that matters.
+    Written when a human evaluating each proposal was the whole safety model:
+    a detector scanning every 20 seconds can produce dozens a minute —
+    observed: 20 per scan across 22 watched events — and a queue that long is
+    not reviewed, it is rubber-stamped.
+
+    That reason still holds, and a second one now sits on top of it. The cap
+    also bounds how much the autonomy sweep can be asked to act on in one
+    pass, and it bounds how much an operator has to *veto* within
+    ``min_proposal_age_sec``. A queue too long to read was previously
+    rubber-stamped; it would now be worked through by a machine, which is the
+    same failure with better throughput.
     """
     pending = (
         await session.execute(

@@ -1,16 +1,36 @@
 # ============================================================================
-# kalshi-copilot — runtime configuration
+# kalshi-copilot — runtime configuration TEMPLATE
+#
+#   cp config.example.yaml config.yaml
+#
+# `config.yaml` is what the stack actually loads, and it is gitignored: it is
+# one deployment's state, not the project's defaults.  This file is the
+# defaults, it is committed, and `backend/tests/test_config.py` asserts against
+# *it* that a fresh clone ships disarmed — every detector off, every engine
+# off, paper mode, no autonomy.  Those assertions are the reason the two files
+# are separate: while they were one file, enabling a detector on a running box
+# edited the thing that was supposed to prove nothing was enabled.
+#
+# Keep new keys in both.  A key added only to config.yaml is invisible to a
+# fresh clone; a key added only here is untested against a real boot.
 #
 # Bind-mounted read-only into every container.  Most values are editable from
 # the settings UI (which writes through to config_kv in Postgres and takes
 # precedence over this file); this file is the boot-time default.
 #
-# NOTHING here can enable automatic trading.  Every order requires explicit
-# per-trade human approval.  There is no auto-trade flag, by design.
+# Two orthogonal axes decide whether an order happens:
+#
+#   trading.mode  — WHERE an approved order goes (paper / live).
+#   autonomous:   — WHO approved it (a human clicking, or the machine).
+#
+# Nothing in `trading:` can enable automatic trading; nothing in `autonomous:`
+# can change where an order is routed.  Both blocks ship disarmed, and
+# `autonomous:` additionally requires an environment interlock this file
+# cannot set.
 # ============================================================================
 
 # ---------------------------------------------------------------------------
-# Trading mode
+# Trading mode — where an approved order goes
 # ---------------------------------------------------------------------------
 trading:
   # paper | live
@@ -40,6 +60,81 @@ trading:
     auto_cancel_after_sec: 90
     # Never pay worse than the proposed price.
     allow_price_improvement_only: true
+
+# ---------------------------------------------------------------------------
+# Autonomous trading — who approves
+#
+# When armed, the worker approves and places proposals with no human click.
+# This is real and it can reach real money.  Read the "Autonomy" section of
+# CLAUDE.md before changing anything here.
+#
+# Arming the machine takes four separate facts, and this file holds two of
+# them:
+#     enabled: true            (here)
+#     routes.<rail>: true      (here)
+#     AUTONOMOUS_TRADING=true  (.env — plus KALSHI_ENV/LIVE_TRADING for live)
+# and then, per trade, the evidence gate and the budget below.
+#
+# The evidence gate is what replaces the human's judgement.  It refuses
+# unless the backtest report card has *measured* a positive edge for that
+# detector on that route.  On this deployment's data it refuses everything
+# today, and that is the gate working, not a bug — see `docker compose run
+# --rm --no-deps api python scripts/backtest.py --days 30`.
+# ---------------------------------------------------------------------------
+autonomous:
+  enabled: false
+
+  # Which rails the machine may fire on.  Independent of trading.mode: the
+  # route is resolved as always, and this only says whether the machine is
+  # allowed to act once it is.
+  routes:
+    simulated: false        # local fill simulator; no API call leaves the box
+    demo_exchange: false    # real order rail, play money
+    live_exchange: false    # REAL MONEY. Needs all three env vars as well.
+
+  # What the machine must be able to prove.  None of this is waivable while
+  # an exchange route is armed; the loader refuses such a config at boot.
+  evidence:
+    # Refuse unless the report card's bootstrap CI lower bound is above zero
+    # for this (detector, route).  Not the mean — a 20-trade binary sample is
+    # exactly the regime where a point estimate lies.
+    require_edge_shown: true
+    # Refuse unless the backtest coverage gate passes.  May only be false
+    # while just `simulated` is armed (bring-up).
+    require_coverage_usable: true
+    # Blank = use backtest.report_card_min_trades.  May only be raised.
+    min_trades: null
+    # An evidence snapshot older than this is refused rather than used.
+    max_report_age_sec: 900
+
+  # Ceilings.  EVERY ONE OF THESE DEFAULTS TO ZERO AND ZERO REFUSES.
+  # There is no way to write "unlimited" here, deliberately.
+  budget:
+    max_trades_per_hour: 0
+    max_trades_per_detector_per_hour: 0
+    # Sum of max_loss_cents over autonomous approvals in the UTC day.
+    max_daily_risk_cents: 0
+    # Open markets on the route, from any source (not just autonomous ones).
+    max_open_positions: 0
+    # Working orders on the route before autonomy stops adding.  1 means
+    # "place one, let it resolve, then consider the next".
+    max_working_orders: 1
+    # After an autonomous trade, refuse the same detector on the same ticker
+    # for this long.  Without it the detector re-derives the same edge every
+    # scan and the duplicate guard has already cleared — see CLAUDE.md.
+    repeat_cooldown_sec: 3600
+
+  # How often the machine looks at the queue.
+  decision_interval_sec: 10
+  # A proposal must be this old before the machine may act on it.  This is
+  # the operator's veto window; the dashboard counts it down.
+  min_proposal_age_sec: 15
+
+  # Self-disarm.  A latch, not a cooldown: it does not clear on its own.
+  disarm_after_consecutive_losses: 3
+  disarm_after_failed_placements: 3
+  disarm_on_verdict_degradation: true
+  require_manual_rearm: true
 
 # ---------------------------------------------------------------------------
 # Risk & sizing  (M7)
@@ -287,6 +382,11 @@ detectors:
 # Bitcoin engine  (M4/M6)
 # ---------------------------------------------------------------------------
 bitcoin:
+  # `stale_quote` depends on this: the spot poller is what writes the
+  # ExternalPrice rows the detector prices against, and with no reference it
+  # refuses on every scan rather than guessing. Turning stale_quote on while
+  # this is off yields a detector that runs and can never signal — so enable
+  # the pair together, or neither.
   enabled: false
   spot_source: coinbase          # coinbase | binance | kraken
   ewma_lambda: 0.94

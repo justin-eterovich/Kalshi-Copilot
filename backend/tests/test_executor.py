@@ -26,6 +26,7 @@ import pytest
 
 from app.config import Config
 from app.db.models import (
+    AuditLog,
     Market,
     Order,
     OrderStatus,
@@ -34,6 +35,7 @@ from app.db.models import (
     ProposedTrade,
     Side,
 )
+from app.kalshi.rest import KalshiApiError
 from app.settings import KalshiEnv, Settings
 from app.trading.executor import (
     ExecutionError,
@@ -41,11 +43,56 @@ from app.trading.executor import (
     fee_cents_from_dollars,
     order_view,
 )
-from app.trading.interlocks import ExecutionRoute, InterlockError
+from app.trading.interlocks import (
+    ACTOR_AUTONOMOUS,
+    ExecutionRoute,
+    InterlockError,
+    MachineConsent,
+)
 
 # ---------------------------------------------------------------------------
 # Doubles
 # ---------------------------------------------------------------------------
+
+
+def rejection(body: str, status: int = 400) -> KalshiApiError:
+    """A *definite* refusal from the exchange.
+
+    The executor splits placement failures on whether the exchange actually
+    said no: a 4xx is REJECTED, anything else (a timeout, a 5xx, a bare
+    exception) is ambiguous and stays PENDING for reconciliation, because the
+    order may have reached the matching engine. A plain `RuntimeError` carries
+    no status and is therefore ambiguous — so tests about the rejected path
+    have to raise something that names a 4xx, or they assert the wrong branch.
+    """
+    return KalshiApiError(status, "POST", "/portfolio/events/orders", body)
+
+
+def _project(stmt: Any, rows: list[Any]) -> list[Any]:
+    """Return what a real session would for `stmt`, given the matching entities.
+
+    A fake that hands back whole ORM objects regardless of what was selected is
+    wrong the moment production code projects a column, and wrong in a way that
+    passes right up until something *uses* the value. `select(ProposalLeg)`
+    yields legs; `select(ProposalLeg.ticker)` yields ticker strings, and the
+    executor feeds those straight into `Position.ticker.in_(...)`. Returning
+    legs there raised `ArgumentError: Object <ProposalLeg> is not legal as a
+    SQL literal value` from deep inside SQLAlchemy — a stack trace that names
+    the risk layer and never mentions the double that actually lied.
+
+    Dispatch on `column_descriptions` rather than on the compiled SQL string,
+    for the same reason `execute` dispatches on the driving table: the shape of
+    the query is a fact about the statement, not something to pattern-match out
+    of its text.
+    """
+    descriptions = stmt.column_descriptions
+    # `select(Entity)` describes one column whose expression *is* the entity.
+    if len(descriptions) == 1 and descriptions[0]["expr"] is descriptions[0]["entity"]:
+        return list(rows)
+    names = [d["name"] for d in descriptions]
+    if len(names) == 1:
+        return [getattr(row, names[0]) for row in rows]
+    return [tuple(getattr(row, name) for name in names) for row in rows]
 
 
 class FakeResult:
@@ -108,9 +155,9 @@ class FakeSession:
         # risk layer's join against `orders` and unpack it as position rows.
         text = str(stmt).lower()
         if "from proposal_legs" in text:
-            return FakeResult(self.legs)
+            return FakeResult(_project(stmt, self.legs))
         if "from orders" in text:
-            return FakeResult(self._existing)
+            return FakeResult(_project(stmt, self._existing))
         # Everything else — positions, pnl_daily, fills, settlements — is an
         # empty book. These tests are about the executor's control flow; the
         # risk limits have their own.
@@ -334,6 +381,231 @@ class TestInterlocksAtExecution:
 
         with pytest.raises(InterlockError):
             await executor.approve_and_execute(session, proposal, confirmed=False)
+
+        assert proposal.status is ProposalStatus.PENDING
+
+
+class TestMachineConsentAtExecution:
+    """The machine path through the one function that can place an order.
+
+    The executor re-checks everything rather than trusting its caller, so
+    these assert the autonomy path is subject to the same rail — plus the one
+    thing only the executor can enforce, which is who gets recorded as having
+    approved.
+    """
+
+    @staticmethod
+    def _armed(key_file: Path) -> tuple[Settings, Config]:
+        settings = Settings(
+            kalshi_env=KalshiEnv.DEMO,
+            kalshi_demo_key_id="demo-key",
+            autonomous_trading=True,
+        )
+        settings.kalshi_demo_private_key_path = key_file
+        config = Config.model_validate(
+            {
+                "trading": {},
+                "autonomous": {"enabled": True, "routes": {"demo_exchange": True}},
+            }
+        )
+        return settings, config
+
+    @staticmethod
+    def _consent(**overrides: Any) -> MachineConsent:
+        fields: dict[str, Any] = {
+            "proposal_id": 1,
+            "route": ExecutionRoute.DEMO_EXCHANGE,
+            "detector": "set_arbitrage",
+            "verdict": "edge_shown",
+            "trades": 41,
+            "ci_low_cents": "0.83",
+            "ci_high_cents": "3.11",
+            "mean_cents": "1.94",
+            "min_trades": 20,
+            "coverage_usable": True,
+            "coverage_refusals": (),
+            "evidence_computed_at": datetime.now(UTC),
+            "budget": {"trades_this_hour": "2", "trades_per_hour_limit": "6"},
+        }
+        fields.update(overrides)
+        return MachineConsent(**fields)
+
+    async def test_the_audit_row_records_the_machine_as_the_actor(
+        self, key_file: Path
+    ) -> None:
+        """AuditLog.actor is the only record of who authorised an order."""
+        session = session_with_market()
+        settings, config = self._armed(key_file)
+        executor = Executor(FakeRest(), settings, config)
+        proposal = make_proposal(source="set_arbitrage")
+
+        await executor.approve_and_execute(
+            session, proposal, confirmed=False, machine_consent=self._consent()
+        )
+
+        approvals = [
+            row
+            for row in session.of_type(AuditLog)
+            if row.kind == "proposal.approved"
+        ]
+        assert len(approvals) == 1
+        assert approvals[0].actor == ACTOR_AUTONOMOUS
+
+    async def test_the_audit_row_records_why_it_was_allowed(
+        self, key_file: Path
+    ) -> None:
+        """Written in the same transaction as the status change.
+
+        The report card moves and the budget is a point-in-time reading, so
+        this cannot be reconstructed after the fact. If it is not written here
+        it does not exist.
+        """
+        session = session_with_market()
+        settings, config = self._armed(key_file)
+        executor = Executor(FakeRest(), settings, config)
+
+        await executor.approve_and_execute(
+            session,
+            make_proposal(source="set_arbitrage"),
+            confirmed=False,
+            machine_consent=self._consent(),
+        )
+
+        row = next(
+            r for r in session.of_type(AuditLog) if r.kind == "proposal.approved"
+        )
+        autonomy = row.payload["autonomy"]
+        assert autonomy["verdict"] == "edge_shown"
+        assert autonomy["trades"] == 41
+        assert autonomy["ci_low_cents"] == "0.83"
+        assert autonomy["coverage_usable"] is True
+        assert autonomy["budget"]["trades_this_hour"] == "2"
+        # Read straight back out by the budget queries, so it has to be here.
+        assert row.payload["detector"] == "set_arbitrage"
+        assert "max_loss_cents" in row.payload
+
+    async def test_a_human_approval_still_records_the_operator(
+        self, key_file: Path
+    ) -> None:
+        """The other direction of the same property."""
+        session = session_with_market()
+        settings, config = self._armed(key_file)
+        executor = Executor(FakeRest(), settings, config)
+
+        await executor.approve_and_execute(
+            session, make_proposal(), confirmed=True
+        )
+
+        row = next(
+            r for r in session.of_type(AuditLog) if r.kind == "proposal.approved"
+        )
+        assert row.actor == "operator"
+        assert row.payload["autonomy"] is None
+
+    async def test_claiming_the_autonomous_actor_without_a_consent_is_refused(
+        self, key_file: Path
+    ) -> None:
+        """The actor is derived, never accepted from a caller.
+
+        Everything downstream reads it as fact — the budget counts rows by it,
+        the disarm triggers count failures by it. A caller that could set it by
+        hand could make the machine blind to its own spending.
+        """
+        session = session_with_market()
+        settings, config = self._armed(key_file)
+        rest = FakeRest()
+        executor = Executor(rest, settings, config)
+
+        with pytest.raises(InterlockError) as exc:
+            await executor.approve_and_execute(
+                session, make_proposal(), confirmed=True, actor=ACTOR_AUTONOMOUS
+            )
+
+        assert exc.value.code == "actor_spoofed"
+        assert rest.create_calls == []
+        assert session.of_type(Order) == []
+
+    async def test_both_authorities_at_once_places_nothing(
+        self, key_file: Path
+    ) -> None:
+        session = session_with_market()
+        settings, config = self._armed(key_file)
+        rest = FakeRest()
+        executor = Executor(rest, settings, config)
+
+        with pytest.raises(InterlockError) as exc:
+            await executor.approve_and_execute(
+                session,
+                make_proposal(),
+                confirmed=True,
+                machine_consent=self._consent(),
+            )
+
+        assert exc.value.code == "ambiguous_consent"
+        assert rest.create_calls == []
+        assert session.of_type(Order) == []
+
+    async def test_a_consent_does_not_bypass_the_kill_switch(
+        self, key_file: Path
+    ) -> None:
+        session = session_with_market()
+        settings, _ = self._armed(key_file)
+        config = Config.model_validate(
+            {
+                "risk": {"kill_switch": True},
+                "autonomous": {"enabled": True, "routes": {"demo_exchange": True}},
+            }
+        )
+        rest = FakeRest()
+        executor = Executor(rest, settings, config)
+
+        with pytest.raises(InterlockError) as exc:
+            await executor.approve_and_execute(
+                session,
+                make_proposal(),
+                confirmed=False,
+                machine_consent=self._consent(),
+            )
+
+        assert exc.value.code == "kill_switch"
+        assert rest.create_calls == []
+
+    async def test_a_consent_for_another_proposal_places_nothing(
+        self, key_file: Path
+    ) -> None:
+        session = session_with_market()
+        settings, config = self._armed(key_file)
+        rest = FakeRest()
+        executor = Executor(rest, settings, config)
+
+        with pytest.raises(InterlockError) as exc:
+            await executor.approve_and_execute(
+                session,
+                make_proposal(),
+                confirmed=False,
+                machine_consent=self._consent(proposal_id=999),
+            )
+
+        assert exc.value.code == "consent_proposal_mismatch"
+        assert rest.create_calls == []
+        assert session.of_type(Order) == []
+
+    async def test_a_refused_consent_leaves_the_proposal_pending(
+        self, key_file: Path
+    ) -> None:
+        """So the gate can reconsider it once the condition clears."""
+        session = session_with_market()
+        settings, config = self._armed(key_file)
+        proposal = make_proposal()
+        executor = Executor(FakeRest(), settings, config)
+
+        with pytest.raises(InterlockError):
+            await executor.approve_and_execute(
+                session,
+                proposal,
+                confirmed=False,
+                machine_consent=self._consent(proposal_id=999),
+            )
 
         assert proposal.status is ProposalStatus.PENDING
 
@@ -914,7 +1186,7 @@ class TestExchangeFills:
         self, key_file: Path
     ) -> None:
         session = session_with_market()
-        rest = FakeRest(create_error=RuntimeError("exchange said no"))
+        rest = FakeRest(create_error=rejection("exchange said no"))
         executor = Executor(rest, demo_settings(key_file), make_config())
 
         with pytest.raises(ExecutionError):
@@ -1297,7 +1569,7 @@ class TestFailureIsRecorded:
     async def test_rejected_orders_are_still_written(self, key_file: Path) -> None:
         session = session_with_market()
         executor = Executor(
-            FakeRest(create_error=RuntimeError("exchange said no")),
+            FakeRest(create_error=rejection("exchange said no")),
             demo_settings(key_file),
             make_config(),
         )
@@ -1318,7 +1590,7 @@ class TestFailureIsRecorded:
         legs = TestMultiLeg._legs()
         session = session_with_market(legs)
         executor = Executor(
-            FakeRest(create_error=RuntimeError("batch rejected")),
+            FakeRest(create_error=rejection("batch rejected")),
             demo_settings(key_file),
             make_config(),
         )
@@ -1332,6 +1604,52 @@ class TestFailureIsRecorded:
         assert len(orders) == 2
         assert all(o.status is OrderStatus.REJECTED for o in orders)
         assert len({o.client_order_id for o in orders}) == 2
+
+    async def test_an_ambiguous_failure_stays_pending_for_reconciliation(
+        self, key_file: Path
+    ) -> None:
+        """A timeout is not a refusal, and must not be recorded as one.
+
+        REJECTED is terminal and no sweep revisits it, so marking an order
+        REJECTED on a failure that says nothing about whether the exchange saw
+        it can strand a live order behind a local row claiming it never
+        happened. This branch had no test at all, which is how three tests
+        asserting the *other* branch went stale without anything noticing.
+        """
+        session = session_with_market()
+        executor = Executor(
+            FakeRest(create_error=TimeoutError("read timed out")),
+            demo_settings(key_file),
+            make_config(),
+        )
+
+        with pytest.raises(ExecutionError):
+            await executor.approve_and_execute(
+                session, make_proposal(), confirmed=True
+            )
+
+        order = session.of_type(Order)[0]
+        assert order.status is OrderStatus.PENDING
+        assert order.client_order_id  # the only key reconciliation has
+        kinds = [a.kind for a in session.of_type(AuditLog)]
+        assert "order.submit_ambiguous" in kinds
+        assert "order.failed" not in kinds
+
+    async def test_a_5xx_is_ambiguous_too(self, key_file: Path) -> None:
+        """The matching engine may well have taken it before the error."""
+        session = session_with_market()
+        executor = Executor(
+            FakeRest(create_error=rejection("upstream exploded", status=503)),
+            demo_settings(key_file),
+            make_config(),
+        )
+
+        with pytest.raises(ExecutionError):
+            await executor.approve_and_execute(
+                session, make_proposal(), confirmed=True
+            )
+
+        assert session.of_type(Order)[0].status is OrderStatus.PENDING
 
 
 class TestIocStatus:

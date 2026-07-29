@@ -4,9 +4,29 @@ Runs the execution rail's upkeep — proposal expiry, order auto-cancel,
 exchange reconciliation, settlement — alongside the detector registry and the
 calibration collector.
 
-**No code path in this service can place an order.**  It expires, cancels and
-reconciles; it never creates.  Detectors emit signals here, and even those
-only become proposals that a human must approve one at a time.
+**This service can place orders, and it is the only one that can do so
+without a human.**  That was not true until autonomous trading was added, and
+the sentence that used to be here — "no code path in this service can place an
+order" — is the kind of comment that is load-bearing right up until it is
+wrong.
+
+What still constrains it:
+
+- The autonomy sweep is the only loop that approves anything.  Expiry,
+  auto-cancel, reconciliation and settlement move orders *toward* a terminal
+  state and never create one.
+- It approves nothing without a :class:`~app.trading.interlocks.MachineConsent`
+  from ``app.trading.autonomy``, which is refused unless the route is armed in
+  config *and* in the environment, the report card shows a measured edge for
+  that detector on that route, backtest coverage is usable, and the hour's and
+  the day's budget have room.
+- Every interlock is still evaluated inside
+  :meth:`~app.trading.executor.Executor.approve_and_execute`, which this
+  service calls like any other caller and cannot bypass.
+- Detectors still only emit signals and *pending* proposals.  The gap between
+  a proposal and an order is now closable by the machine, but it is still a
+  gap, and ``autonomous.min_proposal_age_sec`` is how long an operator has to
+  see one before that happens.
 """
 
 from __future__ import annotations
@@ -18,7 +38,7 @@ from typing import Any
 
 from app.config import get_config
 from app.core.logging import configure_logging, get_logger
-from app.core.redis import beat, close_redis, get_redis
+from app.core.redis import beat, close_redis, get_kill_switch, get_redis
 from app.db.base import dispose_engine, get_session_factory
 from app.detectors.base import enabled_detector_names, propose_finding, record
 from app.detectors.runner import (
@@ -139,14 +159,31 @@ async def _calibration_loop(stop: asyncio.Event) -> None:
 async def _detector_loop(detectors: list[Any], stop: asyncio.Event) -> None:
     """Scan with every enabled detector and record what they find.
 
-    Detectors emit signals only. Nothing in this loop can create a proposal,
-    let alone an order — that gap is the safety model, not an oversight.
+    Detectors emit signals, and `propose_finding` turns the costable ones into
+    *pending* proposals. Nothing here approves or places anything — this loop
+    fills the queue and the autonomy sweep (or a person) empties it.
+
+    The docstring here used to claim this loop could not create a proposal,
+    which had not been true for several milestones: `propose_finding` is called
+    below. Worth naming because the same sentence was the reason nobody looked
+    at the kill-switch read underneath it.
     """
     sessions = get_session_factory()
     while not stop.is_set():
         config = get_config()
         active = [d for d in detectors if d.enabled(config)]
-        if active and not config.risk.kill_switch:
+        # Both sources, not just the config floor.
+        #
+        # This read the config flag alone, which meant the runtime kill switch
+        # — the only one an operator can reach on a running system — halted
+        # approvals and cancelled resting orders but did not stop this loop
+        # from producing more proposals. That was survivable while a human
+        # stood between a proposal and an order, because the executor refused
+        # them anyway. It is not survivable now: detector -> proposal ->
+        # auto-approval -> order is one continuous path, and an emergency stop
+        # has to break it at the first link as well as the last.
+        halted = await get_kill_switch() or config.risk.kill_switch
+        if active and not halted:
             for detector in active:
                 # Per detector, not per cycle. Declared once outside this loop,
                 # it accumulated: detector N's summary line reported the

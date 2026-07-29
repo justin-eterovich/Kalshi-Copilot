@@ -18,6 +18,7 @@ name: kalshi-copilot
 x-backend-env: &backend-env
   KALSHI_ENV: ${KALSHI_ENV:-demo}
   LIVE_TRADING: ${LIVE_TRADING:-false}
+  AUTONOMOUS_TRADING: ${AUTONOMOUS_TRADING:-false}
   KALSHI_DEMO_KEY_ID: ${KALSHI_DEMO_KEY_ID:-}
   KALSHI_DEMO_PRIVATE_KEY_PATH: ${KALSHI_DEMO_PRIVATE_KEY_PATH:-/run/secrets/kalshi_demo_key.pem}
   KALSHI_PROD_KEY_ID: ${KALSHI_PROD_KEY_ID:-}

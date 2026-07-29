@@ -53,6 +53,28 @@ def schedule() -> FeeSchedule:
 
 
 @pytest.fixture
+def maker_safe() -> FeeSchedule:
+    """A schedule where no listed series exceeds *either* default.
+
+    The `schedule` fixture above deliberately mirrors the real table, which
+    lists maker multipliers above the documented default of 0 — so on that
+    table an unlisted series must refuse on the maker side, and a test that
+    asserts "the maker default is 0" against it is really asserting the
+    refusal it was written before. Questions about what the default *is* need
+    a table on which defaulting is still safe; questions about what happens
+    when it is not belong on `schedule`.
+    """
+    return FeeSchedule.from_dict(
+        {
+            "meta": {"verified_on": "2026-07-27", "schedule_revision": "test"},
+            "formula": {"base_taker_rate": "0.07", "base_maker_rate": "0.0175"},
+            "defaults": {"taker_multiplier": 1, "maker_multiplier": 0},
+            "series": {"KXBTCY": {"maker": 0, "taker": 0}},
+        }
+    )
+
+
+@pytest.fixture
 def unverified() -> FeeSchedule:
     return FeeSchedule.from_dict(
         {
@@ -201,13 +223,42 @@ class TestSeriesLookup:
 
 
 class TestMakerFees:
-    def test_maker_defaults_to_zero(self, schedule: FeeSchedule) -> None:
+    def test_maker_defaults_to_zero(self, maker_safe: FeeSchedule) -> None:
         """The documented default maker multiplier is 0.
 
         Most markets charge no maker fee. Charging one by default — as this
         engine used to — overstates the cost of every resting order.
+
+        Asserted on a schedule that lists no maker exception, because that is
+        the condition under which defaulting is allowed at all.
         """
-        assert maker_fee_cents("0.50", "100", "KXNOTLISTED", schedule) == 0
+        assert maker_fee_cents("0.50", "100", "KXNOTLISTED", maker_safe) == 0
+
+    def test_an_unlisted_maker_refuses_once_any_series_charges_one(
+        self, schedule: FeeSchedule
+    ) -> None:
+        """The other half of the rule above, and the reason it is conditional.
+
+        Once *any* listed series carries a maker multiplier above the default,
+        an unlisted series might too, and assuming 0 would understate the fee.
+        The real schedule is in exactly this state, so this is the live
+        behaviour rather than a hypothetical.
+        """
+        with pytest.raises(UnknownSeries):
+            maker_fee_cents("0.50", "100", "KXNOTLISTED", schedule)
+
+    def test_an_unsafe_maker_default_does_not_block_taker_pricing(
+        self, schedule: FeeSchedule
+    ) -> None:
+        """The refusal is per side, and this is why that matters.
+
+        Refusing every unlisted series because the *maker* default is unsafe
+        would exclude essentially the whole catalogue from proposals over a
+        multiplier that does not apply to the order being priced — the same
+        shape as the category-keyed design that once excluded ~50,000 markets.
+        A taker order on an unlisted series still prices.
+        """
+        assert taker_fee_cents("0.50", "100", "KXNOTLISTED", schedule) == Decimal(175)
 
     def test_listed_series_do_charge_maker_fees(self, schedule: FeeSchedule) -> None:
         assert maker_fee_cents("0.50", "100", "KXCPI", schedule) == Decimal("43.75")
@@ -234,9 +285,23 @@ class TestFailClosed:
         assert schedule.verified_on == "2026-07-27"
 
     def test_default_is_safe_while_nothing_exceeds_the_default(
+        self, maker_safe: FeeSchedule
+    ) -> None:
+        assert maker_safe.default_is_safe is True
+
+    def test_the_two_sides_are_reported_separately(
         self, schedule: FeeSchedule
     ) -> None:
-        assert schedule.default_is_safe is True
+        """`default_is_safe` is the AND of two answers that genuinely differ.
+
+        On a table listing maker multipliers above the default — which the real
+        one does — the taker side is still safe to default and the maker side
+        is not. Collapsing them into one flag either overstates what may be
+        priced or excludes the whole catalogue; the dashboard reads all three.
+        """
+        assert schedule.default_taker_is_safe is True
+        assert schedule.default_maker_is_safe is False
+        assert schedule.default_is_safe is False
 
     def test_a_premium_multiplier_makes_the_default_unsafe(self) -> None:
         """If a series is ever listed above the default, an *unlisted* series
@@ -350,15 +415,33 @@ class TestRoundTrip:
         )
 
     def test_resting_entry_is_free_on_an_unlisted_series(
-        self, schedule: FeeSchedule
+        self, maker_safe: FeeSchedule
     ) -> None:
-        """Maker default is 0, so a resting entry costs nothing to open."""
+        """Maker default is 0, so a resting entry costs nothing to open.
+
+        On `maker_safe`, where defaulting the maker side is still allowed; the
+        mixed schedule refuses instead, which the case below pins.
+        """
         assert (
             round_trip_cost_cents(
-                "0.40", "100", "KXNOTLISTED", entry_is_taker=False, schedule=schedule
+                "0.40", "100", "KXNOTLISTED", entry_is_taker=False, schedule=maker_safe
             )
             == 0
         )
+
+    def test_a_resting_entry_refuses_when_the_maker_default_is_unsafe(
+        self, schedule: FeeSchedule
+    ) -> None:
+        """The refusal has to survive the round-trip helper too.
+
+        `round_trip_cost_cents` is what the proposal path actually calls, so a
+        maker leg on an unlisted series must fail closed here and not quietly
+        cost zero one layer above the lookup that refuses.
+        """
+        with pytest.raises(UnknownSeries):
+            round_trip_cost_cents(
+                "0.40", "100", "KXNOTLISTED", entry_is_taker=False, schedule=schedule
+            )
 
 
 class TestNetEdge:

@@ -230,8 +230,10 @@ async def propose_finding(
     independent proposals would let three legs of five be approved, leaving a
     directional position where the operator thought they had a hedge.
 
-    Still nothing automatic: this creates a *pending* proposal. It reaches an
-    exchange only after a human approves it.
+    This creates a *pending* proposal and nothing more. It reaches an exchange
+    only after a human approves it — or after the autonomy gate does, which is
+    a much larger set of conditions and not a shortcut past any of these.
+    Either way, this function's output is a queue entry, never an order.
 
     A **single-leg** finding goes to :func:`create_proposal` instead, through
     exactly the same guards (halted, queue depth, duplicate, per-market size)

@@ -7,14 +7,39 @@ anything; several of the rules below were learned the expensive way.
 
 ## Hard constraints — do not violate these
 
-1. **Human-in-the-loop, always.** No order reaches Kalshi without explicit
-   per-trade approval. There is **no auto-trade mode and none may be added**,
-   not even behind a flag. `trading.mode` is `Literal["paper", "live"]` and a
-   test asserts that. If a task seems to require automatic execution, stop and
-   ask.
-2. **Live trading needs three interlocks**: `KALSHI_ENV=prod` **and**
-   `LIVE_TRADING=true` **and** per-trade confirmation in the UI (typing the
-   market ticker, on the live route).
+1. **Two consent paths, and they are separately typed.** An order reaches
+   Kalshi only through `Executor.approve_and_execute`, and only with exactly
+   one of:
+   - a human's explicit per-trade `confirmed=True`, or
+   - a `MachineConsent` issued by `app/trading/autonomy.py`.
+
+   **Never both** — an approval carrying both is refused (`ambiguous_consent`),
+   because `AuditLog.actor` has one value and two claimants and picking one
+   silently would make the audit trail a guess. `actor` is *derived* in the
+   executor from which authority passed the interlocks, never accepted from
+   the caller; a caller naming `autonomous` without a consent gets
+   `actor_spoofed`.
+
+   Autonomous mode is real and may fire on every route including
+   `live_exchange`. It is not a flag — it is a gate, and the gate is what
+   replaced the human's judgement. See §Autonomy.
+
+   `trading.mode` remains `Literal["paper", "live"]` and a test still asserts
+   exactly that. It now pins something different and just as important: mode
+   says **where** an order goes, `autonomous:` says **who** approved it, and
+   collapsing them would make "is this real money?" and "is anyone watching?"
+   the same question. They are not.
+2. **Live trading interlocks, two sets, neither substituting for the other.**
+   - *Human live*: `KALSHI_ENV=prod` **and** `LIVE_TRADING=true` **and** the
+     market ticker typed back in the UI.
+   - *Machine live*: those first two **and** `AUTONOMOUS_TRADING=true` **and**
+     `autonomous.enabled` **and** `autonomous.routes.live_exchange` **and** the
+     evidence gate **and** budget remaining.
+
+   The typed ticker is never asked of the machine — a machine typing a string
+   it generated proves nothing about intent — and the machine's set is never
+   satisfied by a human. A change that lets either stand in for the other has
+   removed an interlock rather than moved it.
 3. **Demo-first.** Default environment is Kalshi demo. Demo and prod use
    separate credentials; a demo key will not authenticate against prod.
    **Paper mode never touches a production exchange**, even with prod
@@ -287,9 +312,27 @@ what a check would *fail* on before adding it.
 `propose_finding` dropped every single-leg finding with a bare `return None`,
 so an enabled detector that had found an edge, sized it with Kelly and named
 its binding cap looked identical to one that had found nothing — for three
-milestones. It now raises `single_leg_unsupported`, which the worker counts
-and prints. There is still no single-leg proposal path: set arbitrage is the
-only detector whose output can reach the approval queue.
+milestones. It now raises rather than returning, and the worker counts and
+prints the refusal code.
+
+**This paragraph named the wrong code and claimed the wrong containment for
+several milestones, and both are corrected here.** The code is `not_costable`
+— `single_leg_unsupported` exists nowhere in the tree. And there *is* a
+single-leg proposal path: `detectors/base.py` routes a single-leg finding to
+`create_proposal` through the same guards and the same pending queue, so set
+arbitrage is **not** the only detector that can reach it. As of this writing:
+
+| detector | enabled | reaches the queue? |
+|---|---|---|
+| `set_arbitrage` | yes | yes, multi-leg |
+| `stale_quote` | yes | **yes, single-leg** — has both `price` and `size_hint` |
+| `resolution_sniper` | yes | no — `not_costable`, it has a price but no `size_hint` |
+| `weather` | no | no — has `size_hint`, but its evidence dict carries no `price` |
+| everything else | no | no — neither |
+
+Re-derive that table rather than trusting it; the question "which detectors
+can reach the queue" is now also the question "what can the machine trade",
+which makes a stale answer here considerably more expensive than it was.
 
 The same shape shows up in **tri-state fields**. `Market.result` is `''` for
 an open market, not NULL — 153,808 rows — so `is not None` calls every open
@@ -299,6 +342,100 @@ outcome sample and biasing what is left toward YES. Name the value
 (`resolved_outcome`) and ask a separate question for "is it known".
 
 The backtester refuses too, and that is its main job — see below.
+
+---
+
+## Autonomy
+
+The machine can approve and place trades with no human click, on any route
+including real money. What follows is why it is safe to have built that, and
+what would make it unsafe again.
+
+**The gate replaced a judgement, so it has to be one.** Before autonomy, the
+human click was the *only* quality control in the system: `Verdict.EDGE_SHOWN`
+and `CoverageReport.usable` existed but were read by the dashboard and by
+nothing in the trading path. Removing the click without adding a gate would
+have left zero. So `autonomy.evaluate()` refuses unless the report card has
+**measured** a positive edge for that `(detector, route)` — bootstrap CI lower
+bound above zero, never the mean — and backtest coverage is usable.
+
+**Evidence is cached, never recomputed per decision.** `detector_reports` runs
+six capped SQL queries plus a 10k-resample bootstrap per pair; at a 10s
+decision interval that would dominate the worker. A 300s refresh loop holds the
+snapshot in-process. It is *also* published to Redis for the API to display —
+but **the gate never reads it from there**, so no stale key and no other
+process can authorise a trade. A failed refresh leaves the previous snapshot
+in place and lets it age out; it never writes a partial or empty one, because
+an empty snapshot refuses identically to a genuine absence of evidence and the
+operator needs to tell those apart.
+
+**The budget is derived from `audit_log`, not counted.** Trades per hour, per
+detector per hour, daily risk and the repeat cooldown all come from
+`kind='proposal.approved' AND actor='autonomous'` rows. Exact across restarts,
+and the ledger *is* the audit trail rather than a second source that can
+disagree with it. This is why `actor` is derived in the executor rather than
+passed: it is not a label, it is the index.
+
+Note the direction: `proposal.approved` is written *before* placement, so a
+failing placement burns budget rather than retrying forever. Conservative, and
+deliberate.
+
+**Named hazard: the re-proposal loop.** `_guard_duplicate` only refuses while a
+proposal is *pending*. Today a human is the rate limiter, and nothing in the
+code was. Without a cooldown: detector proposes → gate approves seconds later →
+the duplicate guard clears → the detector re-derives the same edge on its next
+20s scan → approve again, repeatedly trading one market until the per-market
+exposure cap finally binds. `budget.repeat_cooldown_sec` is the mitigation.
+This hazard is invisible from any single file, which is why it is written down
+here.
+
+**Zero refuses.** Every budget ceiling defaults to 0 and 0 means "no
+allowance", never "unlimited" — same convention as
+`news.headlines.daily_budget_usd`. There is no way to express unlimited.
+
+**The config cannot waive its own gate.** `Config`'s root validator refuses at
+*load* time: `min_trades` below `backtest.report_card_min_trades`, coverage
+waived while an exchange route is armed, `require_edge_shown` or
+`require_manual_rearm` off while live is armed. A gate that can be talked out
+of its own threshold is not a gate, and boot is the moment to find out.
+Coverage may be waived on the **simulated route only** — that route exists to
+*generate* the evidence the gate wants and cannot spend money doing it.
+
+**Arming takes four facts, and config holds only two.** `autonomous.enabled`
+and `autonomous.routes.<rail>` in `config.yaml`; `AUTONOMOUS_TRADING=true` (plus
+`KALSHI_ENV`/`LIVE_TRADING` for live) in `.env`. The environment half is
+deliberately outside the settings UI's reach: the dashboard has no auth in
+front of it by design, so arming the machine must take a file edit and a
+restart. Disarming, symmetrically, *is* reachable at runtime.
+
+**The disarm latch is a latch, not a cooldown.** It does not clear itself
+(`require_manual_rearm`, forced true whenever live is armed), and it has no TTL
+in Redis — same reasoning as the kill switch. Two triggers fire at **1**, not
+at a threshold: an `order.submit_ambiguous` (an order may exist that we cannot
+see; trading on top of an unknown position is the worst available action) and
+a `PARTIAL` outcome (the executor already calls that "real, and it needs a
+person" — under autonomy it must actually get one).
+
+Evidence staleness **refuses but does not latch**. Latching on a transient
+failure makes a human clear a condition that clears itself, which trains them
+to clear latches.
+
+**The kill switch and the disarm latch are different stops.** The kill switch
+halts everything including manual approvals and cancels resting orders; the
+latch stops only the machine. The UI must say so — an operator reaching for
+the wrong one in a hurry is a foreseeable failure.
+
+**No audit row per gate refusal.** Every existing `AuditLog` kind is a state
+change; ten refusals every ten seconds is not, and it would swamp the table
+`/api/audit` reads. Refusals are logged and published live. What an operator
+wants is the current binding reason per pair, not the same reason 8,640 times
+a day.
+
+**On this deployment the gate refuses everything, and that is it working.**
+Coverage fails all four hard axes (79/200 markets, ~0/100 settled, 9.8h against
+a 30-day span, median gaps). Demo and live autonomy are therefore unreachable
+until the data matures — by construction, not by bug. Do not "fix" this by
+lowering a threshold; the thresholds are the product.
 
 ---
 
@@ -395,9 +532,20 @@ docker compose run --rm tools python scripts/refresh_fee_schedule.py
 docker compose run --rm --no-deps api python scripts/backtest.py --days 30
 ```
 
+**Two config files, and mixing them up breaks the safety tests.**
+`config.example.yaml` is committed and holds the project's defaults —
+everything disarmed. `config.yaml` is **gitignored**, is this box's live
+state, and is what actually loads. `test_config.py` asserts the shipped-safe
+posture against the *template*, and the template is baked into the image by
+the Dockerfile (it is not bind-mounted, because the point is to test the
+committed copy). While these were one file, enabling a detector made
+`test_every_detector_ships_disabled` fail — the assertion and the thing it
+asserted about were the same bytes. **Add any new key to both**; a drift test
+compares the key sets and names what is missing.
+
 **`compose run api pytest` tests the image, not your working tree.** Only
-`config.yaml`, `data/` and `secrets/` are bind-mounted; `app/` and `tests/`
-are baked in at build time. Without the `--build` above, a green suite is
+`config.yaml`, `data/` and `secrets/` are bind-mounted; `app/`, `tests/` and
+`config.example.yaml` are baked in at build time. Without the `--build` above, a green suite is
 green for the code you last built — the run that exposed this reported 1,292
 tests while the tree on disk held several hundred more. Either build first, or
 bind-mount the source (`-v ./backend:/app` plus `config.yaml`, `data/`,

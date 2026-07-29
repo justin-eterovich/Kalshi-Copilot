@@ -3,7 +3,15 @@
 Every endpoint here is either read-only or requires an explicit, per-trade
 human decision.  There is no bulk approve, no "approve all", and no endpoint
 that creates and executes in one call — the proposal has to exist and be
-looked at before it can be approved, because that gap *is* the safety model.
+looked at before it can be approved.
+
+**Nothing here can produce an autonomous approval.**  The machine path needs a
+``MachineConsent``, which only ``app.trading.autonomy`` issues and only the
+worker's sweep uses; no request reaching this module can construct one.  That
+is worth stating as a property rather than leaving as an accident, because the
+dashboard has no auth in front of it by design (LAN-only), so "nothing on the
+network can trigger an unattended trade" is doing real work.  A test in
+``test_build_identity.py`` pins it.
 
 Errors are shaped so the dashboard can explain a refusal precisely:
 

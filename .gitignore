@@ -25,10 +25,21 @@ frontend/dist/
 .vite/
 *.tsbuildinfo
 
+# ---- local deployment state ----
+# One box's live config, not the project's defaults. Start it with
+#   cp config.example.yaml config.yaml
+# The template is committed and is what test_config.py asserts ships disarmed;
+# this file is where you actually turn detectors on.
+/config.yaml
+
 # ---- data & runtime ----
 pgdata/
 data/runtime/
 *.log
+
+# ---- agent tooling ----
+# Local tool permissions and scratch worktrees (each a full checkout).
+.claude/
 
 # ---- editors / os ----
 .DS_Store

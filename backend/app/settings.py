@@ -31,6 +31,15 @@ class Settings(BaseSettings):
     # -- environment ----------------------------------------------------
     kalshi_env: KalshiEnv = KalshiEnv.DEMO
     live_trading: bool = False
+    #: Whether this machine may approve trades without a human.
+    #:
+    #: In the environment rather than config.yaml on purpose. The split is
+    #: that the environment says *this deployment may act on its own at all*
+    #: — which requires editing .env and restarting — while config.yaml says
+    #: which rails and at what budget. An operator tuning the budget from the
+    #: settings UI cannot arm the machine, and arming it is not a thing that
+    #: can happen from a browser on the LAN.
+    autonomous_trading: bool = False
     service_role: str = "api"
 
     # -- credentials ----------------------------------------------------
@@ -99,9 +108,27 @@ class Settings(BaseSettings):
         """Both interlocks thrown.
 
         Even when this is True, no order is placed without per-trade
-        confirmation in the UI — this only unlocks the possibility.
+        confirmation in the UI — or, on the autonomous path, without
+        everything :attr:`autonomous_live_armed` additionally requires. This
+        only unlocks the possibility.
         """
         return self.is_prod and self.live_trading
+
+    @property
+    def autonomous_live_armed(self) -> bool:
+        """All three environment interlocks for machine-driven real money.
+
+        Strictly stronger than :attr:`live_trading_armed`: a deployment can be
+        armed for a human to trade live while the machine is not. There is no
+        combination in which this is true and that is false, which is the
+        property that keeps "the robot may trade real money" from being
+        reachable by fewer facts than "a person may".
+
+        Even when this is True, an order still needs a ``MachineConsent`` from
+        the autonomy gate — the route armed in config, a report card showing a
+        measured edge, usable coverage, and budget left.
+        """
+        return self.is_prod and self.live_trading and self.autonomous_trading
 
     def credentials_present(self) -> bool:
         """True when the active environment has a key ID and a readable key file.
