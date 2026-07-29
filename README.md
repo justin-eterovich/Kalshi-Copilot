@@ -2,11 +2,19 @@
 
 Self-hosted Kalshi analysis and trading copilot. Ingests market data, runs
 edge-detection algorithms, proposes trades with sizing and a written rationale,
-and executes **only after you approve each trade individually**.
+and executes either after you approve each trade individually, or — if you arm
+it — on its own.
 
-> **No order reaches Kalshi without explicit per-trade human approval.**
-> There is no auto-trade mode, not even behind a flag. That is a design
-> constraint, not a default.
+> **Two consent paths, and exactly one applies to any given order.**
+> A human approving that specific trade, or the autonomy gate issuing a
+> machine consent for it. Never both; an approval claiming both is refused.
+>
+> **Autonomy ships disarmed and takes four separate facts to arm**, one of
+> which is an environment variable no request on your LAN can set. Once
+> armed, it still refuses any trade whose detector has not been *measured*
+> profitable on that route by the backtest report card. On a fresh
+> deployment that refuses everything, and it will keep refusing for months —
+> that is the gate working, not a bug.
 
 The premise: you cannot out-speed professional market makers on flagship
 markets, so this hunts edges that persist longer than your approval latency —
@@ -77,6 +85,7 @@ out.
 
 ```bash
 cp .env.example .env
+cp config.example.yaml config.yaml
 $EDITOR .env
 ```
 
@@ -84,6 +93,11 @@ At minimum set `POSTGRES_PASSWORD`, `KALSHI_DEMO_KEY_ID`, and make
 `DATABASE_URL` use the same password.
 
 Leave `KALSHI_ENV=demo` and `LIVE_TRADING=false`.
+
+**Both copies are required.** `config.yaml` is gitignored — it is one box's
+live state, not the project's defaults — and compose bind-mounts it, so if it
+does not exist Docker helpfully creates a *directory* with that name and every
+service then fails to parse its config. Copy the template first.
 
 ### 4. Bring it up
 
@@ -279,14 +293,23 @@ Size comes from Kelly rather than a fixed `size_hint`, on the after-fee cost
 per-market cap and the exposure headroom all cut it, and the binding cap is
 named on the signal.
 
-**It cannot currently create a proposal.** The only detector→proposal path
-takes a *multi-leg* finding, so set arbitrage is the one detector whose output
-reaches the approval queue; a single-leg finding is refused with
-`single_leg_unsupported`, counted in the scan's refusal line, and recorded as a
-signal. Acting on one means writing the ticket by hand from `/api/signals`.
-That refusal is loud on purpose — it used to be a silent `return None`, which
-made a detector that had found and sized a real edge look exactly like one
-that had found nothing.
+**It does reach the approval queue.** This paragraph used to say it could not,
+naming a refusal code (`single_leg_unsupported`) that no longer exists — the
+single-leg path goes through `create_proposal` under the same guards as any
+other, and stale quote has both the price and the size hint it needs. A finding
+missing either is refused with `not_costable`, counted in the scan's refusal
+line, and recorded as a signal; acting on one means writing the ticket by hand
+from `/api/signals`. That refusal is loud on purpose — it used to be a silent
+`return None`, which made a detector that had found and sized a real edge look
+exactly like one that had found nothing.
+
+Worth knowing before arming autonomy: this detector's fair value is a
+heuristic, its spot feed is a reference price rather than the CF Benchmarks
+index these markets actually settle on, and it is the detector that once
+reported a +72¢ edge by pricing ETH contracts against Bitcoin. The evidence
+gate does not care about any of that directly — it only asks whether the
+measured P&L came out positive — which is the argument for letting it run on
+the simulated route for a long time first.
 
 ### Resolution sniper
 
@@ -505,7 +528,8 @@ rather than producing a number.
 
 ## Going live
 
-Live trading is deliberately awkward to enable. All three must be true:
+Live trading is deliberately awkward to enable. For a trade **you** approve,
+all three must be true:
 
 1. `KALSHI_ENV=prod` in `.env`
 2. `LIVE_TRADING=true` in `.env`
@@ -523,6 +547,82 @@ still says "safe mode", one of the interlocks is not set.
 
 Before you do this, read the per-detector report card (M9). A detector that has
 not proven positive expectancy on paper, net of fees, has not earned real money.
+
+---
+
+## Autonomous trading
+
+The machine approving and placing trades with nobody watching. Off by default;
+the environment interlock is not settable from the dashboard, deliberately.
+
+**What it takes.** Four facts, plus a gate that is evaluated per trade:
+
+| # | Fact | Where |
+|---|---|---|
+| 1 | `autonomous.enabled: true` | `config.yaml` |
+| 2 | `autonomous.routes.<rail>: true` | `config.yaml` |
+| 3 | `AUTONOMOUS_TRADING=true` | `.env` (needs a restart) |
+| 4 | `KALSHI_ENV=prod` + `LIVE_TRADING=true` | `.env`, **live route only** |
+
+Then, per trade: the report card must show `EDGE_SHOWN` for that
+`(detector, route)`, backtest coverage must be usable, and the hour's and the
+day's budget must have room. Every budget ceiling ships at **0, and 0 refuses**
+— there is no way to write "unlimited".
+
+**What replaced your judgement.** The evidence gate, and it is a real
+threshold rather than a formality: `EDGE_SHOWN` means the *bootstrap
+confidence interval's lower bound* is above zero over at least
+`backtest.report_card_min_trades` decisions — not that the mean looks good. A
+20-trade binary sample is exactly the regime where a point estimate lies. The
+config loader refuses at boot if you try to lower that floor, waive coverage
+while an exchange route is armed, or turn off `require_edge_shown` on live.
+
+**Seeing why it refused.** `GET /api/autonomy` reports the arming state, both
+stops, the budget ceilings, and the evidence snapshot the gate is working from
+— every measured pair with its verdict, decision count and interval lower
+bound. There is deliberately no audit row per refusal: the gate evaluates every
+few seconds, and what you want is the current binding reason, not the same
+sentence several thousand times a day. The worker logs a one-line summary per
+sweep with a count per refusal code.
+
+On this deployment it refuses everything, and that is it working:
+
+```
+manual ticket                       -> manual_proposal
+stale_quote, coverage enforced      -> coverage_unusable
+stale_quote, coverage waived        -> insufficient_trades
+```
+
+That last one is worth staring at. `stale_quote` shows a bootstrap lower bound
+of **+61.6¢ over 16 decisions** and is refused anyway, because the floor is 20.
+The most persuasive number the system can produce is the one carrying the least
+information, and there is no override for it.
+
+**It disarms itself** on a losing streak, the daily loss limit, repeated
+placement failures, and immediately on a single ambiguous placement or a
+partially-filled multi-leg proposal. The latch has no TTL and does not clear
+itself — re-arming is a deliberate act. Note this is *not* the kill switch: the
+kill switch halts everything including your own manual approvals and cancels
+resting orders; disarming autonomy stops only the machine.
+
+**Checklist before arming the live route:**
+
+- [ ] The pair has read `EDGE_SHOWN` on `demo_exchange` for at least
+      `min_trades` decisions over at least 30 days — not on `simulated`, which
+      is a different kind of evidence and never transfers.
+- [ ] `scripts/backtest.py` reports usable coverage rather than refusing.
+- [ ] You have deliberately triggered every disarm condition at least once on
+      the simulated route and watched the latch hold.
+- [ ] Budgets set to the smallest numbers that can lose money you would not
+      mind losing.
+- [ ] The topbar shows a red `AUTO` pill and the banner names real money and
+      autonomy together. If it does not, something is not armed — check
+      `GET /api/autonomy`, which names the binding refusal per pair.
+
+**On a fresh deployment the gate refuses everything**, because coverage needs
+months of orderbook snapshots that no historical endpoint can backfill. Wait,
+or run on `simulated` to generate the evidence. Do not lower a threshold — the
+thresholds are the product.
 
 ---
 
@@ -760,6 +860,48 @@ bind-mounted read-only, so edits need only a restart:
 $EDITOR config.yaml
 docker compose restart worker ingest
 ```
+
+**There are two config files and the split is deliberate.**
+
+| file | tracked? | what it is |
+|---|---|---|
+| `config.example.yaml` | committed | the project's defaults — everything disarmed |
+| `config.yaml` | gitignored | this deployment's live state — what actually loads |
+
+`backend/tests/test_config.py` asserts against the *template* that a fresh
+clone ships with every detector off, every engine off, paper mode and no
+autonomy. While these were one file, enabling a detector on a running box
+edited the very thing that was supposed to prove nothing was enabled, and
+those tests failed as soon as anyone used the system normally.
+
+Add new keys to **both**: one added only to `config.yaml` never reaches a
+fresh clone, and one added only to the template is never exercised against a
+real boot. A test compares the two key sets and names anything that drifts.
+
+> **Back up `config.yaml` before switching branches.**
+>
+> ```bash
+> cp config.yaml config.yaml.bak
+> ```
+>
+> Being gitignored does **not** protect it. `.gitignore` only stops git
+> *tracking* a file — it does not stop a checkout writing over one. Every
+> branch from before the split still tracks `config.yaml`, so
+> `git checkout <older-branch>` silently replaces your live config with that
+> branch's copy, and a later `git pull` through the commit that removes it
+> deletes the file outright.
+>
+> This happened, once, on the merge that introduced the split. It was
+> recoverable only because the containers were still running and still had the
+> deleted file bind-mounted:
+>
+> ```bash
+> docker compose exec -T api cat /app/config.yaml > config.yaml
+> ```
+>
+> With the stack down there is no copy anywhere, and the fallback is rebuilding
+> your settings from `config.example.yaml` by hand. The hazard lasts until
+> every branch you still care about has the split merged in.
 
 **All detectors ship disabled.** Enable them one at a time and let the report
 card earn your trust before it earns your money.

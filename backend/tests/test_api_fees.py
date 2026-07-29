@@ -37,12 +37,31 @@ class TestFeeQuote:
         # $0.04375 is 437.5 centicents -> rounds up to 438 -> 4.38c
         assert Decimal(result["fee_cents"]) == Decimal("4.38")
 
-    async def test_maker_is_free_on_an_unlisted_series(self) -> None:
-        """The documented default maker multiplier is 0."""
-        maker = await fee_quote(
-            price_dollars="0.5000", contracts="1000", is_taker=False
-        )
-        assert Decimal(maker["fee_cents"]) == 0
+    async def test_maker_on_an_unlisted_series_fails_closed(self) -> None:
+        """The maker default is 0, but only while defaulting is safe.
+
+        This asserted a free maker quote, which was right while every listed
+        maker multiplier was 0. The real schedule now lists series above that
+        default, so assuming it for a series we did not find can understate the
+        fee — and this endpoint's whole job at that point is to refuse rather
+        than to render a number the ticket UI would show as fact.
+
+        Unlike the engine tests this one reads the deployed schedule, so it
+        pins the endpoint's *handling* rather than a particular table: whatever
+        the file says, an unpriceable maker leg comes back as a 409 and not a
+        zero.
+        """
+        with pytest.raises(HTTPException) as exc:
+            await fee_quote(
+                price_dollars="0.5000", contracts="1000", is_taker=False
+            )
+        assert exc.value.status_code == 409
+        assert exc.value.detail["error"] == "unknown_series"
+        # The refusal is per side: `test_prices_a_normal_market` above quotes
+        # a taker on the same unlisted series and still gets a number. A
+        # maker-side refusal leaking across would empty the proposal queue
+        # rather than tighten it, since every ticket this system builds is a
+        # taker order.
 
     async def test_maker_is_charged_on_a_listed_series(self) -> None:
         maker = await fee_quote(

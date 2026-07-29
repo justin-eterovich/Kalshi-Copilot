@@ -34,8 +34,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import Config
 from app.core.logging import get_logger
-from app.core.redis import get_kill_switch
 from app.core.money import parse_count, parse_dollars
+from app.core.redis import get_kill_switch
 from app.db.models import Fill, Order, OrderStatus
 from app.kalshi.rest import KalshiApiError
 from app.settings import Settings

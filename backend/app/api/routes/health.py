@@ -23,6 +23,7 @@ from app.core.redis import HEARTBEAT_KEY, get_kill_switch, get_redis
 from app.db.base import get_engine
 from app.detectors.base import enabled_detector_names
 from app.settings import get_settings
+from app.trading import autonomy
 
 router = APIRouter()
 
@@ -73,9 +74,14 @@ async def system() -> dict[str, Any]:
     return {
         "environment": settings.kalshi_env.value,
         "trading_mode": config.trading.mode,
-        # Both interlocks. Even when armed, every order still needs per-trade
-        # approval in the UI — there is no auto-trade path.
+        # Both interlocks for the *human* live path. Even when armed, an
+        # operator-approved order still needs the ticker typed back.
+        #
+        # This says nothing about the machine: autonomous live trading needs
+        # `autonomous_live_armed`, which is strictly stronger, plus the
+        # evidence gate. See /api/autonomy for that side.
         "live_trading_armed": settings.live_trading_armed,
+        "autonomous_live_armed": settings.autonomous_live_armed,
         # The effective switch, config floor OR the runtime flag in Redis.
         # Reporting only the config file made the header disagree with what
         # the executor would actually do.
@@ -167,4 +173,65 @@ async def fee_quote(
         "contracts": contracts,
         "series": series,
         "is_taker": is_taker,
+    }
+
+
+@router.get("/autonomy")
+async def autonomy_state() -> dict[str, Any]:
+    """What the machine may do, and — when it may not — precisely why.
+
+    Read-only. Nothing here can arm anything: the environment half of the
+    interlock is outside this process's reach by design, and the config half
+    needs a file edit and a restart. The dashboard has no auth in front of it,
+    so "nothing on the LAN can start unattended trading" has to be a property
+    of the surface, not a convention.
+
+    The useful field is ``evidence``. An operator deciding whether to arm a
+    route wants the measured numbers in front of them, and the gate refusing
+    everything on this deployment is the expected reading rather than a fault
+    — coverage fails on real thresholds and the report card has no settled
+    trades to work from.
+
+    The evidence shown here is read from Redis, because the gate runs in the
+    *worker* and these are separate processes with separate memory. That is
+    display only and one-way: the gate reads its own in-process snapshot and
+    never this key. Authorisation and display are deliberately different
+    paths, since a key any process could write must not be able to authorise
+    a trade — and a key that outlived its writer must not authorise one after
+    the evidence had gone.
+    """
+    settings = get_settings()
+    config = get_config()
+    evidence = await autonomy.published_evidence()
+
+    return {
+        "enabled": config.autonomous.enabled,
+        "env_armed": settings.autonomous_trading,
+        "live_armed": settings.autonomous_live_armed,
+        "routes": {
+            "simulated": config.autonomous.routes.simulated,
+            "demo_exchange": config.autonomous.routes.demo_exchange,
+            "live_exchange": config.autonomous.routes.live_exchange,
+        },
+        # Two different stops, and an operator reaching for the wrong one in a
+        # hurry is a foreseeable failure — so both are reported, named, and
+        # described. The kill switch halts everything including manual
+        # approvals and cancels resting orders; the latch stops only the
+        # machine and needs a human to clear it.
+        "kill_switch": await get_kill_switch(),
+        "disarmed_reason": await autonomy.disarm_reason(),
+        "requires_manual_rearm": config.autonomous.require_manual_rearm,
+        "min_proposal_age_sec": config.autonomous.min_proposal_age_sec,
+        "decision_interval_sec": config.autonomous.decision_interval_sec,
+        "evidence": evidence,
+        "budget": {
+            "max_trades_per_hour": config.autonomous.budget.max_trades_per_hour,
+            "max_trades_per_detector_per_hour": (
+                config.autonomous.budget.max_trades_per_detector_per_hour
+            ),
+            "max_daily_risk_cents": config.autonomous.budget.max_daily_risk_cents,
+            "max_open_positions": config.autonomous.budget.max_open_positions,
+            "max_working_orders": config.autonomous.budget.max_working_orders,
+            "repeat_cooldown_sec": config.autonomous.budget.repeat_cooldown_sec,
+        },
     }

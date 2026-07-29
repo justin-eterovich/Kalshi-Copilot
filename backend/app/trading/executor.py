@@ -1,10 +1,18 @@
 """The execution rail: approved proposal in, order and fills out.
 
 This is the only module in the system that can cause an order to exist.  It
-is reached from exactly one place — a human approving one specific proposal —
-and it re-checks every interlock itself rather than trusting the caller,
-because an interlock that lives only in the API layer is an interlock that
-the next caller forgets.
+is reached from exactly two places, one per authority — a human approving one
+specific proposal, and the autonomy sweep issuing a ``MachineConsent`` for
+one — and it re-checks every interlock itself rather than trusting either
+caller, because an interlock that lives only in the API layer is an interlock
+that the next caller forgets.  Adding the second caller is precisely why that
+was worth insisting on: nothing had to move for the machine path to be
+subject to the same rail.
+
+``actor`` is derived here from which authority passed the interlocks, never
+accepted from the caller.  ``AuditLog.actor`` is the only record of who
+authorised an order, and the autonomy budget, the self-disarm triggers and the
+dashboard all read it as fact.
 
 Ordering of operations is load-bearing:
 
@@ -54,7 +62,14 @@ from app.kalshi.rest import TIF_GTC, TIF_IOC, KalshiApiError, KalshiRestClient
 from app.settings import Settings
 from app.trading import paper, positions, proposals, risk
 from app.trading.direction import book_side, to_yes_price
-from app.trading.interlocks import ExecutionRoute, InterlockError, check_execution
+from app.trading.interlocks import (
+    ACTOR_AUTONOMOUS,
+    ACTOR_OPERATOR,
+    ExecutionRoute,
+    InterlockError,
+    MachineConsent,
+    check_execution,
+)
 
 log = get_logger(__name__)
 
@@ -172,9 +187,14 @@ class Executor:
         *,
         confirmed: bool,
         confirmation_phrase: str | None = None,
-        actor: str = "operator",
+        machine_consent: MachineConsent | None = None,
+        actor: str = ACTOR_OPERATOR,
     ) -> Order:
         """Approve one proposal and place its order.
+
+        Reached from exactly two places, one per authority: the approval
+        endpoint (a human) and the autonomy sweep (the machine). ``actor`` is
+        derived from which one, not accepted from the caller — see below.
 
         Raises:
             InterlockError: a safety check refused. Nothing is placed and the
@@ -220,8 +240,30 @@ class Executor:
             self._config,
             confirmed=confirmed,
             kill_switch=await get_kill_switch(),
+            machine_consent=machine_consent,
             confirmation_phrase=confirmation_phrase,
         )
+
+        # `actor` is derived from which authority actually passed the
+        # interlocks, never trusted from the caller.
+        #
+        # AuditLog.actor is the only record of who authorised an order, and
+        # everything downstream reads it as fact: the autonomy budget counts
+        # rows by it, the disarm triggers count failures by it, the dashboard
+        # labels fills by it. A caller that passed the wrong string would not
+        # produce a cosmetic error — it would produce a machine that cannot
+        # see its own spending, or one whose losses are attributed to a person
+        # who was asleep.
+        if machine_consent is not None:
+            actor = ACTOR_AUTONOMOUS
+        elif actor == ACTOR_AUTONOMOUS:
+            raise InterlockError(
+                "actor_spoofed",
+                "an approval claimed the autonomous actor without a machine "
+                "consent. The actor is derived from the authority that passed "
+                "the interlocks, so this can only be a caller constructing it "
+                "by hand.",
+            )
 
         # The portfolio limits, which no single proposal can check about
         # itself. They live here rather than in the API layer for the same
@@ -262,8 +304,25 @@ class Executor:
 
         proposal.status = ProposalStatus.APPROVED
         proposal.decided_at = datetime.now(UTC)
-        proposal.decision_reason = f"approved by {actor}"
+        if machine_consent is not None:
+            proposal.decision_reason = (
+                f"auto-approved by the autonomy gate v{machine_consent.gate_version}: "
+                f"{machine_consent.detector} {machine_consent.verdict} over "
+                f"n={machine_consent.trades}, CI low "
+                f"{machine_consent.ci_low_cents}c"
+            )
+        else:
+            proposal.decision_reason = f"approved by {actor}"
 
+        # The justification is written in the same transaction as the status
+        # change, so there is no state in which an autonomous order exists and
+        # the reason it was allowed does not. Reconstructing it later is not
+        # possible: the report card moves, and the budget is a point-in-time
+        # reading.
+        #
+        # `detector` and `max_loss_cents` are here because the budget queries
+        # read them straight back out of this payload — the audit trail is the
+        # ledger, rather than a second counter that can disagree with it.
         await proposals.audit(
             session,
             kind="proposal.approved",
@@ -274,6 +333,11 @@ class Executor:
                 "route": route.value,
                 "event_ticker": proposal.event_ticker,
                 "leg_count": proposal.leg_count,
+                "detector": proposal.source,
+                "max_loss_cents": str(proposal.max_loss_cents or 0),
+                "autonomy": (
+                    machine_consent.as_dict() if machine_consent is not None else None
+                ),
             },
         )
 
@@ -470,7 +534,12 @@ class Executor:
                 session,
                 kind="order.submit_ambiguous" if ambiguous else "order.failed",
                 ticker=proposal.ticker,
-                actor="system",
+                # The authority that ordered the placement, not "system".
+                # Autonomy's self-disarm counts failures and ambiguous
+                # placements *it* caused; attributing them to a generic actor
+                # made the machine unable to see its own failure rate, which is
+                # the one thing that has to stop it.
+                actor=actor,
                 payload={
                     "proposal_id": proposal.id,
                     "error": str(exc)[:500],

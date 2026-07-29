@@ -175,6 +175,100 @@ class TestAsyncTestsActuallyRun:
         )
 
 
+class TestAutonomyIsWiredCorrectly:
+    """Structural properties of the machine-consent path.
+
+    These are not behaviour tests — each has its own elsewhere. They pin the
+    *shape* of the autonomy path, because every one of them is a property that
+    a plausible-looking refactor would quietly remove: collapsing the consent
+    into a bool, letting a caller name the actor, reading evidence from a
+    cache that another process can write.
+    """
+
+    def test_check_execution_still_requires_a_kill_switch_argument(self) -> None:
+        """Unchanged by autonomy, and it must stay that way.
+
+        ``machine_consent`` gained a ``None`` default, which is safe because
+        None can only make the check stricter. ``kill_switch`` must not follow
+        it: a forgotten kill-switch argument would *bypass* the emergency stop.
+        """
+        from app.trading.interlocks import check_execution
+
+        params = inspect.signature(check_execution).parameters
+        assert params["kill_switch"].default is inspect.Parameter.empty
+        assert params["kill_switch"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    def test_machine_consent_is_not_a_bool(self) -> None:
+        """A machine approval must never be confusable with a human one.
+
+        If this were a bool it would be one keyword away from ``confirmed``,
+        and the two mean opposite things about who is accountable.
+        """
+        from app.trading.interlocks import MachineConsent, check_execution
+
+        params = inspect.signature(check_execution).parameters
+        assert "machine_consent" in params
+        assert params["machine_consent"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params["machine_consent"].annotation is not bool
+        # It names its subject, which is what makes it non-replayable.
+        assert "proposal_id" in MachineConsent.__dataclass_fields__
+        assert "route" in MachineConsent.__dataclass_fields__
+        assert MachineConsent.__dataclass_params__.frozen
+
+    def test_the_executor_derives_the_actor_rather_than_accepting_it(self) -> None:
+        """SAFETY — the audit trail is the only record of who approved."""
+        from app.trading.executor import Executor
+
+        source = inspect.getsource(Executor.approve_and_execute)
+        assert "ACTOR_AUTONOMOUS" in source
+        assert "actor_spoofed" in source
+
+    def test_exactly_one_authority_is_enforced(self) -> None:
+        from app.trading.interlocks import check_execution
+
+        source = inspect.getsource(check_execution)
+        assert "ambiguous_consent" in source
+        assert "not_confirmed" in source
+
+    def test_no_api_route_can_produce_an_autonomous_approval(self) -> None:
+        """The machine path lives in the worker and is unreachable over HTTP.
+
+        The dashboard has no auth in front of it by design (LAN-only), so
+        "nothing on the network can trigger an autonomous trade" is a property
+        worth pinning rather than assuming.
+        """
+        from app.api.routes import trading
+
+        assert "machine_consent" not in inspect.getsource(trading)
+
+    def test_the_detector_loop_reads_the_runtime_kill_switch(self) -> None:
+        """It read only the config floor, which the operator cannot reach.
+
+        Survivable while a human stood between a proposal and an order.
+        Not survivable once that path is continuous.
+        """
+        from app.worker import main as worker_main
+
+        source = inspect.getsource(worker_main._detector_loop)
+        assert "get_kill_switch" in source
+
+    def test_autonomy_ships_disarmed(self) -> None:
+        from app.config import Config
+
+        auto = Config.model_validate({}).autonomous
+        assert auto.enabled is False
+        assert auto.routes.live_exchange is False
+        assert auto.evidence.require_edge_shown is True
+
+    def test_arming_the_machine_needs_an_environment_variable(self) -> None:
+        """Not settable from config.yaml or the settings UI, deliberately."""
+        from app.settings import Settings
+
+        assert "autonomous_trading" in Settings.model_fields
+        assert Settings.model_fields["autonomous_trading"].default is False
+        assert Settings().autonomous_live_armed is False
+
+
 class TestBuildProvenance:
     """If the image records what it was built from, check it.
 
