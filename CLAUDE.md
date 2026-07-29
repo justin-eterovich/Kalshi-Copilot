@@ -573,6 +573,20 @@ committed copy). While these were one file, enabling a detector made
 asserted about were the same bytes. **Add any new key to both**; a drift test
 compares the key sets and names what is missing.
 
+**Gitignored does not mean safe from a checkout, and this destroyed the live
+config once.** `.gitignore` stops git *tracking* a file; it does nothing to
+stop a checkout writing over one. Every branch predating the split still
+tracks `config.yaml`, so `git checkout <older-branch>` overwrites the
+operator's live config with that branch's copy without a word, and a `git pull`
+through the removal commit then deletes it. Observed on the merge that
+introduced the split: `git checkout` of the base branch replaced it, the
+fast-forward deleted it, and the only surviving copy was the one the running
+containers still had bind-mounted —
+`docker compose exec -T api cat /app/config.yaml > config.yaml`. With the stack
+down it would have been gone. `cp config.yaml config.yaml.bak` before touching
+branches, and treat the worktrees under `.claude/worktrees/` as carrying the
+same hazard until the split is merged into each.
+
 **`compose run api pytest` tests the image, not your working tree.** Only
 `config.yaml`, `data/` and `secrets/` are bind-mounted; `app/`, `tests/` and
 `config.example.yaml` are baked in at build time. Without the `--build` above, a green suite is
