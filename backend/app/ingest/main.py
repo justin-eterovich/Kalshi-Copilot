@@ -21,13 +21,15 @@ import asyncio
 import contextlib
 import signal
 
+import httpx
+
 from app.config import get_config
 from app.core.logging import configure_logging, get_logger
 from app.core.redis import beat, close_redis, get_redis
 from app.db.base import dispose_engine, get_session_factory
 from app.ingest.catalog import CatalogSync
 from app.ingest.news import sweep_headlines
-from app.ingest.spot import fetch_spot, record_spot
+from app.ingest.spot import fetch_spot, record_spot, supported_symbols
 from app.ingest.streams import StreamProcessor
 from app.ingest.weather import backfill_actuals, sweep_weather, tracked_stations
 from app.kalshi.client import build_rest_client, build_websocket
@@ -53,6 +55,10 @@ BOOK_HEAL_MIN_STALE = 10
 #: Spot is only useful to a detector while it is fresh, and the
 #: stale-quote detector's default tolerance is seconds.
 SPOT_POLL_SEC = 3
+#: Shorter than the generic 8s default in `fetch_spot`: a reply that takes
+#: longer than two poll intervals has already missed its window, and holding
+#: the connection open only delays the next attempt.
+SPOT_FETCH_TIMEOUT_SEC = 6.0
 #: Feeds are other people's free servers, and an item that arrives thirty
 #: seconds sooner is still an item published after the market moved.
 NEWS_POLL_SEC = 300
@@ -241,11 +247,19 @@ async def _report_stats(processor: StreamProcessor, stop: asyncio.Event) -> None
 
 
 async def _spot_loop(stop: asyncio.Event) -> None:
-    """Poll BTC spot into external_prices.
+    """Poll every configured crypto spot symbol into external_prices.
 
     Only runs when the bitcoin engine is switched on. Detectors check the
     *age* of the newest row rather than trusting it, so a poller that stalls
     degrades to "no signals" instead of "signals against a stale price".
+
+    The symbols are fetched **concurrently and independently**. Concurrently
+    because they share one poll interval and four sequential round-trips do not
+    reliably fit in three seconds; independently because one venue failing on
+    one symbol must cost only that symbol its tick. Sequential fetches with a
+    single ``except`` would let a slow XRP request age the BTC price, which is
+    the freshness failure this whole module is arranged to avoid — silently,
+    since a stale reference does not raise, it just stops signalling.
     """
     config = get_config()
     if not config.bitcoin.enabled:
@@ -254,18 +268,43 @@ async def _spot_loop(stop: asyncio.Event) -> None:
 
     sessions = get_session_factory()
     source = config.bitcoin.spot_source
-    log.info("bitcoin spot feed: %s", source)
 
-    while not stop.is_set():
+    # Refuse an unpollable pair once, here, rather than logging the same
+    # failure every three seconds forever. A symbol the source cannot price is
+    # a config error the operator has to fix; the remaining symbols still run,
+    # because dropping the whole feed over one bad entry is a worse outcome
+    # than pricing three assets out of four.
+    available = set(supported_symbols(source))
+    symbols = [s for s in config.bitcoin.spot_symbols if s in available]
+    unsupported = [s for s in config.bitcoin.spot_symbols if s not in available]
+    if unsupported:
+        log.error(
+            "spot source %s cannot price %s; those symbols will not be polled "
+            "and every market that references them will be refused",
+            source,
+            unsupported,
+        )
+    if not symbols:
+        log.error("spot source %s can price none of the configured symbols", source)
+        return
+    log.info("crypto spot feed: %s -> %s", source, symbols)
+
+    async def poll_one(client: httpx.AsyncClient, symbol: str) -> None:
         try:
-            price = await fetch_spot(source)
+            price = await fetch_spot(source, symbol, client=client)
             async with sessions() as session:
-                session.add(record_spot(source, price))
+                session.add(record_spot(source, price, symbol))
                 await session.commit()
         except Exception as exc:  # noqa: BLE001 - never kill the loop
-            log.warning("spot fetch from %s failed: %s", source, exc)
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(stop.wait(), timeout=SPOT_POLL_SEC)
+            log.warning("spot fetch of %s from %s failed: %s", symbol, source, exc)
+
+    # One pool for the life of the loop. Per-symbol per-tick clients would open
+    # a TLS connection roughly eighty times a minute against a free endpoint.
+    async with httpx.AsyncClient(timeout=SPOT_FETCH_TIMEOUT_SEC) as client:
+        while not stop.is_set():
+            await asyncio.gather(*(poll_one(client, s) for s in symbols))
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=SPOT_POLL_SEC)
 
 
 async def _weather_loop(stop: asyncio.Event) -> None:

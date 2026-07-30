@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class _Base(BaseModel):
@@ -234,9 +234,37 @@ class DetectorsConfig(_Base):
 class BitcoinConfig(_Base):
     enabled: bool = False
     spot_source: Literal["coinbase", "binance", "kraken"] = "coinbase"
+    #: Which reference prices to poll. The stale-quote detector refuses any
+    #: market whose underlying is absent here, so a symbol left out is a
+    #: silently unpriceable slice of the catalog rather than an error — at the
+    #: time this list was introduced, ETH/SOL/XRP were 1,353 of the 1,730
+    #: markets the detector selected and every one was dropped for want of a
+    #: feed. Duplicates are collapsed and order is normalised so the poller's
+    #: fan-out is deterministic.
+    spot_symbols: list[Literal["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]] = [
+        "BTC-USD",
+        "ETH-USD",
+        "SOL-USD",
+        "XRP-USD",
+    ]
     ewma_lambda: float = Field(0.94, gt=0, lt=1)
     vol_lookback_minutes: int = Field(1440, ge=1)
     min_net_edge_cents: float = Field(2.0, ge=0)
+
+    @field_validator("spot_symbols")
+    @classmethod
+    def _at_least_one_symbol(cls, value: list[str]) -> list[str]:
+        # An empty list is the one setting that turns the poller into a loop
+        # that runs forever and writes nothing, which reads downstream as "the
+        # feed is stale" — a refusal the operator would go looking for in the
+        # detector. Say it here instead.
+        if not value:
+            raise ValueError(
+                "bitcoin.spot_symbols is empty; set bitcoin.enabled: false to "
+                "disable the spot feed rather than polling no symbols"
+            )
+        seen = [s for s in dict.fromkeys(value)]
+        return seen
 
 
 class WeatherConfig(_Base):
