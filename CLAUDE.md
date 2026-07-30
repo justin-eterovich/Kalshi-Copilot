@@ -664,9 +664,27 @@ and `/api/autonomy` shows an operator the numbers and the binding reason.
   `/api/system` and the worker's boot log while it scanned. Use
   `detectors.base.enabled_detector_names(config)`, which adds it; `app/main.py`
   still prints the narrow list.
-- **Only BTC has a spot feed.** ETH/SOL/XRP markets are correctly refused by
-  the stale-quote detector, which is ~1,353 markets it can see and cannot
-  price. Adding feeds means adding to `SPOT_SOURCES` and polling per symbol.
+- **All four crypto underlyings now have a spot feed** — BTC, ETH, SOL and XRP,
+  polled per symbol from `bitcoin.spot_symbols` and fanned out concurrently on
+  one 3s tick. Before this, only BTC was polled and the stale-quote detector
+  refused **1,353 of the 1,730 markets it selected** for want of a reference;
+  that refusal was correct and it was 78% of the universe.
+
+  `SPOT_SOURCES` is now `source -> symbol -> (url, path)` and every pair is
+  written out longhand. Do not template it from the symbol: Kraken's result
+  keys are `XXBTZUSD`, `XETHZUSD`, `XXRPZUSD` and — with neither prefix —
+  `SOLUSD`, and a templated URL silently invents an endpoint for any symbol
+  handed to it. An unlisted pair raises; there is no default symbol, because
+  reaching for the nearest one is the wrong-asset bug this file already
+  describes twice. **Binance's rows are unverified**: that endpoint refuses
+  this host's region, so they are the documented symbol substitution only.
+
+  **A new symbol prices nothing for its first ~31 minutes.** `horizon_sigma`
+  needs `MIN_RETURNS`+1 one-minute buckets and refuses below that, so a fresh
+  feed is silent until the live poller has accumulated them — correctly silent,
+  but it means "no signals yet" is the expected state right after a deploy, not
+  a bug to chase. `fetch_minute_candles` exists to close that gap and is now
+  per-symbol, but **it is still wired to nothing**; that is the follow-up.
 - **Detector queries must be projected and bounded.** `select(Market)` with
   no columns and no cap killed the worker outright — 122,887 active markets
   each carrying the full `raw` JSONB payload, no traceback, just a process

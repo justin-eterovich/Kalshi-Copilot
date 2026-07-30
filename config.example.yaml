@@ -389,6 +389,19 @@ bitcoin:
   # the pair together, or neither.
   enabled: false
   spot_source: coinbase          # coinbase | binance | kraken
+
+  # Which reference prices to poll. `stale_quote` maps a market's SERIES to one
+  # of these symbols and refuses outright when the feed is absent, so a symbol
+  # left out here is not a smaller universe — it is a slice of the catalog the
+  # detector can see and can never price. Measured before this list existed and
+  # only BTC was polled: 1,353 of the 1,730 markets the detector selected were
+  # ETH/SOL/XRP, and all 1,353 were dropped for want of a reference.
+  #
+  # Each symbol is an independent HTTP GET on every poll tick, fanned out
+  # concurrently. Empty is rejected at load — use `enabled: false` to turn the
+  # feed off, so that "no spot feed" cannot be spelled two different ways.
+  spot_symbols: [BTC-USD, ETH-USD, SOL-USD, XRP-USD]
+
   ewma_lambda: 0.94
   vol_lookback_minutes: 1440
   min_net_edge_cents: 2.0
